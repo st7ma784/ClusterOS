@@ -1,0 +1,32 @@
+[Unit]
+Description=Cluster-OS Node Agent
+Documentation=https://github.com/cluster-os
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStartPre=/usr/local/bin/node-agent init --identity-path /var/lib/cluster-os/identity.json || true
+ExecStart=/usr/local/bin/node-agent start --foreground
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=node-agent
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Security settings
+NoNewPrivileges=false
+PrivateTmp=true
+
+# Environment
+Environment="CLUSTEROS_LOG_LEVEL=info"
+EnvironmentFile=-/etc/cluster-os/node-agent.env
+
+[Install]
+WantedBy=multi-user.target

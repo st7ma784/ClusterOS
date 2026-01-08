@@ -1,0 +1,65 @@
+# Cluster-OS Node Configuration
+
+# Node identity
+identity:
+  path: /var/lib/cluster-os/identity.json
+
+# Discovery settings
+discovery:
+  # Serf bind address (0.0.0.0 for all interfaces)
+  bind_addr: 0.0.0.0
+  bind_port: 7946
+
+  # Bootstrap nodes to join (empty for first node)
+  bootstrap_peers: []
+
+  # Node name (defaults to hostname)
+  node_name: ""
+
+  # Serf encryption key (base64 encoded, leave empty to disable)
+  encrypt_key: ""
+
+# Networking settings
+networking:
+  # WireGuard interface name
+  interface: wg0
+
+  # WireGuard listen port
+  listen_port: 51820
+
+  # WireGuard subnet (10.42.0.0/16)
+  subnet: "10.42.0.0/16"
+
+  # Enable IPv6
+  ipv6: false
+
+  # WiFi configuration
+  wifi:
+    enabled: true
+    ssid: "TALKTALK665317"
+    key: "NXJP7U39"
+
+# Role configuration
+roles:
+  # Enabled roles for this node
+  enabled:
+    - wireguard
+
+  # Node capabilities (auto-detected if empty)
+  capabilities:
+    cpu: 0  # Number of CPU cores (0 = auto-detect)
+    ram: ""  # RAM size (e.g., "64GB", empty = auto-detect)
+    gpu: false  # GPU available
+    arch: ""  # Architecture (e.g., "amd64", empty = auto-detect)
+
+# Logging configuration
+logging:
+  level: info  # debug, info, warn, error
+  format: json  # json or text
+  output: stdout  # stdout, stderr, or file path
+
+# Cluster settings
+cluster:
+  name: cluster-os
+  region: default
+  datacenter: default

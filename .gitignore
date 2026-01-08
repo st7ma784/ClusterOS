@@ -1,0 +1,91 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+node-agent
+/node/node-agent
+
+# Go build artifacts
+*.test
+*.out
+*.prof
+/vendor/
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Cluster-OS runtime data
+/var/lib/cluster-os/
+identity.json
+*.key
+*.pem
+
+# Packer artifacts
+images/**/*.qcow2
+images/**/*.iso
+images/**/*.box
+images/**/*.vmdk
+packer_cache/
+output-*/
+
+# Docker volumes
+*.log
+
+# Test artifacts
+test/docker/volumes/
+*.coverage
+coverage.html
+
+# Build artifacts
+dist/
+release/
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+
+# Systemd artifacts
+*.service.d/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Cloud-init
+cloud-init-output.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+credentials.json
+secrets/
+
+# WireGuard
+wg*.conf
+*.wg
+
+# SLURM
+slurm.conf
+gres.conf
+slurm_state/
+slurmctld.log
+slurmd.log
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+kube/

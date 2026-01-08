@@ -1,0 +1,214 @@
+---
+# Namespace for JupyterHub
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jupyterhub
+
+---
+# ConfigMap for JupyterHub configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jupyterhub-config
+  namespace: jupyterhub
+data:
+  jupyterhub_config.py: |
+    # JupyterHub Configuration for Cluster-OS
+    import os
+
+    # Basic configuration
+    c.JupyterHub.hub_ip = '0.0.0.0'
+    c.JupyterHub.port = 8000
+
+    # Spawner configuration - use KubeSpawner
+    c.JupyterHub.spawner_class = 'kubespawner.KubeSpawner'
+
+    # KubeSpawner configuration
+    c.KubeSpawner.namespace = 'jupyterhub'
+    c.KubeSpawner.image = 'jupyter/scipy-notebook:latest'
+    c.KubeSpawner.start_timeout = 300
+    c.KubeSpawner.http_timeout = 120
+
+    # Storage configuration
+    c.KubeSpawner.storage_pvc_ensure = True
+    c.KubeSpawner.storage_capacity = '10Gi'
+    c.KubeSpawner.storage_class = 'local-path'
+
+    # CPU/Memory limits
+    c.KubeSpawner.cpu_limit = 2
+    c.KubeSpawner.cpu_guarantee = 0.5
+    c.KubeSpawner.mem_limit = '4G'
+    c.KubeSpawner.mem_guarantee = '1G'
+
+    # Authentication - simple for demo (use proper auth in production)
+    c.JupyterHub.authenticator_class = 'dummy'
+    c.DummyAuthenticator.password = 'cluster-os'
+
+    # Admin users
+    c.Authenticator.admin_users = {'admin'}
+
+    # Allow named servers
+    c.JupyterHub.allow_named_servers = True
+
+    # Networking
+    c.JupyterHub.bind_url = 'http://0.0.0.0:8000'
+
+---
+# Service Account for JupyterHub
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jupyterhub
+  namespace: jupyterhub
+
+---
+# ClusterRole for JupyterHub
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jupyterhub
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims"]
+    verbs: ["get", "watch", "list", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "watch", "list"]
+
+---
+# ClusterRoleBinding for JupyterHub
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jupyterhub
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: jupyterhub
+subjects:
+  - kind: ServiceAccount
+    name: jupyterhub
+    namespace: jupyterhub
+
+---
+# PersistentVolumeClaim for JupyterHub database
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jupyterhub-db
+  namespace: jupyterhub
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: local-path
+
+---
+# Deployment for JupyterHub
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jupyterhub
+  namespace: jupyterhub
+  labels:
+    app: jupyterhub
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jupyterhub
+  template:
+    metadata:
+      labels:
+        app: jupyterhub
+    spec:
+      serviceAccountName: jupyterhub
+      containers:
+        - name: jupyterhub
+          image: jupyterhub/k8s-hub:3.2.1
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: JUPYTERHUB_CRYPT_KEY
+              value: "changeme-generate-a-secure-key"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/jupyterhub
+            - name: db
+              mountPath: /srv/jupyterhub
+          command:
+            - jupyterhub
+            - --config
+            - /etc/jupyterhub/jupyterhub_config.py
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          livenessProbe:
+            httpGet:
+              path: /hub/health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /hub/health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: jupyterhub-config
+        - name: db
+          persistentVolumeClaim:
+            claimName: jupyterhub-db
+
+---
+# Service for JupyterHub
+apiVersion: v1
+kind: Service
+metadata:
+  name: jupyterhub
+  namespace: jupyterhub
+  labels:
+    app: jupyterhub
+spec:
+  type: NodePort
+  ports:
+    - port: 8000
+      targetPort: 8000
+      nodePort: 30800
+      protocol: TCP
+      name: http
+  selector:
+    app: jupyterhub
+
+---
+# Ingress for JupyterHub (optional, for external access)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jupyterhub
+  namespace: jupyterhub
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+spec:
+  rules:
+    - host: jupyter.cluster-os.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: jupyterhub
+                port:
+                  number: 8000

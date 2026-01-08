@@ -1,0 +1,29 @@
+# WireGuard Configuration for Cluster-OS
+# Auto-generated - DO NOT EDIT MANUALLY
+# Generated at: {{.GeneratedAt}}
+
+[Interface]
+PrivateKey = {{.PrivateKey}}
+Address = {{.Address}}
+ListenPort = {{.ListenPort}}
+MTU = {{.MTU}}
+
+# Post-up rules (optional)
+{{if .PostUp}}
+PostUp = {{.PostUp}}
+{{end}}
+
+# Pre-down rules (optional)
+{{if .PreDown}}
+PreDown = {{.PreDown}}
+{{end}}
+
+{{range .Peers}}
+# Peer: {{.NodeName}} ({{.NodeID}})
+[Peer]
+PublicKey = {{.PublicKey}}
+{{if .Endpoint}}Endpoint = {{.Endpoint}}{{end}}
+AllowedIPs = {{.AllowedIPs}}
+PersistentKeepalive = {{.PersistentKeepalive}}
+
+{{end}}
