@@ -110,9 +110,16 @@ func (d *Daemon) Start() error {
 func (d *Daemon) initLeaderElection() error {
 	d.logger.Info("Initializing leader election (Raft)")
 
+	// Use node name (hostname) as the advertise address
+	// In Docker, this will be the container hostname which is resolvable
+	advertiseAddr := d.config.Discovery.NodeName
+	if advertiseAddr == "" {
+		advertiseAddr = "localhost"
+	}
+
 	electionCfg := &state.ElectionConfig{
 		NodeID:        d.identity.NodeID,
-		NodeAddr:      d.config.Discovery.BindAddr,
+		NodeAddr:      advertiseAddr,
 		DataDir:       "/var/lib/cluster-os/raft",
 		BindAddr:      "0.0.0.0",
 		BindPort:      7373,

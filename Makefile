@@ -18,7 +18,7 @@ NODE_DIR := ./node
 LDFLAGS := -ldflags "-X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildTime=$(BUILD_TIME)"
 
 # Docker configuration
-DOCKER_COMPOSE := docker-compose
+DOCKER_COMPOSE := docker compose
 DOCKER_COMPOSE_FILE := test/docker/docker-compose.yaml
 
 # Packer configuration
@@ -80,32 +80,29 @@ test-coverage: test
 
 test-cluster: node
 	@echo "Starting Docker test cluster..."
-	@if [ ! -f $(DOCKER_COMPOSE_FILE) ]; then \
-		echo "Error: Docker compose file not found at $(DOCKER_COMPOSE_FILE)"; \
-		exit 1; \
-	fi
 	@echo "Building cluster containers and starting services..."
-	cd test/docker && $(DOCKER_COMPOSE) up --build -d
-	@echo ""
-	@echo "✓ Test cluster started successfully!"
+	./test/docker/start-cluster-direct.sh
 	@echo ""
 	@echo "Useful commands:"
 	@echo "  ./test/docker/cluster-ctl.sh status      # Show cluster status"
 	@echo "  ./test/docker/cluster-ctl.sh info        # Show detailed info"
 	@echo "  ./test/docker/cluster-ctl.sh logs node1  # View logs"
-	@echo "  ./test/docker/cluster-ctl.sh test        # Run integration tests"
 	@echo "  ./test/docker/cluster-ctl.sh shell node1 # Open shell"
-	@echo "  ./test/docker/cluster-ctl.sh stop        # Stop cluster"
+	@echo "  ./test/docker/stop-cluster.sh            # Stop cluster"
+	@echo "  ./test/docker/clean-cluster.sh           # Clean all data"
 	@echo ""
 
 test-cluster-stop:
 	@echo "Stopping Docker test cluster..."
-	cd test/docker && $(DOCKER_COMPOSE) down -v
-	@echo "Test cluster stopped"
+	./test/docker/stop-cluster.sh
+
+test-cluster-clean:
+	@echo "Cleaning Docker test cluster..."
+	./test/docker/clean-cluster.sh
 
 test-cluster-logs:
 	@echo "Showing test cluster logs..."
-	cd test/docker && $(DOCKER_COMPOSE) logs -f
+	./test/docker/cluster-ctl.sh logs node1
 
 image:
 	@echo "Building OS image with Packer..."

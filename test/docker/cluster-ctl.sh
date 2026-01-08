@@ -29,9 +29,7 @@ log_warn() {
 start_cluster() {
     log_info "Starting Cluster-OS test cluster..."
     cd "$SCRIPT_DIR"
-    docker-compose up -d --build
-    log_info "Cluster started. Waiting for nodes to initialize..."
-    sleep 10
+    ./start-cluster-direct.sh
     log_info "Cluster is ready!"
     show_status
 }
@@ -40,8 +38,7 @@ start_cluster() {
 stop_cluster() {
     log_info "Stopping Cluster-OS test cluster..."
     cd "$SCRIPT_DIR"
-    docker-compose down
-    log_info "Cluster stopped"
+    ./stop-cluster.sh
 }
 
 # Restart the cluster
@@ -56,8 +53,7 @@ restart_cluster() {
 clean_cluster() {
     log_warn "Cleaning up cluster (this will delete all data)..."
     cd "$SCRIPT_DIR"
-    docker-compose down -v
-    log_info "Cluster cleaned up (volumes deleted)"
+    ./clean-cluster.sh
 }
 
 # Show cluster status

@@ -83,13 +83,24 @@ func NewLeaderElector(cfg *ElectionConfig, clusterState *ClusterState) (*LeaderE
 	raftConfig.LeaderLeaseTimeout = 500 * time.Millisecond
 
 	// Create transport
-	addr := fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.BindPort)
-	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	// Bind to all interfaces
+	bindAddr := fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.BindPort)
+
+	// Use NodeAddr for advertising (this is the address other nodes will use to contact us)
+	advertiseAddr, err := net.ResolveTCPAddr("tcp", fmt.Sprintf("%s:%d", cfg.NodeAddr, cfg.BindPort))
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve TCP address: %w", err)
+		return nil, fmt.Errorf("failed to resolve advertise address: %w", err)
 	}
 
-	transport, err := raft.NewTCPTransport(addr, tcpAddr, 3, 10*time.Second, os.Stderr)
+	transportConfig := &raft.NetworkTransportConfig{
+		ServerAddressProvider: nil,
+		MaxPool:               3,
+		Timeout:               10 * time.Second,
+		Stream:                nil,
+		Logger:                nil,
+	}
+
+	transport, err := raft.NewTCPTransportWithConfig(bindAddr, advertiseAddr, transportConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Raft transport: %w", err)
 	}

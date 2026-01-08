@@ -138,12 +138,12 @@ docker exec -it cluster-os-node1 /bin/bash
 The cluster uses a custom Docker network:
 
 ```
-Network: cluster_net (172.20.0.0/16)
-├── node1: 172.20.0.10 (bootstrap)
-├── node2: 172.20.0.11
-├── node3: 172.20.0.12
-├── node4: 172.20.0.13
-└── node5: 172.20.0.14
+Network: cluster_net (172.21.0.0/16)
+├── node1: 172.21.0.10 (bootstrap)
+├── node2: 172.21.0.11
+├── node3: 172.21.0.12
+├── node4: 172.21.0.13
+└── node5: 172.21.0.14
 ```
 
 **Exposed Ports:**

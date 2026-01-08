@@ -44,7 +44,19 @@ networking:
 
 roles:
   enabled:
-    - wireguard
+EOF
+
+# Add roles from environment variable
+if [ -n "$NODE_ROLES" ]; then
+    IFS=',' read -ra ROLES <<< "$NODE_ROLES"
+    for role in "${ROLES[@]}"; do
+        echo "    - $role" >> /etc/cluster-os/node.yaml
+    done
+else
+    echo "    - wireguard" >> /etc/cluster-os/node.yaml
+fi
+
+cat >> /etc/cluster-os/node.yaml <<'EOF'
   capabilities:
     cpu: 0
     ram: ""

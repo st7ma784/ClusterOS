@@ -21,19 +21,24 @@ RUN apt-get update && apt-get install -y \
     sudo \
     vim \
     less \
+    slurm-wlm \
+    slurmd \
+    slurmctld \
+    munge \
+    python3 \
+    python3-pip \
+    build-essential \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Remove unnecessary systemd services
-RUN cd /lib/systemd/system/sysinit.target.wants/ && \
-    ls | grep -v systemd-tmpfiles-setup | xargs rm -f && \
-    rm -f /lib/systemd/system/multi-user.target.wants/* && \
-    rm -f /etc/systemd/system/*.wants/* && \
-    rm -f /lib/systemd/system/local-fs.target.wants/* && \
-    rm -f /lib/systemd/system/sockets.target.wants/*udev* && \
-    rm -f /lib/systemd/system/sockets.target.wants/*initctl* && \
-    rm -f /lib/systemd/system/basic.target.wants/* && \
-    rm -f /lib/systemd/system/anaconda.target.wants/*
+# Configure systemd for container environment
+RUN systemctl mask systemd-udevd.service \
+    systemd-udevd-control.socket \
+    systemd-udevd-kernel.socket \
+    systemd-modules-load.service \
+    sys-kernel-config.mount \
+    sys-kernel-debug.mount \
+    sys-kernel-tracing.mount
 
 # Create cluster-os directories
 RUN mkdir -p /var/lib/cluster-os \
@@ -67,7 +72,7 @@ EXPOSE 7946/tcp 7946/udp 7373/tcp 51820/udp
 # Set systemd as entrypoint
 STOPSIGNAL SIGRTMIN+3
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["/lib/systemd/systemd"]
+CMD ["/lib/systemd/systemd", "--unit=multi-user.target", "--log-level=info"]
 
 # Labels
 LABEL org.cluster-os.version="dev" \

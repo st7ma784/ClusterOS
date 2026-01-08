@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Bootstrap node (node1)
   node1:
@@ -31,7 +29,7 @@ services:
       - WIREGUARD_PORT=51820
     networks:
       cluster_net:
-        ipv4_address: 172.20.0.10
+        ipv4_address: 10.90.0.10
     ports:
       - "7946:7946/tcp"
       - "7946:7946/udp"
@@ -73,7 +71,7 @@ services:
       - WIREGUARD_PORT=51820
     networks:
       cluster_net:
-        ipv4_address: 172.20.0.11
+        ipv4_address: 10.90.0.11
     depends_on:
       node1:
         condition: service_healthy
@@ -109,7 +107,7 @@ services:
       - WIREGUARD_PORT=51820
     networks:
       cluster_net:
-        ipv4_address: 172.20.0.12
+        ipv4_address: 10.90.0.12
     depends_on:
       node1:
         condition: service_healthy
@@ -145,7 +143,7 @@ services:
       - WIREGUARD_PORT=51820
     networks:
       cluster_net:
-        ipv4_address: 172.20.0.13
+        ipv4_address: 10.90.0.13
     depends_on:
       node1:
         condition: service_healthy
@@ -181,7 +179,7 @@ services:
       - WIREGUARD_PORT=51820
     networks:
       cluster_net:
-        ipv4_address: 172.20.0.14
+        ipv4_address: 10.90.0.14
     depends_on:
       node1:
         condition: service_healthy
@@ -191,7 +189,7 @@ networks:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.0.0/16
+        - subnet: 10.90.0.0/16
 
 volumes:
   node1-data:
