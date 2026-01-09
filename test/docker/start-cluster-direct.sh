@@ -7,9 +7,22 @@ set -e
 # Colors
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
 echo -e "${GREEN}Starting Cluster-OS test cluster with direct Docker commands...${NC}"
+
+# Clean up existing containers
+echo -e "${YELLOW}Cleaning up any existing cluster containers...${NC}"
+for i in 1 2 3 4 5; do
+    if docker ps -a --format '{{.Names}}' | grep -q "^cluster-os-node$i$"; then
+        echo "Removing existing container: cluster-os-node$i"
+        docker stop cluster-os-node$i >/dev/null 2>&1 || true
+        docker rm cluster-os-node$i >/dev/null 2>&1 || true
+    fi
+done
+echo "Cleanup complete"
+echo ""
 
 # Create network if it doesn't exist
 if ! docker network inspect docker_cluster_net >/dev/null 2>&1; then
@@ -48,6 +61,7 @@ docker run -d \
     -e SERF_BIND_PORT=7946 \
     -e RAFT_BIND_PORT=7373 \
     -e WIREGUARD_PORT=51820 \
+    -e CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s= \
     -p 7946:7946/tcp \
     -p 7946:7946/udp \
     -p 6443:6443 \
@@ -88,6 +102,7 @@ for i in 2 3 4 5; do
         -e SERF_BIND_PORT=7946 \
         -e RAFT_BIND_PORT=7373 \
         -e WIREGUARD_PORT=51820 \
+        -e CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s= \
         cluster-os-node:latest
     sleep 2
 done

@@ -1,6 +1,7 @@
 package state
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -300,6 +301,49 @@ func (le *LeaderElector) RegisterRoleLeadershipObserver(role string) <-chan bool
 	return ch
 }
 
+// ApplySetMungeKey applies a SetMungeKey command via Raft
+func (le *LeaderElector) ApplySetMungeKey(mungeKey []byte, mungeKeyHash string) error {
+	if !le.IsLeader() {
+		return fmt.Errorf("not the leader, cannot apply munge key")
+	}
+
+	// Create command payload
+	payload := SetMungeKeyPayload{
+		MungeKey:     mungeKey,
+		MungeKeyHash: mungeKeyHash,
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
+	// Create Raft command
+	cmd := RaftCommand{
+		Type:    CommandSetMungeKey,
+		Payload: payloadBytes,
+	}
+
+	cmdBytes, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to marshal command: %w", err)
+	}
+
+	// Apply to Raft with timeout
+	future := le.raft.Apply(cmdBytes, 10*time.Second)
+	if err := future.Error(); err != nil {
+		return fmt.Errorf("failed to apply munge key via Raft: %w", err)
+	}
+
+	le.logger.Info("Successfully applied munge key to Raft cluster")
+	return nil
+}
+
+// GetClusterState returns the cluster state
+func (le *LeaderElector) GetClusterState() *ClusterState {
+	return le.state
+}
+
 // Shutdown gracefully shuts down the leader elector
 func (le *LeaderElector) Shutdown() error {
 	le.logger.Info("Shutting down leader elector")
@@ -329,45 +373,8 @@ func (le *LeaderElector) Shutdown() error {
 }
 
 // clusterFSM is the finite state machine for Raft
+// Implementation is in raft_commands.go
 type clusterFSM struct {
 	state  *ClusterState
 	logger *logrus.Logger
-}
-
-// Apply applies a Raft log entry
-func (f *clusterFSM) Apply(log *raft.Log) interface{} {
-	f.logger.Debugf("Applying Raft log entry: index=%d, type=%v", log.Index, log.Type)
-
-	// TODO: Implement actual state machine commands
-	// For now, this is a placeholder
-	return nil
-}
-
-// Snapshot creates a snapshot of the current state
-func (f *clusterFSM) Snapshot() (raft.FSMSnapshot, error) {
-	f.logger.Debug("Creating snapshot")
-
-	// TODO: Implement snapshot logic
-	return &clusterSnapshot{}, nil
-}
-
-// Restore restores state from a snapshot
-func (f *clusterFSM) Restore(rc io.ReadCloser) error {
-	f.logger.Info("Restoring from snapshot")
-	defer rc.Close()
-
-	// TODO: Implement restore logic
-	return nil
-}
-
-// clusterSnapshot implements raft.FSMSnapshot
-type clusterSnapshot struct{}
-
-func (s *clusterSnapshot) Persist(sink raft.SnapshotSink) error {
-	// TODO: Implement snapshot persistence
-	return sink.Close()
-}
-
-func (s *clusterSnapshot) Release() {
-	// TODO: Implement snapshot release
 }

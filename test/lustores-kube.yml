@@ -1,0 +1,1225 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lustores
+
+---
+
+# StorageClass for multi-node support (using local storage on each node)
+# Alternative: Use 'standard' if your cluster has a default StorageClass
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: lustores-local
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+
+---
+
+# Storage: Database Tier (PostgreSQL Primary + Replica)
+# Primary uses StatefulSet for guaranteed identity and ordered startup
+
+# PVC for PostgreSQL Primary (read-write)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-primary-pvc
+  namespace: lustores
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: lustores-local
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+
+# PVC for PostgreSQL Replica (for streaming replication storage)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-replica-pvc
+  namespace: lustores
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: lustores-local
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+
+# Storage: Cache Tier (Redis Master + Replica)
+
+# PVC for Redis Master (primary cache)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-master-pvc
+  namespace: lustores
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: lustores-local
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+
+# PVC for Redis Replica (for redundancy)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-replica-pvc
+  namespace: lustores
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: lustores-local
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+
+# ConfigMap for Redis configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: lustores
+data:
+  redis.conf: |
+    # Redis configuration for master/replica replication
+    bind 0.0.0.0
+    port 6379
+    appendonly yes
+    appendfsync everysec
+    # Replication settings will be overridden by pod role
+
+---
+
+# StatefulSet for Redis Master + Replica (ordered startup)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: lustores
+spec:
+  serviceName: redis
+  replicas: 2
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      # Pod anti-affinity: spread master and replica to different nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - redis
+                topologyKey: kubernetes.io/hostname
+        # Prefer worker nodes over control plane
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+      containers:
+        - name: redis
+          image: redis:8-alpine
+          ports:
+            - containerPort: 6379
+              name: redis
+          # Master is redis-0, replicas are redis-1+
+          command:
+            - sh
+            - -c
+            - |
+              if [ $(hostname | sed 's/.*-//') -eq 0 ]; then
+                exec redis-server /etc/redis/redis.conf
+              else
+                exec redis-server /etc/redis/redis.conf --slaveof redis-0.redis.lustores.svc.cluster.local 6379
+              fi
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+            - name: redis-config
+              mountPath: /etc/redis
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          # Liveness probe: check if Redis is responding
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # Readiness probe: check if Redis is fully operational
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 2
+      volumes:
+        - name: redis-config
+          configMap:
+            name: redis-config
+  volumeClaimTemplates:
+    - metadata:
+        name: redis-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: lustores-local
+        resources:
+          requests:
+            storage: 5Gi
+
+---
+
+# Headless Service for Redis StatefulSet (DNS discovery)
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: lustores
+spec:
+  clusterIP: None  # Headless service
+  selector:
+    app: redis
+  ports:
+    - protocol: TCP
+      port: 6379
+      targetPort: 6379
+
+---
+
+# ClusterIP Service for Redis client access (load balanced)
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-client
+  namespace: lustores
+spec:
+  selector:
+    app: redis
+  ports:
+    - protocol: TCP
+      port: 6379
+      targetPort: 6379
+  type: ClusterIP
+
+---
+
+# ConfigMap for PostgreSQL configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: lustores
+data:
+  postgresql.conf: |
+    # PostgreSQL configuration for streaming replication
+    listen_addresses = '*'
+    wal_level = replica
+    max_wal_senders = 10
+    max_replication_slots = 10
+    hot_standby = on
+  pg_hba.conf: |
+    local   all             all                                     trust
+    host    all             all             127.0.0.1/32            scram-sha-256
+    host    all             all             ::1/128                 scram-sha-256
+    host    replication     replication     0.0.0.0/0               scram-sha-256
+    host    all             all             0.0.0.0/0               scram-sha-256
+    host    all             all             ::/0                    scram-sha-256
+
+---
+
+# StatefulSet for PostgreSQL Primary + Replica (ordered startup, persistent identity)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+  namespace: lustores
+spec:
+  serviceName: db
+  replicas: 2
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      # Pod anti-affinity: primary and replica on different nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - db
+                topologyKey: kubernetes.io/hostname
+        # Prefer worker nodes
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+      containers:
+        - name: postgres
+          image: postgres:18-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: university_inventory
+            - name: POSTGRES_USER
+              value: postgres
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: db-secret
+                  key: password
+            - name: POSTGRES_INITDB_ARGS
+              value: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+            # Primary is db-0, replicas are db-1+
+            - name: POD_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+                  # Will be db-0, db-1, etc.
+          command:
+            - sh
+            - -c
+            - |
+              # Extract pod index (0 for primary, 1+ for replicas)
+              POD_NUM=$(echo $HOSTNAME | sed 's/.*-//')
+              
+              if [ "$POD_NUM" -eq 0 ]; then
+                # Primary server
+                exec docker-entrypoint.sh postgres
+              else
+                # Replica server - set up streaming replication
+                export POSTGRES_INITDB_ARGS="$POSTGRES_INITDB_ARGS --recovery"
+                
+                # Wait for primary to be ready
+                until pg_isready -h db-0.db.lustores.svc.cluster.local -U postgres; do
+                  echo "Waiting for primary..."
+                  sleep 2
+                done
+                
+                # Take base backup from primary
+                pg_basebackup -h db-0.db.lustores.svc.cluster.local -D /var/lib/postgresql/data -U postgres -v -P -W -X stream
+                
+                # Create recovery signal to become standby
+                touch /var/lib/postgresql/data/pgdata/standby.signal
+                
+                exec docker-entrypoint.sh postgres
+              fi
+          volumeMounts:
+            - mountPath: /var/lib/postgresql/data
+              name: postgres-data
+            - mountPath: /etc/postgresql
+              name: postgres-config
+            - mountPath: /docker-entrypoint-initdb.d
+              name: init-sql
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+          # Liveness probe: check if PostgreSQL is responsive
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+                - -d
+                - university_inventory
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          # Readiness probe: check if PostgreSQL is fully ready
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+                - -d
+                - university_inventory
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: postgres-config
+          configMap:
+            name: postgres-config
+        - name: init-sql
+          configMap:
+            name: init-sql-config
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: lustores-local
+        resources:
+          requests:
+            storage: 10Gi
+
+---
+
+# ConfigMap for init.sql
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: init-sql-config
+  namespace: lustores
+data:
+  init.sql: |
+    -- Initialize the database with required tables
+    -- This file will be executed when the PostgreSQL container starts
+
+    -- Create sessions table for session storage
+    CREATE TABLE IF NOT EXISTS sessions (
+      sid varchar NOT NULL COLLATE "default",
+      sess json NOT NULL,
+      expire timestamp(6) NOT NULL
+    )
+    WITH (OIDS=FALSE);
+
+    ALTER TABLE sessions ADD CONSTRAINT session_pkey PRIMARY KEY (sid) NOT DEFERRABLE INITIALLY IMMEDIATE;
+
+    CREATE INDEX IF NOT EXISTS IDX_session_expire ON sessions (expire);
+
+    -- Create application tables
+    CREATE TABLE IF NOT EXISTS users (
+      id VARCHAR PRIMARY KEY,
+      email VARCHAR NOT NULL UNIQUE,
+      password_hash VARCHAR NOT NULL,
+      first_name VARCHAR NOT NULL,
+      last_name VARCHAR NOT NULL,
+      role VARCHAR NOT NULL DEFAULT 'user',
+      is_active BOOLEAN NOT NULL DEFAULT true,
+      must_change_password BOOLEAN NOT NULL DEFAULT false,
+      last_login TIMESTAMP,
+      profile_image_url VARCHAR,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+
+    -- Notes table for system-wide notes that can be attached to items, suppliers, orders, and charge codes
+    -- Must be created before tables that reference it
+    CREATE TABLE IF NOT EXISTS notes (
+      id SERIAL PRIMARY KEY,
+      text TEXT NOT NULL,
+      reference_type VARCHAR(50) NOT NULL, -- 'item', 'supplier', 'order', 'chargecode'
+      reference_id VARCHAR(100) NOT NULL, -- ID of the referenced entity
+      created_by VARCHAR NOT NULL REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+
+    -- Add indexes for efficient querying
+    CREATE INDEX IF NOT EXISTS idx_notes_reference ON notes(reference_type, reference_id);
+    CREATE INDEX IF NOT EXISTS idx_notes_created_by ON notes(created_by);
+    CREATE INDEX IF NOT EXISTS idx_notes_created_at ON notes(created_at);
+
+    CREATE TABLE IF NOT EXISTS categories (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR NOT NULL UNIQUE,
+      description TEXT,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+    -- Additional tables would be added here from the full init.sql
+
+---
+
+# Headless Service for PostgreSQL StatefulSet (DNS discovery)
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: lustores
+spec:
+  clusterIP: None  # Headless service for StatefulSet
+  selector:
+    app: db
+  ports:
+    - protocol: TCP
+      port: 5432
+      targetPort: 5432
+      name: postgres
+
+---
+
+# ClusterIP Service for PostgreSQL (points to all replicas)
+apiVersion: v1
+kind: Service
+metadata:
+  name: db-client
+  namespace: lustores
+spec:
+  selector:
+    app: db
+  ports:
+    - protocol: TCP
+      port: 5432
+      targetPort: 5432
+  type: ClusterIP
+
+---
+
+# Secret for Database Password
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-secret
+  namespace: lustores
+type: Opaque
+data:
+  password: <BASE64_ENCODED_PASSWORD>  # Replace with actual base64 encoded password
+
+---
+
+# Secret for Application Configuration
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secret
+  namespace: lustores
+type: Opaque
+data:
+  session-secret: <BASE64_ENCODED_SESSION_SECRET>  # Replace with actual base64 encoded session secret
+  jwt-secret: <BASE64_ENCODED_JWT_SECRET>  # Replace with actual base64 encoded JWT secret
+  database-url: <BASE64_ENCODED_DATABASE_URL>  # Replace with actual base64 encoded database URL
+
+---
+
+# Deployment for Production App (3 replicas spread across nodes)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: lustores
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # No downtime during rolling updates
+  selector:
+    matchLabels:
+      app: app
+  template:
+    metadata:
+      labels:
+        app: app
+    spec:
+      # Pod anti-affinity: spread 3 app replicas to different nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - app
+                topologyKey: kubernetes.io/hostname
+        # Prefer worker nodes
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+      # Graceful termination: give app 30s to drain connections
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: app
+          image: st7ma784/lustores:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 5000
+              name: http
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: app-secret
+                  key: database-url
+            - name: SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: app-secret
+                  key: session-secret
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: app-secret
+                  key: jwt-secret
+            - name: JWT_EXPIRES_IN
+              value: "7d"
+            - name: HTTPS
+              value: "true"
+            - name: FORCE_HTTPS
+              value: "true"
+            - name: DOMAIN
+              value: "localhost"
+            - name: EMAIL
+              value: "admin@localhost"
+            - name: REPL_ID
+              value: "prod-repl"
+            - name: REPLIT_DOMAINS
+              value: ""
+            - name: ISSUER_URL
+              value: ""
+            # Connect to primary database (write operations)
+            - name: DB_HOST
+              value: "db-0.db.lustores.svc.cluster.local"
+            # Or use db-client for read-only replicas (optional)
+            - name: DB_REPLICA_HOST
+              value: "db-client.lustores.svc.cluster.local"
+            # Redis master for writes
+            - name: REDIS_HOST
+              value: "redis-0.redis.lustores.svc.cluster.local"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+          # Liveness probe: restart if app is unresponsive
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+          # Readiness probe: remove from load balancer if unhealthy
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 3
+          # Startup probe: give app time to fully boot (e.g., DB migrations)
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 0
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30  # 5 minutes max startup time
+
+---
+
+# Service for Production App
+apiVersion: v1
+kind: Service
+metadata:
+  name: app
+  namespace: lustores
+spec:
+  selector:
+    app: app
+  ports:
+    - protocol: TCP
+      port: 5000
+      targetPort: 5000
+
+---
+
+# Deployment for Replit Auth (2 replicas for redundancy)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: replit-auth
+  namespace: lustores
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: replit-auth
+  template:
+    metadata:
+      labels:
+        app: replit-auth
+    spec:
+      # Pod anti-affinity: spread auth replicas to different nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - replit-auth
+                topologyKey: kubernetes.io/hostname
+        # Prefer worker nodes
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: replit-auth
+          image: st7ma784/replitauth:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3001
+              name: http
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: PORT
+              value: "3001"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: app-secret
+                  key: jwt-secret
+            - name: ALLOWED_ORIGINS
+              value: "https://localhost"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          # Liveness probe
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          # Readiness probe
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+---
+
+# Service for Replit Auth (load balances across 2 replicas)
+apiVersion: v1
+kind: Service
+metadata:
+  name: replit-auth
+  namespace: lustores
+spec:
+  selector:
+    app: replit-auth
+  ports:
+    - protocol: TCP
+      port: 3001
+      targetPort: 3001
+  type: ClusterIP
+
+---
+
+# Deployment for Nginx (3 replicas spread across nodes, load balanced)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: lustores
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      # Pod anti-affinity: spread nginx replicas to different nodes
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - nginx
+                topologyKey: kubernetes.io/hostname
+        # Prefer worker nodes
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 50
+              preference:
+                matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: nginx
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+              name: http
+            - containerPort: 443
+              name: https
+          env:
+            - name: DOMAIN
+              value: "localhost"
+            - name: NGINX_HOST
+              value: "localhost"
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/templates
+            - name: nginx-http-config
+              mountPath: /etc/nginx/nginx-http.conf
+              subPath: nginx-http.conf
+            - name: certbot-conf
+              mountPath: /etc/letsencrypt
+            - name: certbot-www
+              mountPath: /var/www/certbot
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "250m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          # Liveness probe: check if Nginx is responding
+          livenessProbe:
+            tcpSocket:
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          # Readiness probe: remove from load balancer if unhealthy
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: nginx-config
+        - name: nginx-http-config
+          configMap:
+            name: nginx-http-config
+        - name: certbot-conf
+          emptyDir: {}
+        - name: certbot-www
+          emptyDir: {}
+
+---
+
+# Service for Nginx (LoadBalancer spreads traffic across 3 replicas)
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx
+  namespace: lustores
+  labels:
+    app: nginx
+spec:
+  type: LoadBalancer
+  selector:
+    app: nginx
+  sessionAffinity: None  # No session stickiness (scale requires stateless)
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 80
+    - name: https
+      protocol: TCP
+      port: 443
+      targetPort: 443
+
+---
+
+# ConfigMap for Nginx configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: lustores
+data:
+  default.conf.template: |
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        # Basic settings
+        sendfile on;
+        tcp_nopush on;
+        tcp_nodelay on;
+        keepalive_timeout 65;
+        types_hash_max_size 2048;
+        server_tokens off;
+
+        # DNS resolver for dynamic upstream resolution
+        resolver 127.0.0.11 valid=10s ipv6=off;
+        resolver_timeout 5s;
+
+        # MIME types
+        include /etc/nginx/mime.types;
+        default_type application/octet-stream;
+
+        # Logging
+        log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent "$http_referer" '
+                        '"$http_user_agent" "$http_x_forwarded_for"';
+        
+        access_log /var/log/nginx/access.log main;
+        error_log /var/log/nginx/error.log warn;
+
+        # Gzip compression
+        gzip on;
+        gzip_vary on;
+        gzip_proxied any;
+        gzip_comp_level 6;
+        gzip_types
+            text/plain
+            text/css
+            text/xml
+            text/javascript
+            application/json
+            application/javascript
+            application/xml+rss
+            application/atom+xml
+            image/svg+xml;
+
+        # Rate limiting
+        limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+        limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;
+
+        # Upstream backend
+        upstream app {
+            server app:5000 max_fails=3 fail_timeout=30s weight=1;
+            keepalive 32;
+            keepalive_requests 1000;
+            keepalive_timeout 60s;
+        }
+
+        upstream replit-auth {
+            server replit-auth:3001 max_fails=3 fail_timeout=30s weight=1;
+            keepalive 32;
+        }
+
+        # HTTP server block
+        server {
+            listen 80;
+            server_name ${NGINX_HOST};
+
+            # Security headers
+            add_header X-Frame-Options DENY always;
+            add_header X-Content-Type-Options nosniff always;
+            add_header X-XSS-Protection "1; mode=block" always;
+            add_header Referrer-Policy strict-origin-when-cross-origin always;
+
+            # Let's Encrypt challenge
+            location /.well-known/acme-challenge/ {
+                root /var/www/certbot;
+            }
+
+            # Redirect HTTP to HTTPS
+            location / {
+                return 301 https://$server_name$request_uri;
+            }
+        }
+
+        # HTTPS server block
+        server {
+            listen 443 ssl http2;
+            server_name ${NGINX_HOST};
+
+            # SSL configuration
+            ssl_certificate /etc/letsencrypt/live/${NGINX_HOST}/fullchain.pem;
+            ssl_certificate_key /etc/letsencrypt/live/${NGINX_HOST}/privkey.pem;
+            
+            # Modern SSL configuration
+            ssl_protocols TLSv1.2 TLSv1.3;
+            ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+            ssl_prefer_server_ciphers off;
+
+            # Security headers
+            add_header Strict-Transport-Security "max-age=63072000" always;
+            add_header X-Frame-Options DENY always;
+            add_header X-Content-Type-Options nosniff always;
+            add_header X-XSS-Protection "1; mode=block" always;
+
+            # Main application proxy
+            location / {
+                proxy_pass http://app;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection 'upgrade';
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_cache_bypass $http_upgrade;
+                proxy_read_timeout 300s;
+                proxy_connect_timeout 75s;
+
+                # Rate limiting
+                limit_req zone=api burst=20 nodelay;
+            }
+
+            # Replit Auth service proxy
+            location /auth/ {
+                proxy_pass http://replit-auth/;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection 'upgrade';
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_cache_bypass $http_upgrade;
+            }
+        }
+    }
+
+---
+
+# ConfigMap for Nginx HTTP configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-http-config
+  namespace: lustores
+data:
+  nginx-http.conf: |
+    events {
+        worker_connections 1024;
+    }
+
+    http {
+        # Basic settings
+        sendfile on;
+        tcp_nopush on;
+        tcp_nodelay on;
+        keepalive_timeout 65;
+        types_hash_max_size 2048;
+        server_tokens off;
+
+        # MIME types
+        include /etc/nginx/mime.types;
+        default_type application/octet-stream;
+
+        # Rate limiting
+        limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+        limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;
+
+        upstream app {
+            server app:5000 max_fails=3 fail_timeout=30s weight=1;
+            keepalive 32;
+            keepalive_requests 1000;
+            keepalive_timeout 60s;
+        }
+
+        # HTTP-only server for development/testing
+        server {
+            listen 80;
+            server_name localhost;
+
+            location / {
+                proxy_pass http://app;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection 'upgrade';
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_cache_bypass $http_upgrade;
+
+                # Rate limiting
+                limit_req zone=api burst=20 nodelay;
+            }
+        }
+    }
+
+---
+
+# Deployment for GitHub Actions Runner (ephemeral, auto-cleanup)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: github-runner
+  namespace: lustores
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: github-runner
+  template:
+    metadata:
+      labels:
+        app: github-runner
+    spec:
+      # Tolerate any node (even control plane for CI/CD)
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 50
+            preference:
+              matchExpressions:
+                - key: node-role.kubernetes.io/control-plane
+                  operator: DoesNotExist
+      # Graceful shutdown
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: github-runner
+          image: myoung34/github-runner:latest
+          env:
+            - name: REPO_URL
+              value: "https://github.com/st7ma784/LUStores"
+            - name: RUNNER_NAME
+              value: "lustores-prod-runner"
+            - name: RUNNER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-runner-secret
+                  key: token
+            - name: LABELS
+              value: "lustores,production,docker,self-hosted"
+            - name: EPHEMERAL
+              value: "true"
+            - name: DISABLE_AUTOMATIC_DEREGISTRATION
+              value: "false"
+            - name: RUNNER_GROUP
+              value: "default"
+            - name: RUNNER_ALLOW_RUNASROOT
+              value: "true"
+          volumeMounts:
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: runner-data
+              mountPath: /tmp/runner
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "1000m"
+            limits:
+              memory: "2Gi"
+              cpu: "2"
+          securityContext:
+            privileged: true
+          # Liveness probe: restart runner if dead
+          livenessProbe:
+            exec:
+              command:
+                - pgrep
+                - -f
+                - "Runner.Listener"
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+        - name: runner-data
+          emptyDir: {}
+
+---
+
+# Secret for GitHub Runner
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-runner-secret
+  namespace: lustores
+type: Opaque
+data:
+  token: <BASE64_ENCODED_RUNNER_TOKEN>  # Replace with actual base64 encoded GitHub runner token

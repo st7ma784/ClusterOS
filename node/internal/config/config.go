@@ -73,9 +73,11 @@ type LoggingConfig struct {
 
 // ClusterConfig contains cluster-wide settings
 type ClusterConfig struct {
-	Name       string `mapstructure:"name"`
-	Region     string `mapstructure:"region"`
-	Datacenter string `mapstructure:"datacenter"`
+	Name         string `mapstructure:"name"`
+	Region       string `mapstructure:"region"`
+	Datacenter   string `mapstructure:"datacenter"`
+	AuthKey      string `mapstructure:"auth_key"`      // Cluster authentication key (base64)
+	ElectionMode string `mapstructure:"election_mode"` // "serf" (stateless) or "raft" (persistent)
 }
 
 // DefaultConfigPaths are the default paths to search for configuration files
@@ -178,6 +180,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.name", "cluster-os")
 	v.SetDefault("cluster.region", "default")
 	v.SetDefault("cluster.datacenter", "default")
+	v.SetDefault("cluster.auth_key", "")          // Must be set by user
+	v.SetDefault("cluster.election_mode", "serf") // "serf" (stateless) or "raft" (persistent)
 }
 
 // autoDetectCapabilities auto-detects hardware capabilities
@@ -200,6 +204,11 @@ func autoDetectCapabilities(config *Config) error {
 
 // Validate validates the configuration
 func (c *Config) Validate() error {
+	// Validate cluster authentication key
+	if c.Cluster.AuthKey == "" {
+		return fmt.Errorf("cluster.auth_key must be set - run scripts/generate-cluster-key.sh to create one")
+	}
+
 	// Validate discovery settings
 	if c.Discovery.BindPort < 1 || c.Discovery.BindPort > 65535 {
 		return fmt.Errorf("invalid discovery bind port: %d", c.Discovery.BindPort)

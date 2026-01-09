@@ -10,6 +10,7 @@ import (
 	"text/template"
 
 	"github.com/cluster-os/node/internal/roles"
+	"github.com/cluster-os/node/internal/services/slurm/auth"
 	"github.com/cluster-os/node/internal/state"
 	"github.com/sirupsen/logrus"
 )
@@ -17,13 +18,15 @@ import (
 // SLURMController implements the SLURM controller role
 type SLURMController struct {
 	*roles.BaseRole
-	config        *Config
-	clusterState  *state.ClusterState
-	slurmctldCmd  *exec.Cmd
-	mungeKey      []byte
-	configPath    string
-	statePath     string
-	slurmConfPath string
+	config          *Config
+	clusterState    *state.ClusterState
+	leaderElector   auth.RaftMungeKeyApplier
+	slurmctldCmd    *exec.Cmd
+	mungeKey        []byte
+	mungeKeyManager *auth.MungeKeyManager
+	configPath      string
+	statePath       string
+	slurmConfPath   string
 }
 
 // Config contains configuration for the SLURM controller
@@ -57,11 +60,13 @@ func NewSLURMController(roleConfig *roles.RoleConfig, logger *logrus.Logger) (ro
 	}
 
 	return &SLURMController{
-		BaseRole:      roles.NewBaseRole("slurm-controller", logger),
-		config:        config,
-		slurmConfPath: config.SlurmConfPath,
-		configPath:    config.ConfigPath,
-		statePath:     config.StatePath,
+		BaseRole:        roles.NewBaseRole("slurm-controller", logger),
+		config:          config,
+		slurmConfPath:   config.SlurmConfPath,
+		configPath:      config.ConfigPath,
+		statePath:       config.StatePath,
+		leaderElector:   roleConfig.LeaderElector,
+		mungeKeyManager: auth.NewMungeKeyManager(logger),
 	}, nil
 }
 
@@ -250,17 +255,28 @@ func (sc *SLURMController) generateConfig() error {
 	// Get all nodes with slurm-worker role
 	workers := sc.clusterState.GetNodesByRole("slurm-worker")
 
+	// Get controller node info
+	controllerName := ""
+	if leaderNode, ok := sc.clusterState.GetLeaderNode("slurm-controller"); ok {
+		// Use node name for SlurmctldHost (resolves via DNS in Docker)
+		controllerName = leaderNode.Name
+		sc.Logger().Infof("SLURM controller node: %s (address: %s)", leaderNode.Name, leaderNode.Address)
+	} else {
+		sc.Logger().Warn("No SLURM controller leader found, using placeholder")
+		controllerName = "localhost"
+	}
+
 	// Prepare template data
 	data := struct {
-		ClusterName  string
+		ClusterName    string
 		ControllerNode string
-		Port         int
-		Nodes        []*state.Node
+		Port           int
+		Nodes          []*state.Node
 	}{
-		ClusterName:  sc.config.ClusterName,
-		ControllerNode: func() string { leader, _ := sc.clusterState.GetLeader("slurm-controller"); return leader }(),
-		Port:         sc.config.Port,
-		Nodes:        workers,
+		ClusterName:    sc.config.ClusterName,
+		ControllerNode: controllerName,
+		Port:           sc.config.Port,
+		Nodes:          workers,
 	}
 
 	// Parse template
@@ -293,40 +309,61 @@ func (sc *SLURMController) generateConfig() error {
 	return nil
 }
 
-// setupMungeKey sets up the munge authentication key
+// setupMungeKey sets up the munge authentication key using Raft consensus
 func (sc *SLURMController) setupMungeKey() error {
-	// TODO: Implement munge key generation and distribution
-	// For now, create a placeholder key
-	mungeKeyPath := "/etc/munge/munge.key"
+	sc.Logger().Info("Setting up munge authentication key via Raft")
 
-	if _, err := os.Stat(mungeKeyPath); os.IsNotExist(err) {
-		sc.Logger().Warn("Munge key not found, creating placeholder")
-		// In production, this should be properly generated and distributed
-		if err := os.WriteFile(mungeKeyPath, []byte("placeholder-key"), 0400); err != nil {
-			return fmt.Errorf("failed to write munge key: %w", err)
+	// First check if cluster already has a munge key in Raft state
+	if sc.clusterState.HasMungeKey() {
+		sc.Logger().Info("Munge key already exists in cluster state, fetching from Raft")
+		key, hash, err := sc.mungeKeyManager.FetchFromRaft(sc.clusterState)
+		if err != nil {
+			return fmt.Errorf("failed to fetch munge key from Raft: %w", err)
 		}
+
+		sc.Logger().Infof("Fetched existing munge key from Raft (hash: %s)", hash[:16]+"...")
+		sc.mungeKey = key
+
+		// Write to local disk
+		if err := sc.mungeKeyManager.WriteMungeKey(key); err != nil {
+			return fmt.Errorf("failed to write munge key to disk: %w", err)
+		}
+
+		return nil
 	}
 
+	// No munge key in cluster - we need to generate one
+	// Only the leader should generate and store
+	if !sc.IsLeader() {
+		sc.Logger().Warn("Not leader and no munge key in cluster, waiting for leader to generate")
+		return fmt.Errorf("waiting for leader to generate munge key")
+	}
+
+	sc.Logger().Info("Generating new munge key (first controller)")
+	key, err := sc.mungeKeyManager.GenerateMungeKey()
+	if err != nil {
+		return fmt.Errorf("failed to generate munge key: %w", err)
+	}
+
+	// Store in Raft (this replicates to all nodes)
+	if err := sc.mungeKeyManager.StoreInRaft(sc.leaderElector, key); err != nil {
+		return fmt.Errorf("failed to store munge key in Raft: %w", err)
+	}
+
+	sc.mungeKey = key
+
+	// Write to local disk
+	if err := sc.mungeKeyManager.WriteMungeKey(key); err != nil {
+		return fmt.Errorf("failed to write munge key to disk: %w", err)
+	}
+
+	sc.Logger().Info("Munge key generated and stored in Raft successfully")
 	return nil
 }
 
 // startMunge starts the munge daemon
 func (sc *SLURMController) startMunge() error {
-	// Check if munge is already running
-	if err := exec.Command("pgrep", "munged").Run(); err == nil {
-		sc.Logger().Info("Munge daemon already running")
-		return nil
-	}
-
-	sc.Logger().Info("Starting munge daemon")
-
-	cmd := exec.Command("munged", "--foreground")
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start munged: %w", err)
-	}
-
-	sc.Logger().Info("Munge daemon started")
-	return nil
+	return sc.mungeKeyManager.StartMungeDaemon()
 }
 
 const slurmConfTemplate = `# SLURM Configuration (Auto-generated by Cluster-OS)
@@ -359,8 +396,10 @@ SlurmdSpoolDir=/var/lib/slurm/slurmd
 ProctrackType=proctrack/linuxproc
 TaskPlugin=task/none
 
-# MPI
-MpiDefault=none
+# MPI Configuration
+MpiDefault=pmix
+MpiParams=ports=12000-12999
+PrologFlags=Alloc
 
 # Node definitions
 {{range .Nodes}}

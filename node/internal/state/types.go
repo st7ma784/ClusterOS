@@ -1,6 +1,7 @@
 package state
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -8,16 +9,17 @@ import (
 
 // Node represents a cluster node
 type Node struct {
-	ID           string            `json:"id"`
-	Name         string            `json:"name"`
-	Roles        []string          `json:"roles"`
-	Capabilities Capabilities      `json:"capabilities"`
-	Status       NodeStatus        `json:"status"`
-	Address      string            `json:"address"`
-	WireGuardIP  net.IP            `json:"wireguard_ip,omitempty"`
-	Tags         map[string]string `json:"tags"`
-	LastSeen     time.Time         `json:"last_seen"`
-	JoinedAt     time.Time         `json:"joined_at"`
+	ID              string            `json:"id"`
+	Name            string            `json:"name"`
+	Roles           []string          `json:"roles"`
+	Capabilities    Capabilities      `json:"capabilities"`
+	Status          NodeStatus        `json:"status"`
+	Address         string            `json:"address"`
+	WireGuardIP     net.IP            `json:"wireguard_ip,omitempty"`
+	WireGuardPubKey string            `json:"wireguard_pubkey,omitempty"` // Base64-encoded WireGuard public key
+	Tags            map[string]string `json:"tags"`
+	LastSeen        time.Time         `json:"last_seen"`
+	JoinedAt        time.Time         `json:"joined_at"`
 }
 
 // Capabilities describes node hardware capabilities
@@ -42,8 +44,16 @@ const (
 // ClusterState holds the current cluster membership and state
 type ClusterState struct {
 	mu      sync.RWMutex
-	nodes   map[string]*Node // keyed by node ID
-	leaders map[string]string // keyed by role, value is node ID
+	nodes   map[string]*Node      // keyed by node ID
+	leaders map[string]string     // keyed by role, value is node ID
+	secrets *ClusterSecrets       // cluster-wide secrets (replicated via Raft)
+}
+
+// ClusterSecrets holds cluster-wide secret data
+type ClusterSecrets struct {
+	MungeKey     []byte    `json:"munge_key"`
+	MungeKeyHash string    `json:"munge_key_hash"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // NewClusterState creates a new cluster state
@@ -51,6 +61,7 @@ func NewClusterState() *ClusterState {
 	return &ClusterState{
 		nodes:   make(map[string]*Node),
 		leaders: make(map[string]string),
+		secrets: &ClusterSecrets{},
 	}
 }
 
@@ -192,4 +203,34 @@ func (cs *ClusterState) UpdateNodeTags(nodeID string, tags map[string]string) {
 		node.Tags = tags
 		node.LastSeen = time.Now()
 	}
+}
+
+// SetMungeKey sets the munge key in cluster secrets
+func (cs *ClusterState) SetMungeKey(key []byte, hash string) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	cs.secrets.MungeKey = key
+	cs.secrets.MungeKeyHash = hash
+	cs.secrets.CreatedAt = time.Now()
+}
+
+// GetMungeKey retrieves the munge key from cluster secrets
+func (cs *ClusterState) GetMungeKey() ([]byte, string, error) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	if cs.secrets.MungeKey == nil || len(cs.secrets.MungeKey) == 0 {
+		return nil, "", fmt.Errorf("munge key not set in cluster state")
+	}
+
+	return cs.secrets.MungeKey, cs.secrets.MungeKeyHash, nil
+}
+
+// HasMungeKey returns true if a munge key has been set
+func (cs *ClusterState) HasMungeKey() bool {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	return cs.secrets.MungeKey != nil && len(cs.secrets.MungeKey) > 0
 }

@@ -124,6 +124,14 @@ type RoleConfig struct {
 	RequiresLeadership bool
 	Dependencies       []string
 	Config             map[string]interface{}
+	LeaderElector      LeaderElector // For Raft operations
+}
+
+// LeaderElector interface for Raft operations (avoid circular dependency)
+type LeaderElector interface {
+	IsLeader() bool
+	ApplySetMungeKey(mungeKey []byte, mungeKeyHash string) error
+	GetClusterState() *state.ClusterState
 }
 
 // RoleStatus represents the current status of a role

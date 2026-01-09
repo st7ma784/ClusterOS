@@ -1,24 +1,40 @@
 package discovery
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 
+	"github.com/cluster-os/node/internal/auth"
 	"github.com/cluster-os/node/internal/state"
 	"github.com/hashicorp/serf/serf"
 	"github.com/sirupsen/logrus"
 )
 
+// LeaderElector provides access to Raft operations
+type LeaderElector interface {
+	IsLeader() bool
+	AddVoter(nodeID string, address string) error
+	RemoveServer(nodeID string) error
+}
+
+// UserEventHandler handles user events
+type UserEventHandler func(name string, payload []byte) error
+
 // SerfDiscovery wraps HashiCorp Serf for cluster discovery
 type SerfDiscovery struct {
-	serf       *serf.Serf
-	eventCh    chan serf.Event
-	shutdownCh chan struct{}
-	state      *state.ClusterState
-	localNode  *state.Node
-	logger     *logrus.Logger
+	serf              *serf.Serf
+	eventCh           chan serf.Event
+	shutdownCh        chan struct{}
+	state             *state.ClusterState
+	localNode         *state.Node
+	logger            *logrus.Logger
+	clusterAuth       *auth.ClusterAuth
+	leaderElector     LeaderElector    // For Raft integration
+	raftPort          int              // Raft consensus port
+	userEventHandlers []UserEventHandler // Custom user event handlers
 }
 
 // Config contains configuration for Serf discovery
@@ -29,14 +45,22 @@ type Config struct {
 	BindPort       int
 	BootstrapPeers []string
 	EncryptKey     []byte
+	ClusterAuthKey string // Base64-encoded cluster authentication key
 	Tags           map[string]string
 	Logger         *logrus.Logger
+	RaftPort       int // Raft consensus port for cluster integration
 }
 
 // New creates a new Serf discovery instance
-func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node) (*SerfDiscovery, error) {
+func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node, leaderElector LeaderElector) (*SerfDiscovery, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = logrus.New()
+	}
+
+	// Initialize cluster authentication
+	clusterAuth, err := auth.New(cfg.ClusterAuthKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize cluster auth: %w", err)
 	}
 
 	eventCh := make(chan serf.Event, 256)
@@ -64,6 +88,14 @@ func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node) (
 	cfg.Tags["roles"] = strings.Join(localNode.Roles, ",")
 	cfg.Tags["cpu"] = strconv.Itoa(localNode.Capabilities.CPU)
 	cfg.Tags["arch"] = localNode.Capabilities.Arch
+
+	// Generate and add authentication token
+	joinToken, err := clusterAuth.CreateJoinToken(cfg.NodeID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create join token: %w", err)
+	}
+	cfg.Tags["auth_token"] = joinToken
+
 	serfConfig.Tags = cfg.Tags
 
 	// Create Serf instance
@@ -73,12 +105,15 @@ func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node) (
 	}
 
 	sd := &SerfDiscovery{
-		serf:       serfInstance,
-		eventCh:    eventCh,
-		shutdownCh: shutdownCh,
-		state:      clusterState,
-		localNode:  localNode,
-		logger:     cfg.Logger,
+		serf:          serfInstance,
+		eventCh:       eventCh,
+		shutdownCh:    shutdownCh,
+		state:         clusterState,
+		localNode:     localNode,
+		logger:        cfg.Logger,
+		clusterAuth:   clusterAuth,
+		leaderElector: leaderElector,
+		raftPort:      cfg.RaftPort,
 	}
 
 	// Join bootstrap peers if provided
@@ -157,9 +192,54 @@ func (sd *SerfDiscovery) handleMemberEvent(event serf.MemberEvent) {
 
 // handleMemberJoin processes a member join event
 func (sd *SerfDiscovery) handleMemberJoin(member serf.Member) {
+	// Skip processing for local node
+	nodeID := member.Tags["node_id"]
+	if nodeID == sd.localNode.ID {
+		return
+	}
+
+	// Validate authentication token
+	authToken := member.Tags["auth_token"]
+	if authToken == "" {
+		sd.logger.Warnf("Node %s attempted to join without auth token - rejecting", member.Name)
+		return
+	}
+
+	// Verify the join token
+	verifiedNodeID, err := sd.clusterAuth.VerifyJoinToken(authToken)
+	if err != nil {
+		sd.logger.Warnf("Node %s failed authentication: %v - rejecting", member.Name, err)
+		return
+	}
+
+	// Verify the node ID matches
+	if verifiedNodeID != nodeID {
+		sd.logger.Warnf("Node %s auth token node ID mismatch (expected %s, got %s) - rejecting",
+			member.Name, nodeID, verifiedNodeID)
+		return
+	}
+
+	sd.logger.Infof("Node %s authenticated successfully", member.Name)
+
+	// Add to local cluster state
 	node := sd.memberToNode(member)
 	node.Status = state.StatusAlive
 	sd.state.AddNode(node)
+
+	// Add to Raft cluster if we're the leader
+	if sd.leaderElector != nil && sd.leaderElector.IsLeader() {
+		raftAddr := fmt.Sprintf("%s:%d", member.Addr.String(), sd.raftPort)
+		sd.logger.Infof("Adding node %s to Raft cluster at %s", nodeID, raftAddr)
+
+		err := sd.leaderElector.AddVoter(nodeID, raftAddr)
+		if err != nil {
+			sd.logger.Errorf("Failed to add node %s to Raft cluster: %v", nodeID, err)
+		} else {
+			sd.logger.Infof("Successfully added node %s to Raft cluster", nodeID)
+		}
+	} else if sd.leaderElector != nil {
+		sd.logger.Debugf("Not Raft leader, skipping Raft voter addition for node %s", nodeID)
+	}
 }
 
 // handleMemberUpdate processes a member update event
@@ -173,12 +253,34 @@ func (sd *SerfDiscovery) handleMemberUpdate(member serf.Member) {
 func (sd *SerfDiscovery) handleMemberLeave(member serf.Member) {
 	nodeID := member.Tags["node_id"]
 	sd.state.UpdateNodeStatus(nodeID, state.StatusLeft)
+
+	// Remove from Raft cluster if we're the leader
+	if sd.leaderElector != nil && sd.leaderElector.IsLeader() {
+		sd.logger.Infof("Removing node %s from Raft cluster (graceful leave)", nodeID)
+		err := sd.leaderElector.RemoveServer(nodeID)
+		if err != nil {
+			sd.logger.Errorf("Failed to remove node %s from Raft cluster: %v", nodeID, err)
+		} else {
+			sd.logger.Infof("Successfully removed node %s from Raft cluster", nodeID)
+		}
+	}
 }
 
 // handleMemberFailed processes a member failed event
 func (sd *SerfDiscovery) handleMemberFailed(member serf.Member) {
 	nodeID := member.Tags["node_id"]
 	sd.state.UpdateNodeStatus(nodeID, state.StatusFailed)
+
+	// Remove from Raft cluster if we're the leader (after grace period)
+	if sd.leaderElector != nil && sd.leaderElector.IsLeader() {
+		sd.logger.Warnf("Node %s failed, removing from Raft cluster", nodeID)
+		err := sd.leaderElector.RemoveServer(nodeID)
+		if err != nil {
+			sd.logger.Errorf("Failed to remove node %s from Raft cluster: %v", nodeID, err)
+		} else {
+			sd.logger.Infof("Successfully removed failed node %s from Raft cluster", nodeID)
+		}
+	}
 }
 
 // handleMemberReap processes a member reap event
@@ -189,8 +291,20 @@ func (sd *SerfDiscovery) handleMemberReap(member serf.Member) {
 
 // handleUserEvent processes custom user events
 func (sd *SerfDiscovery) handleUserEvent(event serf.UserEvent) {
-	sd.logger.Debugf("Received user event: %s", event.Name)
-	// TODO: Handle custom events (e.g., munge key distribution, config updates)
+	sd.logger.Debugf("Received user event: %s (payload size: %d)", event.Name, len(event.Payload))
+
+	// Call registered handlers
+	for _, handler := range sd.userEventHandlers {
+		if err := handler(event.Name, event.Payload); err != nil {
+			sd.logger.Warnf("User event handler error: %v", err)
+		}
+	}
+}
+
+// RegisterUserEventHandler registers a handler for user events
+func (sd *SerfDiscovery) RegisterUserEventHandler(handler UserEventHandler) {
+	sd.userEventHandlers = append(sd.userEventHandlers, handler)
+	sd.logger.Debug("Registered user event handler")
 }
 
 // handleQuery processes Serf queries
@@ -218,13 +332,17 @@ func (sd *SerfDiscovery) memberToNode(member serf.Member) *state.Node {
 		Arch: member.Tags["arch"],
 	}
 
+	// Extract WireGuard public key from tags
+	wgPubKey := member.Tags["wg_pubkey"]
+
 	return &state.Node{
-		ID:           nodeID,
-		Name:         member.Name,
-		Roles:        roles,
-		Capabilities: capabilities,
-		Address:      member.Addr.String(),
-		Tags:         member.Tags,
+		ID:              nodeID,
+		Name:            member.Name,
+		Roles:           roles,
+		Capabilities:    capabilities,
+		Address:         member.Addr.String(),
+		WireGuardPubKey: wgPubKey,
+		Tags:            member.Tags,
 	}
 }
 
@@ -275,6 +393,12 @@ func (sd *SerfDiscovery) Members() []serf.Member {
 // LocalMember returns the local Serf member
 func (sd *SerfDiscovery) LocalMember() serf.Member {
 	return sd.serf.LocalMember()
+}
+
+// GetSerf returns the underlying Serf instance
+// Used for Serf-based leader election
+func (sd *SerfDiscovery) GetSerf() *serf.Serf {
+	return sd.serf
 }
 
 // Leave gracefully leaves the cluster
@@ -366,8 +490,7 @@ func ParseEncryptKey(keyStr string) ([]byte, error) {
 
 // Helper function to decode base64
 func decodeBase64(s string) ([]byte, error) {
-	// Simple base64 decode - in production use encoding/base64
-	return []byte(s), nil // Placeholder
+	return base64.StdEncoding.DecodeString(s)
 }
 
 // GetClusterSize returns the number of alive nodes in the cluster

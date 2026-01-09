@@ -42,8 +42,14 @@ networking:
 # Role configuration
 roles:
   # Enabled roles for this node
+  # All nodes can be SLURM controller or worker - Raft elects the leader
+  # All nodes can be K3s server or agent - Raft elects the leader
   enabled:
     - wireguard
+    - slurm-controller
+    - slurm-worker
+    - k3s-server
+    - k3s-agent
 
   # Node capabilities (auto-detected if empty)
   capabilities:
@@ -63,3 +69,9 @@ cluster:
   name: cluster-os
   region: default
   datacenter: default
+
+  # Cluster authentication key (REQUIRED)
+  # This key ensures only authorized nodes can join your cluster
+  # Generate with: scripts/generate-cluster-key.sh
+  # IMPORTANT: Regenerate this when forking to create your own cluster!
+  auth_key: "7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s="

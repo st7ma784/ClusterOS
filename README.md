@@ -36,6 +36,8 @@ A reproducible, self-assembling operating system image for heterogeneous bare-me
 - ✅ Integration test framework
 - ✅ Cluster control utility (cluster-ctl.sh)
 - ✅ Comprehensive test suite
+- ✅ Cluster authentication system (HMAC-SHA256)
+- ✅ Fork isolation (unique cluster keys per fork)
 
 **Next Phases:**
 - ⏳ Phase 5: OS image build (Packer)
@@ -94,6 +96,37 @@ See [test/docker/README.md](test/docker/README.md) for comprehensive testing doc
 ./bin/node-agent status
 ```
 
+## Security & Cluster Authentication
+
+### 🔒 IMPORTANT: Regenerate Cluster Key When Forking
+
+This repository includes a **cluster authentication key** that prevents unauthorized nodes from joining your cluster. When you fork or clone this repo, you **MUST** generate a new key:
+
+```bash
+# Generate your unique cluster key
+./scripts/generate-cluster-key.sh
+
+# The key will be saved to cluster.key and displayed
+# Copy it to your configuration:
+# - node/config/node.yaml (cluster.auth_key field)
+# - OR set environment variable: CLUSTEROS_CLUSTER_AUTH_KEY
+```
+
+**Why this matters:**
+- All nodes with the same key can join each other's clusters
+- The default key in this repo is PUBLIC - only for testing
+- Different keys = isolated clusters (prevents accidental cross-joining)
+- Forks with different keys form separate, independent clusters
+
+### Authentication Architecture
+
+- **HMAC-SHA256** challenge-response authentication
+- **Time-based tokens** (5-minute expiry) prevent replay attacks
+- **No key transmission** - only cryptographic signatures are sent
+- **Automatic rejection** of nodes with wrong/missing keys
+
+See [SECURITY.md](SECURITY.md) and [docs/cluster-authentication.md](docs/cluster-authentication.md) for details.
+
 ## Architecture
 
 ### Core Components
@@ -144,10 +177,11 @@ cluster-os/
 │   ├── cmd/node-agent/      # CLI entry point ✓
 │   ├── internal/            # Internal packages
 │   │   ├── identity/        # Ed25519 identity system ✓
+│   │   ├── auth/            # Cluster authentication ✓
 │   │   ├── config/          # Configuration management ✓
 │   │   ├── discovery/       # Serf integration ✓
 │   │   ├── networking/      # WireGuard mesh + IPAM ✓
-│   │   ├── roles/           # Role framework (planned)
+│   │   ├── roles/           # Role framework ✓
 │   │   └── state/           # Cluster state & Raft ✓
 │   ├── config/              # Default configuration
 │   └── go.mod               # Go dependencies

@@ -140,9 +140,12 @@ func (wgm *WireGuardManager) buildPeerList() []Peer {
 			continue
 		}
 
-		// Derive peer's public key (placeholder - in reality this would come from node identity)
-		// For now, we'll use a placeholder
-		peerPublicKey := "PLACEHOLDER_PUBLIC_KEY"
+		// Get peer's public key from cluster state (exchanged via Serf tags)
+		peerPublicKey := node.WireGuardPubKey
+		if peerPublicKey == "" {
+			wgm.logger.Warnf("No WireGuard public key for node %s, skipping peer", node.Name)
+			continue
+		}
 
 		// Create peer
 		peer := Peer{
@@ -215,7 +218,7 @@ func (wgm *WireGuardManager) ApplyConfig() error {
 	return nil
 }
 
-// bringUpInterface brings up the WireGuard interface
+// bringUpInterface brings up the WireGuard interface with retry logic
 func (wgm *WireGuardManager) bringUpInterface() error {
 	// Check if interface already exists
 	if wgm.isInterfaceUp() {
@@ -223,15 +226,41 @@ func (wgm *WireGuardManager) bringUpInterface() error {
 		return wgm.reloadInterface()
 	}
 
-	// Bring up interface using wg-quick
-	cmd := exec.Command("wg-quick", "up", wgm.interfaceName)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("wg-quick up failed: %w\nOutput: %s", err, string(output))
+	// Retry logic for bringing up the interface
+	const maxRetries = 5
+	const retryDelay = 2 * time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		wgm.logger.Infof("Bringing up interface %s (attempt %d/%d)", wgm.interfaceName, attempt, maxRetries)
+
+		// Bring up interface using wg-quick
+		cmd := exec.Command("wg-quick", "up", wgm.interfaceName)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			wgm.logger.Infof("Interface %s brought up successfully", wgm.interfaceName)
+			
+			// Wait a bit for the interface to stabilize
+			time.Sleep(500 * time.Millisecond)
+			
+			// Verify interface is actually up
+			if wgm.isInterfaceUp() {
+				wgm.logger.Infof("Interface %s verified to be operational", wgm.interfaceName)
+				return nil
+			}
+			
+			wgm.logger.Warnf("Interface %s brought up but verification failed, will retry", wgm.interfaceName)
+		} else {
+			wgm.logger.Warnf("wg-quick up failed (attempt %d/%d): %v\nOutput: %s", attempt, maxRetries, err, string(output))
+		}
+
+		// Don't sleep after the last attempt
+		if attempt < maxRetries {
+			wgm.logger.Infof("Waiting %v before retry...", retryDelay)
+			time.Sleep(retryDelay)
+		}
 	}
 
-	wgm.logger.Infof("Interface %s brought up", wgm.interfaceName)
-	return nil
+	return fmt.Errorf("failed to bring up interface %s after %d attempts", wgm.interfaceName, maxRetries)
 }
 
 // reloadInterface reloads the WireGuard configuration

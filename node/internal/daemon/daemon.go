@@ -20,18 +20,35 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// LeaderElectorInterface defines the interface for leader election
+// Both Raft-based and Serf-based electors implement this
+type LeaderElectorInterface interface {
+	IsLeader() bool
+	IsLeaderForRole(role string) bool
+	GetLeader() (string, error)
+	WaitForLeader(timeout time.Duration) error
+	RegisterRoleLeadershipObserver(role string) <-chan bool
+	ApplySetMungeKey(mungeKey []byte, mungeKeyHash string) error
+	GetClusterState() *state.ClusterState
+	AddVoter(nodeID string, address string) error
+	RemoveServer(nodeID string) error
+	Shutdown() error
+}
+
 // Daemon represents the node agent daemon
 type Daemon struct {
-	config        *config.Config
-	identity      *identity.Identity
-	clusterState  *state.ClusterState
-	discovery     *discovery.SerfDiscovery
-	leaderElector *state.LeaderElector
-	wireguard     *networking.WireGuardManager
-	roleManager   *roles.Manager
-	logger        *logrus.Logger
-	ctx           context.Context
-	cancel        context.CancelFunc
+	config            *config.Config
+	identity          *identity.Identity
+	clusterState      *state.ClusterState
+	discovery         *discovery.SerfDiscovery
+	leaderElector     *state.LeaderElector     // Raft-based (persistent)
+	serfLeaderElector *state.SerfLeaderElector // Serf-based (stateless)
+	wireguard         *networking.WireGuardManager
+	roleManager       *roles.Manager
+	logger            *logrus.Logger
+	ctx               context.Context
+	cancel            context.CancelFunc
+	electionMode      string // "serf" or "raft"
 }
 
 // Config contains configuration for the daemon
@@ -62,8 +79,22 @@ func New(cfg *Config) (*Daemon, error) {
 func (d *Daemon) Start() error {
 	d.logger.Info("Starting Cluster-OS daemon")
 
+	// Determine election mode
+	d.electionMode = d.config.Cluster.ElectionMode
+	if d.electionMode == "" {
+		d.electionMode = "serf" // Default to stateless
+	}
+	d.logger.Infof("Using election mode: %s", d.electionMode)
+
 	// Initialize cluster state
 	d.clusterState = state.NewClusterState()
+
+	// Get WireGuard public key for this node
+	wgPubKey, err := d.identity.WireGuardPublicKey()
+	if err != nil {
+		return fmt.Errorf("failed to get WireGuard public key: %w", err)
+	}
+	d.logger.Infof("Local WireGuard public key: %s", wgPubKey)
 
 	// Create local node representation
 	localNode := &state.Node{
@@ -76,25 +107,36 @@ func (d *Daemon) Start() error {
 			GPU:  d.config.Roles.Capabilities.GPU,
 			Arch: d.config.Roles.Capabilities.Arch,
 		},
-		Status: state.StatusAlive,
+		Status:          state.StatusAlive,
+		WireGuardPubKey: wgPubKey,
 	}
 
 	// Add ourselves to cluster state
 	d.clusterState.AddNode(localNode)
 
-	// Initialize leader election (Raft)
-	if err := d.initLeaderElection(); err != nil {
-		return fmt.Errorf("failed to initialize leader election: %w", err)
+	// For Raft mode, initialize Raft first (before Serf)
+	if d.electionMode == "raft" {
+		if err := d.initRaftLeaderElection(); err != nil {
+			return fmt.Errorf("failed to initialize Raft leader election: %w", err)
+		}
 	}
 
-	// Initialize discovery layer (Serf)
+	// Initialize discovery layer (Serf) - always needed
 	if err := d.initDiscovery(localNode); err != nil {
 		return fmt.Errorf("failed to initialize discovery: %w", err)
 	}
 
-	// Initialize networking (WireGuard)
+	// For Serf mode, initialize Serf-based leader election (after Serf discovery)
+	if d.electionMode == "serf" {
+		if err := d.initSerfLeaderElection(); err != nil {
+			return fmt.Errorf("failed to initialize Serf leader election: %w", err)
+		}
+	}
+
+	// Initialize networking (WireGuard) - this is critical
 	if err := d.initNetworking(); err != nil {
-		d.logger.Warnf("Failed to initialize networking: %v (continuing anyway)", err)
+		d.logger.Errorf("Failed to initialize networking (WireGuard): %v", err)
+		return fmt.Errorf("failed to initialize networking: %w", err)
 	}
 
 	// Initialize role manager and start roles
@@ -106,9 +148,9 @@ func (d *Daemon) Start() error {
 	return nil
 }
 
-// initLeaderElection initializes the Raft-based leader election
-func (d *Daemon) initLeaderElection() error {
-	d.logger.Info("Initializing leader election (Raft)")
+// initRaftLeaderElection initializes the Raft-based leader election (persistent mode)
+func (d *Daemon) initRaftLeaderElection() error {
+	d.logger.Info("Initializing leader election (Raft - persistent mode)")
 
 	// Use node name (hostname) as the advertise address
 	// In Docker, this will be the container hostname which is resolvable
@@ -139,7 +181,56 @@ func (d *Daemon) initLeaderElection() error {
 		d.logger.Warnf("Leader election timeout: %v (continuing anyway)", err)
 	}
 
-	d.logger.Info("Leader election initialized")
+	d.logger.Info("Raft leader election initialized")
+	return nil
+}
+
+// initSerfLeaderElection initializes the Serf-based leader election (stateless mode)
+func (d *Daemon) initSerfLeaderElection() error {
+	d.logger.Info("Initializing leader election (Serf - stateless mode)")
+
+	if d.discovery == nil {
+		return fmt.Errorf("serf discovery must be initialized before serf leader election")
+	}
+
+	electionCfg := &state.SerfElectionConfig{
+		NodeID:       d.identity.NodeID,
+		NodeName:     d.config.Discovery.NodeName,
+		Serf:         d.discovery.GetSerf(),
+		ClusterState: d.clusterState,
+		Logger:       d.logger,
+	}
+
+	elector, err := state.NewSerfLeaderElector(electionCfg)
+	if err != nil {
+		return fmt.Errorf("failed to create serf leader elector: %w", err)
+	}
+
+	d.serfLeaderElector = elector
+
+	// Register user event handler to receive state synchronization events
+	d.discovery.RegisterUserEventHandler(func(name string, payload []byte) error {
+		if name == "cluster-state" {
+			d.logger.Debug("Received cluster-state event, processing...")
+			return elector.HandleStateEvent(payload)
+		}
+		return nil
+	})
+
+	// Wait for leader election (quick for Serf)
+	if err := elector.WaitForLeader(10 * time.Second); err != nil {
+		d.logger.Warnf("Leader election timeout: %v (continuing anyway)", err)
+	}
+
+	// If we're not the leader, request state from the leader
+	if !elector.IsLeader() {
+		d.logger.Info("Not leader, requesting state from leader")
+		if err := elector.RequestState(); err != nil {
+			d.logger.Warnf("Failed to request state from leader: %v", err)
+		}
+	}
+
+	d.logger.Info("Serf leader election initialized")
 	return nil
 }
 
@@ -147,16 +238,42 @@ func (d *Daemon) initLeaderElection() error {
 func (d *Daemon) initDiscovery(localNode *state.Node) error {
 	d.logger.Info("Initializing discovery layer (Serf)")
 
+	// Parse encryption key if provided
+	var encryptKey []byte
+	if d.config.Discovery.EncryptKey != "" {
+		var err error
+		encryptKey, err = discovery.ParseEncryptKey(d.config.Discovery.EncryptKey)
+		if err != nil {
+			return fmt.Errorf("failed to parse encryption key: %w", err)
+		}
+	}
+
+	// Build tags including WireGuard public key
+	tags := map[string]string{
+		"wg_pubkey": localNode.WireGuardPubKey,
+	}
+
 	discoveryCfg := &discovery.Config{
 		NodeName:       d.config.Discovery.NodeName,
 		NodeID:         d.identity.NodeID,
 		BindAddr:       d.config.Discovery.BindAddr,
 		BindPort:       d.config.Discovery.BindPort,
 		BootstrapPeers: d.config.Discovery.BootstrapPeers,
+		EncryptKey:     encryptKey,
+		ClusterAuthKey: d.config.Cluster.AuthKey,
+		Tags:           tags,
 		Logger:         d.logger,
+		RaftPort:       7373, // Raft consensus port
 	}
 
-	disc, err := discovery.New(discoveryCfg, d.clusterState, localNode)
+	// Pass Raft leader elector only in raft mode
+	// In serf mode, we'll set up Serf-based leader election after
+	var leaderElector discovery.LeaderElector
+	if d.electionMode == "raft" && d.leaderElector != nil {
+		leaderElector = d.leaderElector
+	}
+
+	disc, err := discovery.New(discoveryCfg, d.clusterState, localNode, leaderElector)
 	if err != nil {
 		return fmt.Errorf("failed to create discovery: %w", err)
 	}
@@ -191,9 +308,20 @@ func (d *Daemon) initNetworking() error {
 
 	d.wireguard = wg
 
-	// Apply initial configuration
-	if err := wg.ApplyConfig(); err != nil {
-		d.logger.Warnf("Failed to apply WireGuard config: %v (may need kernel module)", err)
+	// Apply initial configuration with retries
+	maxRetries := 3
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := wg.ApplyConfig(); err != nil {
+			d.logger.Warnf("Failed to apply WireGuard config (attempt %d/%d): %v", attempt, maxRetries, err)
+			if attempt < maxRetries {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			d.logger.Errorf("Failed to apply WireGuard config after %d attempts", maxRetries)
+			return fmt.Errorf("failed to apply WireGuard configuration: %w", err)
+		}
+		d.logger.Info("WireGuard configuration applied successfully")
+		break
 	}
 
 	// Start maintenance loop to reconfigure on cluster changes
@@ -216,11 +344,24 @@ func (d *Daemon) initRoles() error {
 	registry.Register("k3s-server", k3s.NewK3sServer)
 	registry.Register("k3s-agent", k3s.NewK3sAgent)
 
+	// Determine which leader elector to use for manager
+	var managerLeaderElector roles.LeaderElectorManager
+	var roleLeaderElector roles.LeaderElector
+	if d.electionMode == "serf" && d.serfLeaderElector != nil {
+		managerLeaderElector = d.serfLeaderElector
+		roleLeaderElector = d.serfLeaderElector
+		d.logger.Info("Using Serf-based leader election for roles")
+	} else if d.leaderElector != nil {
+		managerLeaderElector = d.leaderElector
+		roleLeaderElector = d.leaderElector
+		d.logger.Info("Using Raft-based leader election for roles")
+	}
+
 	// Create role manager
 	managerCfg := &roles.ManagerConfig{
 		Registry:      registry,
 		ClusterState:  d.clusterState,
-		LeaderElector: d.leaderElector,
+		LeaderElector: managerLeaderElector,
 		Logger:        d.logger,
 	}
 
@@ -236,9 +377,10 @@ func (d *Daemon) initRoles() error {
 		d.logger.Infof("Starting role: %s", roleName)
 
 		roleConfig := &roles.RoleConfig{
-			Name:    roleName,
-			Enabled: true,
-			Config:  make(map[string]interface{}),
+			Name:          roleName,
+			Enabled:       true,
+			Config:        make(map[string]interface{}),
+			LeaderElector: roleLeaderElector, // Pass the correct LeaderElector
 		}
 
 		// Add WireGuard IP for k3s roles
@@ -305,10 +447,14 @@ func (d *Daemon) Shutdown() error {
 		}
 	}
 
-	// Shutdown leader elector
-	if d.leaderElector != nil {
+	// Shutdown leader elector (based on mode)
+	if d.electionMode == "serf" && d.serfLeaderElector != nil {
+		if err := d.serfLeaderElector.Shutdown(); err != nil {
+			d.logger.Errorf("Failed to shutdown Serf leader elector: %v", err)
+		}
+	} else if d.leaderElector != nil {
 		if err := d.leaderElector.Shutdown(); err != nil {
-			d.logger.Errorf("Failed to shutdown leader elector: %v", err)
+			d.logger.Errorf("Failed to shutdown Raft leader elector: %v", err)
 		}
 	}
 

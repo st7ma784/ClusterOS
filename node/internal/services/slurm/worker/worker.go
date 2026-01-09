@@ -7,8 +7,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/cluster-os/node/internal/roles"
+	"github.com/cluster-os/node/internal/services/slurm/auth"
 	"github.com/cluster-os/node/internal/state"
 	"github.com/sirupsen/logrus"
 )
@@ -16,11 +18,12 @@ import (
 // SLURMWorker implements the SLURM worker role
 type SLURMWorker struct {
 	*roles.BaseRole
-	config       *Config
-	clusterState *state.ClusterState
-	slurmdCmd    *exec.Cmd
-	configPath   string
-	spoolPath    string
+	config          *Config
+	clusterState    *state.ClusterState
+	slurmdCmd       *exec.Cmd
+	mungeKeyManager *auth.MungeKeyManager
+	configPath      string
+	spoolPath       string
 }
 
 // Config contains configuration for the SLURM worker
@@ -47,10 +50,11 @@ func NewSLURMWorker(roleConfig *roles.RoleConfig, logger *logrus.Logger) (roles.
 	}
 
 	return &SLURMWorker{
-		BaseRole:     roles.NewBaseRole("slurm-worker", logger),
-		config:       config,
-		configPath:   config.ConfigPath,
-		spoolPath:    config.SpoolPath,
+		BaseRole:        roles.NewBaseRole("slurm-worker", logger),
+		config:          config,
+		configPath:      config.ConfigPath,
+		spoolPath:       config.SpoolPath,
+		mungeKeyManager: auth.NewMungeKeyManager(logger),
 	}, nil
 }
 
@@ -213,31 +217,93 @@ func (sw *SLURMWorker) stopSlurmd() error {
 	return nil
 }
 
-// setupMunge ensures munge is running and configured
+// setupMunge ensures munge is running and configured using Raft consensus
 func (sw *SLURMWorker) setupMunge() error {
-	// Ensure munge key exists (should be distributed from controller)
-	mungeKeyPath := "/etc/munge/munge.key"
+	sw.Logger().Info("Setting up munge authentication via Raft")
 
-	if _, err := os.Stat(mungeKeyPath); os.IsNotExist(err) {
-		sw.Logger().Warn("Munge key not found, waiting for distribution...")
-		// In production, this should wait for key distribution
-		// For now, create a placeholder
-		if err := os.MkdirAll("/etc/munge", 0700); err != nil {
-			return fmt.Errorf("failed to create munge directory: %w", err)
-		}
-		if err := os.WriteFile(mungeKeyPath, []byte("placeholder-key"), 0400); err != nil {
-			return fmt.Errorf("failed to write munge key: %w", err)
-		}
-	}
+	// Check if key already exists on disk
+	if _, err := os.Stat(auth.MungeKeyPath); err == nil {
+		sw.Logger().Info("Munge key found on disk, verifying against Raft state")
 
-	// Start munge daemon if not running
-	if err := exec.Command("pgrep", "munged").Run(); err != nil {
-		sw.Logger().Info("Starting munge daemon")
-		cmd := exec.Command("munged", "--foreground")
-		if err := cmd.Start(); err != nil {
-			return fmt.Errorf("failed to start munged: %w", err)
+		// Verify the key matches what's in Raft
+		if err := sw.verifyMungeKeyAgainstRaft(); err != nil {
+			sw.Logger().Warnf("Munge key verification failed: %v, will fetch from Raft", err)
+			// Continue to fetch from Raft
+		} else {
+			// Key is valid, just start munge
+			return sw.mungeKeyManager.StartMungeDaemon()
 		}
 	}
 
+	// Key doesn't exist on disk or verification failed - fetch from Raft
+	sw.Logger().Info("Fetching munge key from Raft consensus state")
+
+	// Retry logic for fetching munge key from Raft
+	maxRetries := 20 // Increased retries since we need to wait for leader to generate
+	retryDelay := 3 * time.Second
+
+	for i := 0; i < maxRetries; i++ {
+		// Check if cluster has munge key
+		if !sw.clusterState.HasMungeKey() {
+			sw.Logger().Warnf("Attempt %d/%d: Cluster doesn't have munge key yet, waiting for controller to generate", i+1, maxRetries)
+			if i < maxRetries-1 {
+				time.Sleep(retryDelay)
+				continue
+			}
+			return fmt.Errorf("failed to get munge key after %d attempts: cluster has no munge key", maxRetries)
+		}
+
+		// Fetch from Raft
+		key, hash, err := sw.mungeKeyManager.FetchFromRaft(sw.clusterState)
+		if err != nil {
+			sw.Logger().Warnf("Attempt %d/%d: Failed to fetch munge key from Raft: %v", i+1, maxRetries, err)
+			if i < maxRetries-1 {
+				time.Sleep(retryDelay)
+				continue
+			}
+			return fmt.Errorf("failed to fetch munge key after %d attempts: %w", maxRetries, err)
+		}
+
+		sw.Logger().Infof("Fetched munge key from Raft (hash: %s)", hash[:16]+"...")
+
+		// Write to disk
+		if err := sw.mungeKeyManager.WriteMungeKey(key); err != nil {
+			return fmt.Errorf("failed to write munge key to disk: %w", err)
+		}
+
+		sw.Logger().Info("Munge key fetched from Raft and written to disk successfully")
+
+		// Start munge daemon
+		return sw.mungeKeyManager.StartMungeDaemon()
+	}
+
+	return fmt.Errorf("failed to setup munge after %d retries", maxRetries)
+}
+
+// verifyMungeKeyAgainstRaft verifies the existing munge key against Raft state
+func (sw *SLURMWorker) verifyMungeKeyAgainstRaft() error {
+	// Check if cluster has munge key
+	if !sw.clusterState.HasMungeKey() {
+		return fmt.Errorf("cluster does not have munge key in Raft state")
+	}
+
+	// Get expected hash from Raft
+	_, expectedHash, err := sw.clusterState.GetMungeKey()
+	if err != nil {
+		return fmt.Errorf("failed to get munge key from Raft: %w", err)
+	}
+
+	// Read the existing key from disk
+	key, err := sw.mungeKeyManager.ReadMungeKey()
+	if err != nil {
+		return fmt.Errorf("failed to read munge key from disk: %w", err)
+	}
+
+	// Verify the hash
+	if !sw.mungeKeyManager.VerifyMungeKey(key, expectedHash) {
+		return fmt.Errorf("munge key hash verification failed")
+	}
+
+	sw.Logger().Info("Munge key verified successfully against Raft state")
 	return nil
 }

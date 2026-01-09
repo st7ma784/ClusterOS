@@ -17,16 +17,21 @@ services:
       - /run
       - /run/lock
       - /tmp
+      - /var/run/dbus
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
       - node1-data:/var/lib/cluster-os
       - node1-log:/var/log/cluster-os
+      - slurm-config:/etc/slurm:rw
+      - slurm-state:/var/lib/slurm:rw
     environment:
       - NODE_NAME=node1
       - NODE_BOOTSTRAP=true
+      - NODE_K3S_ENABLED=true
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
       - WIREGUARD_PORT=51820
+      - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
         ipv4_address: 10.90.0.10
@@ -58,10 +63,13 @@ services:
       - /run
       - /run/lock
       - /tmp
+      - /var/run/dbus
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
       - node2-data:/var/lib/cluster-os
       - node2-log:/var/log/cluster-os
+      - slurm-config:/etc/slurm:rw
+      - slurm-state:/var/lib/slurm:rw
     environment:
       - NODE_NAME=node2
       - NODE_BOOTSTRAP=false
@@ -69,6 +77,7 @@ services:
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
       - WIREGUARD_PORT=51820
+      - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
         ipv4_address: 10.90.0.11
@@ -94,10 +103,13 @@ services:
       - /run
       - /run/lock
       - /tmp
+      - /var/run/dbus
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
       - node3-data:/var/lib/cluster-os
       - node3-log:/var/log/cluster-os
+      - slurm-config:/etc/slurm:rw
+      - slurm-state:/var/lib/slurm:rw
     environment:
       - NODE_NAME=node3
       - NODE_BOOTSTRAP=false
@@ -105,6 +117,7 @@ services:
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
       - WIREGUARD_PORT=51820
+      - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
         ipv4_address: 10.90.0.12
@@ -130,10 +143,13 @@ services:
       - /run
       - /run/lock
       - /tmp
+      - /var/run/dbus
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
       - node4-data:/var/lib/cluster-os
       - node4-log:/var/log/cluster-os
+      - slurm-config:/etc/slurm:rw
+      - slurm-state:/var/lib/slurm:rw
     environment:
       - NODE_NAME=node4
       - NODE_BOOTSTRAP=false
@@ -141,6 +157,7 @@ services:
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
       - WIREGUARD_PORT=51820
+      - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
         ipv4_address: 10.90.0.13
@@ -166,10 +183,13 @@ services:
       - /run
       - /run/lock
       - /tmp
+      - /var/run/dbus
     volumes:
       - /sys/fs/cgroup:/sys/fs/cgroup:rw
       - node5-data:/var/lib/cluster-os
       - node5-log:/var/log/cluster-os
+      - slurm-config:/etc/slurm:rw
+      - slurm-state:/var/lib/slurm:rw
     environment:
       - NODE_NAME=node5
       - NODE_BOOTSTRAP=false
@@ -177,6 +197,7 @@ services:
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
       - WIREGUARD_PORT=51820
+      - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
         ipv4_address: 10.90.0.14
@@ -211,4 +232,8 @@ volumes:
   node5-data:
     driver: local
   node5-log:
+    driver: local
+  slurm-config:
+    driver: local
+  slurm-state:
     driver: local

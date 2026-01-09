@@ -3,11 +3,13 @@ package identity
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 
 	"github.com/mr-tron/base58"
 	"golang.org/x/crypto/blake2b"
+	"golang.org/x/crypto/curve25519"
 )
 
 // Identity represents a node's cryptographic identity
@@ -60,6 +62,29 @@ func (i *Identity) WireGuardKeyString() (string, error) {
 	// WireGuard keys are typically base64 encoded, but we'll return hex for now
 	// and convert in the WireGuard module
 	return hex.EncodeToString(key), nil
+}
+
+// WireGuardPublicKey returns the WireGuard public key derived from the private key
+// The key is clamped per Curve25519 requirements and returned as base64
+func (i *Identity) WireGuardPublicKey() (string, error) {
+	key, err := i.DeriveWireGuardKey()
+	if err != nil {
+		return "", err
+	}
+
+	// Clamp the private key for Curve25519
+	key[0] &= 248
+	key[31] &= 127
+	key[31] |= 64
+
+	// Derive public key using scalar base multiplication
+	var publicKey [32]byte
+	var privKey [32]byte
+	copy(privKey[:], key)
+
+	curve25519.ScalarBaseMult(&publicKey, &privKey)
+
+	return base64.StdEncoding.EncodeToString(publicKey[:]), nil
 }
 
 // Verify checks if the identity is valid

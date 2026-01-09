@@ -34,6 +34,9 @@ help:
 	@echo "  make node         - Build node-agent binary"
 	@echo "  make test         - Run unit tests"
 	@echo "  make test-cluster - Start Docker multi-node test cluster"
+	@echo "  make test-slurm   - Test SLURM integration only"
+	@echo "  make test-k3s     - Test K3s integration only"
+	@echo "  make test-full    - Run full integration test suite (SLURM + K3s)"
 	@echo "  make image        - Build OS image with Packer"
 	@echo "  make release      - Create release artifacts"
 	@echo "  make clean        - Clean build artifacts"
@@ -80,8 +83,9 @@ test-coverage: test
 
 test-cluster: node
 	@echo "Starting Docker test cluster..."
+	@echo "Note: This will stop and remove any existing cluster containers"
 	@echo "Building cluster containers and starting services..."
-	./test/docker/start-cluster-direct.sh
+	@./test/docker/start-cluster-direct.sh
 	@echo ""
 	@echo "Useful commands:"
 	@echo "  ./test/docker/cluster-ctl.sh status      # Show cluster status"
@@ -103,6 +107,52 @@ test-cluster-clean:
 test-cluster-logs:
 	@echo "Showing test cluster logs..."
 	./test/docker/cluster-ctl.sh logs node1
+
+test-slurm: node
+	@echo "=========================================="
+	@echo "Testing SLURM Integration"
+	@echo "=========================================="
+	@echo "Building and starting cluster..."
+	@./test/docker/start-cluster-direct.sh
+	@echo ""
+	@echo "Waiting for cluster to stabilize..."
+	@sleep 20
+	@echo ""
+	@echo "Running SLURM tests..."
+	@RUN_K3S_TESTS=false ./test/integration/test_cluster.sh
+	@echo ""
+
+test-k3s: node
+	@echo "=========================================="
+	@echo "Testing K3s Integration"
+	@echo "=========================================="
+	@echo "Building and starting cluster..."
+	@./test/docker/start-cluster-direct.sh
+	@echo ""
+	@echo "Waiting for cluster to stabilize..."
+	@sleep 20
+	@echo ""
+	@echo "Running K3s tests..."
+	@RUN_SLURM_TESTS=false ./test/integration/test_cluster.sh
+	@echo ""
+
+test-full: node
+	@echo "=========================================="
+	@echo "Full Integration Test Suite"
+	@echo "Testing: WireGuard + SLURM + K3s"
+	@echo "=========================================="
+	@echo "Building and starting cluster..."
+	@./test/docker/start-cluster-direct.sh
+	@echo ""
+	@echo "Waiting for cluster to stabilize..."
+	@sleep 20
+	@echo ""
+	@echo "Running all tests..."
+	@./test/integration/test_cluster.sh
+	@echo ""
+	@echo "=========================================="
+	@echo "Full test suite complete!"
+	@echo "=========================================="
 
 image:
 	@echo "Building OS image with Packer..."

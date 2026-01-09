@@ -10,12 +10,19 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// LeaderElectorManager interface for leader election in role management
+// Both Raft-based and Serf-based electors implement this
+type LeaderElectorManager interface {
+	IsLeader() bool
+	RegisterRoleLeadershipObserver(role string) <-chan bool
+}
+
 // Manager manages the lifecycle of all roles on a node
 type Manager struct {
 	registry      *Registry
 	roles         map[string]Role
 	clusterState  *state.ClusterState
-	leaderElector *state.LeaderElector
+	leaderElector LeaderElectorManager
 	logger        *logrus.Logger
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -27,7 +34,7 @@ type Manager struct {
 type ManagerConfig struct {
 	Registry      *Registry
 	ClusterState  *state.ClusterState
-	LeaderElector *state.LeaderElector
+	LeaderElector LeaderElectorManager
 	Logger        *logrus.Logger
 }
 
