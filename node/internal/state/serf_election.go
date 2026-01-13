@@ -123,6 +123,24 @@ func (le *SerfLeaderElector) checkLeadership() {
 	le.currentLeader = leaderName
 	le.isLeader = (leaderName == le.nodeName)
 
+	// Get the leader's node ID from their tags
+	var leaderNodeID string
+	for _, m := range aliveMembers {
+		if m.Name == leaderName {
+			leaderNodeID = m.Tags["node_id"]
+			break
+		}
+	}
+
+	// Update ClusterState with leader information for all roles
+	if le.clusterState != nil && leaderNodeID != "" {
+		// Set leader for all roles that this node can be leader for
+		for role := range le.leaderObservers {
+			le.clusterState.SetLeader(role, leaderNodeID)
+			le.logger.Debugf("Set leader for role %s: nodeID=%s nodeName=%s", role, leaderNodeID, leaderName)
+		}
+	}
+
 	// Notify observers if leadership changed
 	if wasLeader != le.isLeader {
 		le.logger.Infof("Leadership changed: isLeader=%v (leader is %s)", le.isLeader, leaderName)
@@ -295,6 +313,21 @@ func (le *SerfLeaderElector) RegisterRoleLeadershipObserver(role string) <-chan 
 
 	// Send current state immediately
 	ch <- le.isLeader
+
+	// Also set the initial leader in ClusterState if we know who the leader is
+	if le.clusterState != nil && le.currentLeader != "" {
+		// Find the leader's node ID
+		members := le.serf.Members()
+		for _, m := range members {
+			if m.Name == le.currentLeader && m.Status == serf.StatusAlive {
+				if nodeID := m.Tags["node_id"]; nodeID != "" {
+					le.clusterState.SetLeader(role, nodeID)
+					le.logger.Debugf("Initial leader set for role %s: nodeID=%s", role, nodeID)
+				}
+				break
+			}
+		}
+	}
 
 	return ch
 }

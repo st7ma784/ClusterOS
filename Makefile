@@ -30,19 +30,31 @@ all: deps fmt node test
 help:
 	@echo "Cluster-OS Build System"
 	@echo ""
-	@echo "Available targets:"
+	@echo "Build Targets:"
 	@echo "  make node         - Build node-agent binary"
+	@echo "  make image        - Build OS image with Packer (requires Packer & QEMU)"
+	@echo "  make usb          - Create USB installer image"
+	@echo "  make release      - Create release artifacts"
+	@echo ""
+	@echo "Test Targets (Docker - Limited):"
 	@echo "  make test         - Run unit tests"
 	@echo "  make test-cluster - Start Docker multi-node test cluster"
 	@echo "  make test-slurm   - Test SLURM integration only"
 	@echo "  make test-k3s     - Test K3s integration only"
 	@echo "  make test-full    - Run full integration test suite (SLURM + K3s)"
-	@echo "  make image        - Build OS image with Packer"
-	@echo "  make release      - Create release artifacts"
-	@echo "  make clean        - Clean build artifacts"
+	@echo ""
+	@echo "Test Targets (QEMU VMs - Full systemd support):"
+	@echo "  make test-vm      - Start QEMU VM cluster (3 nodes)"
+	@echo "  make test-vm-5    - Start QEMU VM cluster (5 nodes)"
+	@echo "  make vm-status    - Show VM cluster status"
+	@echo "  make vm-stop      - Stop VM cluster"
+	@echo "  make vm-clean     - Stop and remove all VM data"
+	@echo ""
+	@echo "Development Targets:"
 	@echo "  make fmt          - Format Go code"
 	@echo "  make lint         - Lint Go code"
 	@echo "  make deps         - Download Go dependencies"
+	@echo "  make clean        - Clean build artifacts"
 	@echo "  make help         - Show this help message"
 	@echo ""
 	@echo "Version: $(VERSION)"
@@ -154,15 +166,42 @@ test-full: node
 	@echo "Full test suite complete!"
 	@echo "=========================================="
 
-image:
-	@echo "Building OS image with Packer..."
+image: node
+	@echo "========================================="
+	@echo "Building OS image with Packer"
+	@echo "========================================="
 	@if [ ! -f $(PACKER_FILE) ]; then \
 		echo "Error: Packer file not found at $(PACKER_FILE)"; \
-		echo "Packer configuration not yet created"; \
 		exit 1; \
 	fi
-	cd images/ubuntu && $(PACKER) init . && $(PACKER) build $(PACKER_FILE)
-	@echo "OS image built"
+	@if ! command -v packer >/dev/null 2>&1; then \
+		echo "Error: Packer not installed"; \
+		echo "Install with: wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg"; \
+		echo "  echo 'deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com focal main' | sudo tee /etc/apt/sources.list.d/hashicorp.list"; \
+		echo "  sudo apt update && sudo apt install packer"; \
+		exit 1; \
+	fi
+	@if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then \
+		echo "Error: QEMU not installed"; \
+		echo "Install with: sudo apt-get install qemu-system-x86 qemu-utils"; \
+		exit 1; \
+	fi
+	@echo "Initializing Packer plugins..."
+	cd images/ubuntu && $(PACKER) init .
+	@echo "Cleaning previous build output..."
+	rm -rf /data/packer-output/cluster-os-node
+	@echo "Building image (this may take 10-20 minutes)..."
+	cd images/ubuntu && $(PACKER) build packer.pkr.hcl
+	@echo ""
+	@echo "========================================="
+	@echo "OS image built successfully!"
+	@echo "========================================="
+	@ls -lh /data/packer-output/cluster-os-node/
+
+usb: image
+	@echo "Creating USB installer..."
+	@./scripts/create-usb-installer.sh --both
+	@echo "USB installer created"
 
 release: clean node test
 	@echo "Creating release artifacts..."
@@ -184,6 +223,42 @@ release: clean node test
 	@echo "Version: $(VERSION)"
 	@ls -lh dist/cluster-os-$(VERSION).tar.gz
 
+test-vm: image
+	@echo "========================================="
+	@echo "Starting QEMU VM Cluster (3 nodes)"
+	@echo "========================================="
+	@NUM_NODES=3 ./test/vm/qemu/start-cluster.sh
+	@echo ""
+	@echo "VM cluster started!"
+	@echo "Use 'make vm-status' to check status"
+
+test-vm-5: image
+	@echo "========================================="
+	@echo "Starting QEMU VM Cluster (5 nodes)"
+	@echo "========================================="
+	@NUM_NODES=5 ./test/vm/qemu/start-cluster.sh
+	@echo ""
+	@echo "VM cluster started!"
+	@echo "Use 'make vm-status' to check status"
+
+vm-status:
+	@./test/vm/qemu/cluster-ctl.sh status
+
+vm-info:
+	@./test/vm/qemu/cluster-ctl.sh info
+
+vm-stop:
+	@./test/vm/qemu/cluster-ctl.sh stop
+
+vm-clean:
+	@./test/vm/qemu/cluster-ctl.sh clean
+
+test-vm-integration: test-vm
+	@echo "========================================="
+	@echo "Running QEMU VM Integration Tests"
+	@echo "========================================="
+	@./test/vm/integration-test.sh
+
 clean:
 	@echo "Cleaning build artifacts..."
 	rm -rf $(BUILD_DIR)
@@ -192,6 +267,7 @@ clean:
 	rm -rf node/coverage.html
 	rm -rf images/**/output-*
 	rm -rf images/**/packer_cache
+	rm -rf test/vm/qemu/vms
 	@echo "Clean complete"
 
 dev-setup:

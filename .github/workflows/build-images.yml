@@ -1,0 +1,344 @@
+name: Build OS Images and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub Release'
+        required: false
+        type: boolean
+        default: true
+      upload_artifacts:
+        description: 'Upload build artifacts'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  GO_VERSION: '1.22.0'
+  PACKER_VERSION: '1.10.0'
+
+jobs:
+  build-node-agent:
+    name: Build Node Agent
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Build node-agent
+        run: make node
+
+      - name: Run tests
+        run: make test
+
+      - name: Build multi-arch binaries
+        run: make release
+
+      - name: Upload node-agent artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: node-agent-binaries
+          path: |
+            dist/*/node-agent-*
+            dist/*/SHA256SUMS
+          retention-days: 30
+
+  build-os-image:
+    name: Build OS Image with Packer
+    runs-on: ubuntu-latest
+    needs: build-node-agent
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download node-agent binary
+        uses: actions/download-artifact@v3
+        with:
+          name: node-agent-binaries
+          path: dist/
+
+      - name: Extract node-agent for image
+        run: |
+          mkdir -p bin
+          # Get the latest version directory
+          VERSION_DIR=$(ls -d dist/*/ | head -1)
+          cp "${VERSION_DIR}node-agent-linux-amd64" bin/node-agent
+          chmod +x bin/node-agent
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Install Packer
+        run: |
+          wget -q https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip
+          unzip packer_${PACKER_VERSION}_linux_amd64.zip
+          sudo mv packer /usr/local/bin/
+          packer --version
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            cloud-image-utils \
+            genisoimage
+
+      - name: Cache Packer plugins
+        uses: actions/cache@v3
+        with:
+          path: ~/.packer.d/plugins
+          key: ${{ runner.os }}-packer-${{ hashFiles('images/ubuntu/packer.pkr.hcl') }}
+
+      - name: Initialize Packer
+        run: |
+          cd images/ubuntu
+          packer init .
+
+      - name: Validate Packer template
+        run: |
+          cd images/ubuntu
+          packer validate packer.pkr.hcl
+
+      - name: Build OS image
+        run: |
+          cd images/ubuntu
+          packer build -force packer.pkr.hcl
+        timeout-minutes: 45
+
+      - name: Create checksums
+        run: |
+          cd images/ubuntu/output-cluster-os-node
+          sha256sum *.qcow2 *.raw* > SHA256SUMS
+
+      - name: Upload OS image artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: os-images
+          path: |
+            images/ubuntu/output-cluster-os-node/*.qcow2
+            images/ubuntu/output-cluster-os-node/*.raw.gz
+            images/ubuntu/output-cluster-os-node/SHA256SUMS
+          retention-days: 30
+
+  create-installers:
+    name: Create USB/ISO Installers
+    runs-on: ubuntu-latest
+    needs: build-os-image
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download OS images
+        uses: actions/download-artifact@v3
+        with:
+          name: os-images
+          path: images/ubuntu/output-cluster-os-node/
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y genisoimage qemu-utils
+
+      - name: Create USB installer
+        run: |
+          chmod +x scripts/create-usb-installer.sh
+          ./scripts/create-usb-installer.sh --both
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum *.iso *.img.gz > SHA256SUMS
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: installers
+          path: |
+            dist/*.iso
+            dist/*.img.gz
+            dist/SHA256SUMS
+          retention-days: 30
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-node-agent, build-os-image, create-installers]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true'
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+
+          # Copy binaries
+          cp -r node-agent-binaries/*/* release/ || true
+
+          # Copy images
+          cp os-images/*.qcow2 release/ || true
+          cp os-images/*.raw.gz release/ || true
+          cp os-images/SHA256SUMS release/OS-SHA256SUMS || true
+
+          # Copy installers
+          cp installers/*.iso release/ || true
+          cp installers/*.img.gz release/ || true
+          cp installers/SHA256SUMS release/INSTALLER-SHA256SUMS || true
+
+          # Create combined checksums
+          cat release/*SHA256SUMS > release/SHA256SUMS
+
+          ls -lah release/
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=$(git describe --tags --always)
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          cat > release_notes.md << 'EOF'
+          # Cluster-OS ${{ steps.version.outputs.version }}
+
+          ## What's Included
+
+          ### Bootable OS Images
+          - `cluster-os-node.qcow2` - QEMU/KVM virtual machine image
+          - `cluster-os-node.raw.gz` - Compressed raw disk image for bare metal
+
+          ### Installers
+          - `cluster-os-installer.iso` - Bootable ISO installer
+          - `cluster-os-usb.img.gz` - USB installer image
+
+          ### Node Agent Binaries
+          - `node-agent-linux-amd64` - x86_64 Linux binary
+          - `node-agent-linux-arm64` - ARM64 Linux binary
+
+          ## Quick Start
+
+          ### Deploy to QEMU/KVM
+          ```bash
+          # Download and extract
+          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/cluster-os-node.qcow2
+
+          # Launch VM
+          qemu-system-x86_64 \
+            -name cluster-node-1 \
+            -m 4096 -smp 4 \
+            -drive file=cluster-os-node.qcow2,format=qcow2 \
+            -net nic -net user,hostfwd=tcp::2222-:22 \
+            -accel kvm
+          ```
+
+          ### Deploy to USB Drive
+          ```bash
+          # Download USB image
+          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/cluster-os-usb.img.gz
+
+          # Write to USB (replace /dev/sdX with your device)
+          gunzip -c cluster-os-usb.img.gz | sudo dd of=/dev/sdX bs=4M status=progress
+          ```
+
+          ### Deploy to Bare Metal
+          ```bash
+          # Download raw image
+          wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.version }}/cluster-os-node.raw.gz
+
+          # Write to disk (replace /dev/sda with your device)
+          gunzip -c cluster-os-node.raw.gz | sudo dd of=/dev/sda bs=4M status=progress
+          ```
+
+          ## Included Components
+
+          - **Ubuntu 24.04 LTS** - Base operating system
+          - **Node Agent** - Cluster control plane
+          - **WireGuard** - Encrypted mesh networking
+          - **SLURM** - HPC workload manager
+          - **K3s** - Lightweight Kubernetes
+          - **Pre-configured WiFi** - Auto-connect support
+
+          ## Documentation
+
+          - [Quick Start Guide](https://github.com/${{ github.repository }}/blob/main/PACKER_QEMU_QUICKSTART.md)
+          - [Getting Started](https://github.com/${{ github.repository }}/blob/main/GETTING_STARTED.md)
+          - [VM Testing](https://github.com/${{ github.repository }}/blob/main/docs/VM_TESTING.md)
+          - [Deployment Guide](https://github.com/${{ github.repository }}/blob/main/docs/DEPLOYMENT.md)
+
+          ## Verification
+
+          All artifacts include SHA256 checksums. Verify downloads:
+          ```bash
+          sha256sum -c SHA256SUMS
+          ```
+
+          ## Support
+
+          - Documentation: https://github.com/${{ github.repository }}/tree/main/docs
+          - Issues: https://github.com/${{ github.repository }}/issues
+          EOF
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Cluster-OS ${{ steps.version.outputs.version }}
+          body_path: release_notes.md
+          files: |
+            release/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  notify:
+    name: Notify Build Status
+    runs-on: ubuntu-latest
+    needs: [build-node-agent, build-os-image, create-installers, create-release]
+    if: always()
+
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Node Agent: ${{ needs.build-node-agent.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- OS Image: ${{ needs.build-os-image.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Installers: ${{ needs.create-installers.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Release: ${{ needs.create-release.result }}" >> $GITHUB_STEP_SUMMARY

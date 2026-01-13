@@ -173,6 +173,9 @@ func (ks *K3sServer) startK3s() error {
 	// Disable Traefik (we'll use our own ingress)
 	args = append(args, "--disable", "traefik")
 
+	// Use native snapshotter for Docker/container environments where overlayfs may not work
+	args = append(args, "--snapshotter", "native")
+
 	cmd := exec.Command("k3s", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
