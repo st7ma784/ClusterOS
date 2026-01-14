@@ -19,6 +19,15 @@ CPUS="${CPUS:-2}"
 VM_DIR="$SCRIPT_DIR/vms"
 SHARED_KEY="$PROJECT_ROOT/cluster.key"
 
+# Detect KVM availability
+if [ -e /dev/kvm ] && grep -q kvm /proc/cpuinfo 2>/dev/null; then
+    QEMU_ACCEL="kvm"
+    QEMU_CPU="host"
+else
+    QEMU_ACCEL="tcg"
+    QEMU_CPU="qemu64"  # Use generic CPU model for TCG
+fi
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -178,8 +187,8 @@ launch_vm() {
 
     qemu-system-x86_64 \
         -name "cluster-os-node$node_num" \
-        -machine type=pc,accel=kvm \
-        -cpu host \
+        -machine type=pc,accel=$QEMU_ACCEL \
+        -cpu $QEMU_CPU \
         -smp cpus=$CPUS \
         -m $MEMORY \
         -drive file="$vm_dir/disk.qcow2",format=qcow2,if=virtio \
@@ -207,6 +216,10 @@ main() {
     log_info "  Base Image: $BASE_IMAGE"
     log_info "  Memory per VM: ${MEMORY}M"
     log_info "  CPUs per VM: $CPUS"
+    log_info "  QEMU Accelerator: $QEMU_ACCEL"
+    if [ "$QEMU_ACCEL" = "tcg" ]; then
+        log_info "  (TCG is slow - VMs will take 2-5 minutes to boot)"
+    fi
     log_info "========================================="
     echo ""
 

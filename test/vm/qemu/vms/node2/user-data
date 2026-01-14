@@ -1,0 +1,25 @@
+#cloud-config
+hostname: cluster-node-2
+fqdn: cluster-node-2.cluster.local
+
+# Preserve hostname
+preserve_hostname: false
+
+# Write cluster key
+write_files:
+  - path: /etc/cluster-os/cluster.key
+    content: 7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
+    permissions: '0600'
+    owner: root:root
+
+# Run on first boot
+runcmd:
+  - systemctl daemon-reload
+  - systemctl restart node-agent.service
+  - netplan apply
+
+# Set timezone
+timezone: UTC
+
+# Disable cloud-init on subsequent boots
+final_message: "Cluster OS node2 is ready!"

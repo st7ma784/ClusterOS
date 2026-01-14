@@ -200,6 +200,17 @@ EOF
 
 # Create simple installer ISO (alternative method)
 create_simple_iso() {
+    log_info "Checking image size for ISO compatibility..."
+
+    local raw_size=$(stat -c%s "$RAW_IMAGE" 2>/dev/null)
+    local max_iso_size=$((4294967296 - 1))  # 4GB - 1
+
+    if [ "$raw_size" -gt "$max_iso_size" ]; then
+        log_warn "Image size ($((raw_size / 1024 / 1024 / 1024))GB) exceeds ISO 9660 4GB limit"
+        log_warn "Skipping ISO creation - the USB image (cluster-os-usb.img.gz) is the recommended method"
+        return 0
+    fi
+
     log_info "Creating simple installer ISO..."
 
     mkdir -p "$OUTPUT_DIR"

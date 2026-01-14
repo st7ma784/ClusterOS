@@ -200,8 +200,8 @@ image: node
 
 usb: image
 	@echo "Creating USB installer..."
-	@./scripts/create-usb-installer.sh --both
-	@echo "USB installer created"
+	@./scripts/create-usb-installer.sh --usb
+	@echo "USB installer created successfully"
 
 release: clean node test
 	@echo "Creating release artifacts..."

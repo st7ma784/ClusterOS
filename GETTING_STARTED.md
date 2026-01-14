@@ -83,7 +83,11 @@ make test-vm
 make test-vm-5
 ```
 
-Wait about 60 seconds for VMs to boot and initialize.
+⏱️ **Boot time depends on your system:**
+- **With KVM acceleration**: ~30-60 seconds per VM
+- **Without KVM (TCG fallback)**: ~2-5 minutes per VM (runs in software emulation)
+
+The launcher automatically detects if KVM is available and falls back to TCG if needed.
 
 ## Step 5: Verify Cluster
 
@@ -245,30 +249,43 @@ vncviewer localhost:5900
 To deploy to physical hardware:
 
 ```bash
-# Create USB/ISO installer
+# Create USB installer
 make usb
 ```
 
-This creates:
-- `dist/cluster-os-installer.iso` - Bootable ISO
-- `dist/cluster-os-usb.img.gz` - Compressed USB image
+This creates: `dist/cluster-os-usb.img.gz` - A compressed bootable disk image (~2-3GB)
+
+⚠️ **Important**: The USB image is the **raw disk image** - NOT a standard ISO file. It must be written directly to the USB drive using `dd`, not burned using ISO burning software.
 
 ### Write to USB Drive
 
 ```bash
-# Find your USB device
+# 1. Find your USB device
 lsblk
 
-# Write image (WARNING: This erases the USB drive!)
-gunzip -c dist/cluster-os-usb.img.gz | sudo dd of=/dev/sdX bs=4M status=progress
+# 2. Write image to USB (WARNING: This ERASES the USB drive!)
+gunzip -c dist/cluster-os-usb.img.gz | sudo dd of=/dev/sdX bs=4M status=progress oflag=sync
 
-# Replace /dev/sdX with your actual USB device
+# Replace /dev/sdX with your actual USB device (e.g., /dev/sdb, /dev/sdc)
+# ⚠️ Make sure you have the CORRECT device - double-check with lsblk!
+```
+
+Example with device verification:
+```bash
+# List all disks
+lsblk
+
+# Create USB (example: /dev/sdb)
+gunzip -c dist/cluster-os-usb.img.gz | sudo dd of=/dev/sdb bs=4M status=progress oflag=sync
+
+# Verify write completed
+sync
 ```
 
 ### Boot from USB
 
 1. Insert USB into target machine
-2. Enter BIOS/UEFI (F2, F12, or Del)
+2. Enter BIOS/UEFI setup (usually F2, F12, Del, or Esc during boot)
 3. Set USB as first boot device
 4. Disable Secure Boot if required
 5. Save and reboot
@@ -427,6 +444,29 @@ make vm-clean
 
 # Remove old images
 rm -rf images/ubuntu/output-*
+```
+
+### USB drive won't boot
+
+```bash
+# Common issues:
+
+# 1. Wrong device - DOUBLE-CHECK with lsblk before writing!
+lsblk
+# USB should appear as /dev/sdX (where X is a letter)
+
+# 2. Image not written correctly - try with oflag=sync
+gunzip -c dist/cluster-os-usb.img.gz | sudo dd of=/dev/sdX bs=4M status=progress oflag=sync
+sync  # Wait for write to complete
+
+# 3. USB may need to be unmounted first
+sudo umount /dev/sdX* 2>/dev/null || true
+gunzip -c dist/cluster-os-usb.img.gz | sudo dd of=/dev/sdX bs=4M status=progress oflag=sync
+
+# 4. Check BIOS - ensure USB boot is enabled and in correct priority order
+
+# 5. Don't use ISO burning software - the .img.gz is a raw disk image, not an ISO!
+# Write directly with dd as shown above
 ```
 
 ## Getting Help
