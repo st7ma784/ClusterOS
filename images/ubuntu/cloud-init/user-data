@@ -1,0 +1,66 @@
+#cloud-config
+
+# User setup
+users:
+  - name: clusteros
+    plain_text_passwd: clusteros
+    groups: [sudo, adm, docker]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+
+# Enable password auth for SSH
+ssh_pwauth: true
+
+# Set hostname
+hostname: cluster-node
+
+# Grow root partition to fill disk
+growpart:
+  mode: auto
+  devices: ['/']
+
+# Resize filesystem
+resize_rootfs: true
+
+# Set timezone
+timezone: UTC
+
+# Package management
+package_update: true
+package_upgrade: true
+
+packages:
+  - openssh-server
+  - curl
+  - wget
+  - ca-certificates
+  - gnupg
+  - jq
+  - net-tools
+  - iproute2
+  - wireguard
+  - wireguard-tools
+
+# Write files
+write_files:
+  - path: /etc/sysctl.d/99-clusteros.conf
+    content: |
+      # ClusterOS Network Configuration
+      net.ipv4.ip_forward = 1
+      net.ipv6.conf.all.forwarding = 1
+      net.bridge.bridge-nf-call-iptables = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+
+  - path: /etc/modules-load.d/clusteros.conf
+    content: |
+      br_netfilter
+
+# Run commands at first boot
+runcmd:
+  - sysctl --system
+  - systemctl enable ssh
+  - systemctl start ssh
+
+# Final message
+final_message: "ClusterOS cloud-init complete after $UPTIME seconds"

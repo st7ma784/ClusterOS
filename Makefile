@@ -209,7 +209,15 @@ image: node
 usb: image
 	@echo "Creating USB installer..."
 	@./scripts/create-usb-installer.sh --usb
-	@echo "USB installer created successfully"
+	@echo ""
+	@echo "========================================="
+	@echo "USB installer created!"
+	@echo "========================================="
+	@ls -lh dist/cluster-os-usb.img
+	@echo ""
+	@echo "Write to USB with:"
+	@echo "  sudo dd if=dist/cluster-os-usb.img of=/dev/sdX bs=4M status=progress"
+	@echo ""
 
 release: clean node test
 	@echo "Creating release artifacts..."

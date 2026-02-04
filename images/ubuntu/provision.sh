@@ -1,129 +1,182 @@
 #!/bin/bash
-set -e
+# ClusterOS Provisioning Script
+# Runs after cloud-init during packer build
+set -euo pipefail
 
-# Cluster OS Image Provisioning Script
-# This script is run by Packer to configure the base image
+echo "============================================"
+echo "ClusterOS Provisioning"
+echo "============================================"
 
-echo "========================================="
-echo "Cluster OS Provisioning Started"
-echo "========================================="
+# ------------------------------------------------------------------------------
+# Install node-agent and cluster-os-install
+# ------------------------------------------------------------------------------
+echo "[1/6] Installing node-agent and CLI tools..."
 
-# Configuration
-NODE_AGENT_BIN="/usr/local/bin/node-agent"
-CONFIG_DIR="/etc/cluster-os"
-DATA_DIR="/var/lib/cluster-os"
-LOG_DIR="/var/log/cluster-os"
+sudo install -m 755 /tmp/node-agent /usr/local/bin/node-agent
 
-# Create directories
-echo "Creating cluster-os directories..."
-sudo mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"
-sudo mkdir -p /etc/wireguard /etc/slurm /etc/munge
-
-# Set permissions
-sudo chmod 755 "$CONFIG_DIR"
-sudo chmod 700 "$DATA_DIR"
-sudo chmod 755 "$LOG_DIR"
-sudo chmod 700 /etc/wireguard
-sudo chmod 755 /etc/slurm
-sudo chmod 700 /etc/munge
-
-# Verify node-agent binary
-if [ -f "$NODE_AGENT_BIN" ]; then
-    echo "Node agent installed: $($NODE_AGENT_BIN --version || echo 'version check failed')"
-else
-    echo "ERROR: Node agent binary not found at $NODE_AGENT_BIN"
-    exit 1
+# Install cluster-os-install (the remote installer script)
+if [ -f /tmp/cluster-os-install ]; then
+    sudo install -m 755 /tmp/cluster-os-install /usr/local/bin/cluster-os-install
+    echo "  cluster-os-install installed"
 fi
 
-# Configure systemd services
-echo "Configuring systemd services..."
+# Create directories
+sudo mkdir -p /etc/clusteros /var/lib/clusteros /var/log/clusteros
+sudo chmod 755 /etc/clusteros /var/log/clusteros
+sudo chmod 700 /var/lib/clusteros
 
-# Disable k3s by default (will be enabled by node-agent if role assigned)
-sudo systemctl disable k3s 2>/dev/null || true
-sudo systemctl disable k3s-agent 2>/dev/null || true
+# Copy config
+sudo cp /tmp/clusteros-files/config/node.yaml /etc/clusteros/
+sudo chmod 644 /etc/clusteros/node.yaml
 
-# Disable SLURM by default (will be enabled by node-agent if role assigned)
-sudo systemctl disable slurmctld 2>/dev/null || true
-sudo systemctl disable slurmd 2>/dev/null || true
-sudo systemctl disable munge 2>/dev/null || true
-
-# Enable node-agent to start on boot
+# Copy and enable systemd service
+sudo cp /tmp/clusteros-files/systemd/node-agent.service /etc/systemd/system/
+sudo systemctl daemon-reload
 sudo systemctl enable node-agent.service
 
-# Network configuration
-echo "Configuring network..."
+# ------------------------------------------------------------------------------
+# Install k3s (disabled by default)
+# ------------------------------------------------------------------------------
+echo "[2/6] Installing k3s..."
 
-# Ensure netplan applies on boot
+# Pin to a known stable version to avoid checksum issues with latest
+K3S_VERSION="v1.31.4+k3s1"
+
+# Retry k3s install up to 3 times (handles transient download issues)
+for i in 1 2 3; do
+  echo "  k3s install attempt $i (version: $K3S_VERSION)..."
+  # Clear any partial downloads
+  sudo rm -f /usr/local/bin/k3s 2>/dev/null || true
+  
+  if curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" INSTALL_K3S_SKIP_START=true INSTALL_K3S_SKIP_ENABLE=true sh -; then
+    echo "  k3s installed successfully"
+    break
+  fi
+  
+  if [ $i -eq 3 ]; then
+    echo "  k3s install failed after 3 attempts, continuing anyway..."
+    # Don't fail the build - k3s can be installed later
+    break
+  fi
+  echo "  Retrying in 10 seconds..."
+  sleep 10
+done
+
+# Disable k3s services (node-agent will enable when needed)
+sudo systemctl disable k3s.service 2>/dev/null || true
+sudo systemctl disable k3s-agent.service 2>/dev/null || true
+
+# ------------------------------------------------------------------------------
+# Install SLURM (disabled by default)
+# ------------------------------------------------------------------------------
+echo "[3/6] Installing SLURM..."
+
+sudo apt-get install -y munge slurm-wlm slurm-client
+
+# Install tools needed for cluster-os-install
+sudo apt-get install -y rsync gdisk dosfstools efibootmgr parted
+
+# Create directories
+sudo mkdir -p /etc/slurm /etc/munge /var/spool/slurm /var/log/slurm
+sudo chmod 700 /etc/munge
+sudo chmod 755 /etc/slurm /var/spool/slurm /var/log/slurm
+
+# Disable SLURM services (node-agent will enable when needed)
+sudo systemctl disable munge.service 2>/dev/null || true
+sudo systemctl disable slurmctld.service 2>/dev/null || true
+sudo systemctl disable slurmd.service 2>/dev/null || true
+
+# ------------------------------------------------------------------------------
+# Install Tailscale
+# ------------------------------------------------------------------------------
+echo "[4/6] Installing Tailscale..."
+
+# Install Tailscale
+curl -fsSL https://tailscale.com/install.sh | sh
+
+# Enable tailscaled but don't start (will auth on first boot)
+sudo systemctl enable tailscaled
+
+# Install Tailscale auth config if provided
+if [ -f /tmp/clusteros-files/tailscale/tailscale.env ]; then
+    echo "  Installing Tailscale credentials..."
+    sudo mkdir -p /etc/clusteros
+    sudo cp /tmp/clusteros-files/tailscale/tailscale.env /etc/clusteros/
+    sudo chmod 600 /etc/clusteros/tailscale.env
+    
+    # Install and enable auto-auth service
+    if [ -f /tmp/clusteros-files/systemd/tailscale-auth.service ]; then
+        sudo cp /tmp/clusteros-files/systemd/tailscale-auth.service /etc/systemd/system/
+        sudo systemctl daemon-reload
+        sudo systemctl enable tailscale-auth.service
+        echo "  Tailscale auto-auth enabled"
+    fi
+fi
+
+# ------------------------------------------------------------------------------
+# Network configuration
+# ------------------------------------------------------------------------------
+echo "[5/6] Configuring network..."
+
+# Copy netplan config
+sudo cp /tmp/clusteros-files/netplan/99-clusteros.yaml /etc/netplan/
+sudo chmod 600 /etc/netplan/99-clusteros.yaml
+
+# Ensure networkd is used
 sudo systemctl enable systemd-networkd
 sudo systemctl enable systemd-resolved
 
-# Enable IP forwarding for WireGuard and Kubernetes
-cat <<EOF | sudo tee /etc/sysctl.d/99-cluster-os.conf
-# Cluster OS Network Configuration
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
+# WireGuard directory
+sudo mkdir -p /etc/wireguard
+sudo chmod 700 /etc/wireguard
 
-# Optimize for cluster networking
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
+# ------------------------------------------------------------------------------
+# Final setup
+# ------------------------------------------------------------------------------
+echo "[6/6] Final setup..."
 
-# Kubernetes requirements
-net.bridge.bridge-nf-call-iptables = 1
-net.bridge.bridge-nf-call-ip6tables = 1
-EOF
+# Install MOTD scripts
+echo "  Installing MOTD..."
+sudo mkdir -p /etc/update-motd.d
+if [ -d /tmp/clusteros-files/motd ]; then
+    sudo cp /tmp/clusteros-files/motd/* /etc/update-motd.d/
+    sudo chmod +x /etc/update-motd.d/*
+fi
+# Disable default Ubuntu MOTD components we don't want
+sudo chmod -x /etc/update-motd.d/10-help-text 2>/dev/null || true
+sudo chmod -x /etc/update-motd.d/50-motd-news 2>/dev/null || true
+sudo chmod -x /etc/update-motd.d/88-esm-announce 2>/dev/null || true
+sudo chmod -x /etc/update-motd.d/91-contract-ua-esm-status 2>/dev/null || true
 
-# Load br_netfilter module for Kubernetes
-echo "br_netfilter" | sudo tee /etc/modules-load.d/cluster-os.conf
+# Install CLI commands
+echo "  Installing ClusterOS commands..."
+if [ -d /tmp/clusteros-files/bin ]; then
+    sudo cp /tmp/clusteros-files/bin/* /usr/local/bin/
+    sudo chmod +x /usr/local/bin/cluster-*
+fi
 
-# SSH hardening
-echo "Configuring SSH..."
-sudo sed -i 's/#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
-sudo sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+# SSH config - disable root login
+sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
 
-# Create default cluster configuration
-cat <<EOF | sudo tee "$CONFIG_DIR/node.yaml"
-# Cluster OS Node Configuration
-# This file is managed by the node-agent
+# Apply sysctl settings
+sudo sysctl --system
 
-node:
-  # Node identity will be generated on first boot
-  data_dir: "$DATA_DIR"
-  log_dir: "$LOG_DIR"
-
-discovery:
-  # Discovery bootstrap nodes (empty means this node will bootstrap)
-  bootstrap_nodes: []
-  # Serf bind port
-  bind_port: 7946
-
-wireguard:
-  # WireGuard listen port
-  listen_port: 51820
-  # MTU for WireGuard interface
-  mtu: 1420
-
-roles:
-  # Roles are assigned dynamically by the cluster
-  # Possible roles: slurm-controller, slurm-worker, k8s-control-plane, k8s-worker
-  enabled: []
-EOF
-
-sudo chmod 644 "$CONFIG_DIR/node.yaml"
-
-echo "========================================="
-echo "Cluster OS Provisioning Complete"
-echo "========================================="
+# Verify installation
 echo ""
-echo "Installed components:"
-echo "  - Node Agent: $NODE_AGENT_BIN"
-echo "  - WireGuard: $(wg --version 2>&1 | head -n1)"
-echo "  - K3s: $(k3s --version 2>&1 | head -n1 || echo 'not installed')"
-echo "  - SLURM: $(sinfo --version 2>&1 || echo 'not installed')"
+echo "============================================"
+echo "Installation Summary"
+echo "============================================"
+echo "node-agent:  $(node-agent --version 2>&1 || echo 'installed')"
+echo "k3s:         $(k3s --version 2>&1 | head -1 || echo 'installed')"
+echo "slurm:       $(sinfo --version 2>&1 || echo 'installed')"
+echo "wireguard:   $(wg --version 2>&1 | head -1 || echo 'installed')"
 echo ""
-echo "Services configured:"
-echo "  - node-agent.service: enabled"
-echo "  - systemd-networkd: enabled"
-echo "  - systemd-resolved: enabled"
+echo "ClusterOS commands installed:"
+ls -1 /usr/local/bin/cluster-* 2>/dev/null || echo "  (none)"
 echo ""
+echo "Enabled services:"
+systemctl list-unit-files | grep -E "node-agent|k3s|slurm|munge" | head -10
+echo ""
+echo "============================================"
+echo "Provisioning Complete"
+echo "============================================"

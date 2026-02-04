@@ -1,0 +1,56 @@
+#!/bin/bash
+# ClusterOS MOTD - Help/Commands
+
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echo -e "${YELLOW}ClusterOS Commands:${NC}"
+echo -e "  ${GREEN}cluster-os-install${NC}    - Install ClusterOS to disk"
+echo -e "  ${GREEN}cluster-os-create-usb${NC} - Create new USB installer"
+echo -e "  ${GREEN}cluster-init${NC}          - Initialize a new cluster"
+echo -e "  ${GREEN}cluster-join${NC}          - Join an existing cluster"
+echo -e "  ${GREEN}cluster-status${NC}        - Show cluster status"
+echo -e "  ${GREEN}cluster-help${NC}          - Show all commands"
+echo ""
+echo -e "${YELLOW}Services:${NC}"
+
+# Check node-agent status
+if systemctl is-active --quiet node-agent 2>/dev/null; then
+    echo -e "  node-agent:  ${GREEN}running${NC}"
+else
+    echo -e "  node-agent:  ${YELLOW}stopped${NC}"
+fi
+
+# Check k3s status
+if systemctl is-active --quiet k3s 2>/dev/null; then
+    echo -e "  k3s:         ${GREEN}running${NC}"
+elif systemctl is-enabled --quiet k3s 2>/dev/null; then
+    echo -e "  k3s:         ${YELLOW}enabled (not running)${NC}"
+else
+    echo -e "  k3s:         disabled"
+fi
+
+# Check slurm status
+if systemctl is-active --quiet slurmd 2>/dev/null; then
+    echo -e "  slurm:       ${GREEN}running${NC}"
+elif systemctl is-enabled --quiet slurmd 2>/dev/null; then
+    echo -e "  slurm:       ${YELLOW}enabled (not running)${NC}"
+else
+    echo -e "  slurm:       disabled"
+fi
+
+# Check Tailscale status
+if systemctl is-active --quiet tailscaled 2>/dev/null; then
+    TS_STATUS=$(tailscale status --self 2>/dev/null | awk '{print $1}' || echo '')
+    if [ -n "$TS_STATUS" ]; then
+        echo -e "  tailscale:   ${GREEN}running ($TS_STATUS)${NC}"
+    else
+        echo -e "  tailscale:   ${GREEN}running${NC}"
+    fi
+else
+    echo -e "  tailscale:   ${YELLOW}not running${NC}"
+fi
+
+echo ""

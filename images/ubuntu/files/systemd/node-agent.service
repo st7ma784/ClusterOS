@@ -1,0 +1,21 @@
+[Unit]
+Description=ClusterOS Node Agent
+Documentation=https://github.com/cluster-os
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/node-agent
+Restart=always
+RestartSec=10
+Environment="NODE_CONFIG_PATH=/etc/clusteros/node.yaml"
+EnvironmentFile=-/etc/clusteros/node.env
+
+# Security hardening
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

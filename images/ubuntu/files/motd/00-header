@@ -1,0 +1,28 @@
+#!/bin/bash
+# ClusterOS MOTD Header
+
+# Colors
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+WHITE='\033[1;37m'
+NC='\033[0m'
+
+echo -e "${CYAN}"
+cat << 'EOF'
+   _____ _           _              ___  ____  
+  / ____| |         | |            / _ \/ ___| 
+ | |    | |_   _ ___| |_ ___ _ __ | | | \___ \ 
+ | |    | | | | / __| __/ _ \ '__|| | | |___) |
+ | |____| | |_| \__ \ ||  __/ |   | |_| |____/ 
+  \_____|_|\__,_|___/\__\___|_|    \___/|_____|
+                                                
+EOF
+echo -e "${NC}"
+
+# System info
+echo -e "${WHITE}Welcome to ClusterOS${NC}"
+echo -e "  Hostname:  $(hostname)"
+echo -e "  IP:        $(hostname -I 2>/dev/null | awk '{print $1}' || echo 'N/A')"
+echo -e "  Kernel:    $(uname -r)"
+echo ""

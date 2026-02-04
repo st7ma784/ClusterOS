@@ -79,19 +79,80 @@ create_usb_image() {
     log_info "Copying raw image..."
     cp "$RAW_IMAGE" "$IMG_OUTPUT"
 
-    # Compress for distribution
-    log_info "Compressing image..."
-    gzip -f "$IMG_OUTPUT"
+    local img_size=$(du -h "$IMG_OUTPUT" | cut -f1)
+    log_info "USB image created: $IMG_OUTPUT ($img_size)"
 
-    local img_size=$(du -h "${IMG_OUTPUT}.gz" | cut -f1)
-    log_info "USB image created: ${IMG_OUTPUT}.gz ($img_size)"
+    # Embed the installer image into the image itself (self-replicating)
+    log_info "Embedding installer image for self-replication..."
+    embed_installer_image
+
+    # Final size after embedding
+    local final_size=$(du -h "$IMG_OUTPUT" | cut -f1)
+    log_info "Final USB image: $IMG_OUTPUT ($final_size)"
 
     echo ""
     echo "To write to USB drive:"
-    echo "  gunzip -c ${IMG_OUTPUT}.gz | sudo dd of=/dev/sdX bs=4M status=progress oflag=sync"
+    echo "  sudo dd if=$IMG_OUTPUT of=/dev/sdX bs=4M status=progress oflag=sync"
     echo ""
     echo "Replace /dev/sdX with your USB device (use lsblk to find it)"
     echo "WARNING: This will erase all data on the USB drive!"
+}
+
+# Embed the installer image into the built image for self-replication
+embed_installer_image() {
+    log_info "Mounting image to embed installer..."
+    
+    local LOOP_DEV=""
+    local MOUNT_DIR="/tmp/clusteros-embed-$$"
+    
+    # Set up loop device
+    LOOP_DEV=$(sudo losetup --find --show --partscan "$IMG_OUTPUT")
+    if [ -z "$LOOP_DEV" ]; then
+        log_warn "Failed to set up loop device, skipping embed"
+        return 0
+    fi
+    
+    # Wait for partitions
+    sleep 2
+    
+    # Find the root partition (usually partition 1 or 2)
+    local ROOT_PART=""
+    if [ -b "${LOOP_DEV}p2" ]; then
+        ROOT_PART="${LOOP_DEV}p2"
+    elif [ -b "${LOOP_DEV}p1" ]; then
+        ROOT_PART="${LOOP_DEV}p1"
+    else
+        log_warn "Could not find root partition, skipping embed"
+        sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
+        return 0
+    fi
+    
+    # Mount
+    mkdir -p "$MOUNT_DIR"
+    if ! sudo mount "$ROOT_PART" "$MOUNT_DIR" 2>/dev/null; then
+        log_warn "Failed to mount root partition, skipping embed"
+        sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
+        rmdir "$MOUNT_DIR" 2>/dev/null || true
+        return 0
+    fi
+    
+    # Create directory and copy compressed image
+    sudo mkdir -p "$MOUNT_DIR/usr/share/clusteros"
+    
+    log_info "Compressing and embedding installer (this may take a minute)..."
+    sudo gzip -c "$RAW_IMAGE" > /tmp/installer.img.gz
+    sudo mv /tmp/installer.img.gz "$MOUNT_DIR/usr/share/clusteros/installer.img.gz"
+    sudo chmod 644 "$MOUNT_DIR/usr/share/clusteros/installer.img.gz"
+    
+    local embedded_size=$(sudo du -h "$MOUNT_DIR/usr/share/clusteros/installer.img.gz" | cut -f1)
+    log_info "Embedded installer: $embedded_size (compressed)"
+    
+    # Cleanup
+    sudo umount "$MOUNT_DIR"
+    sudo losetup -d "$LOOP_DEV"
+    rmdir "$MOUNT_DIR" 2>/dev/null || true
+    
+    log_info "Self-replicating installer embedded successfully"
 }
 
 # Create bootable ISO

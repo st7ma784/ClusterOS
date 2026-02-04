@@ -1,0 +1,17 @@
+# ClusterOS Node Configuration
+# Generated at image build time
+
+node:
+  data_dir: /var/lib/clusteros
+  log_dir: /var/log/clusteros
+
+discovery:
+  bind_port: 7946
+  bootstrap_nodes: []
+
+wireguard:
+  listen_port: 51820
+  mtu: 1420
+
+roles:
+  enabled: []
