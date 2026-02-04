@@ -29,7 +29,7 @@ variable "disk_size" {
 
 variable "memory" {
   type    = string
-  default = "2048"
+  default = "4096"
 }
 
 variable "cpus" {
@@ -60,10 +60,10 @@ source "qemu" "ubuntu-2404" {
   disk_size        = var.disk_size
   format           = "qcow2"
   
-  # Use TCG (software emulation) - works on any system
-  # KVM is not available on this system (no /dev/kvm found)
-  # TCG builds are slower (1-2 hours) but work without special hardware
-  accelerator      = "tcg"
+  # Use KVM hardware acceleration for much faster builds
+  # KVM is available on this system (/dev/kvm found)
+  # KVM builds are fast (10-20 minutes) vs TCG (1-2 hours)
+  accelerator      = "kvm"
 
   # VM resources
   memory           = var.memory
@@ -76,13 +76,13 @@ source "qemu" "ubuntu-2404" {
   # SSH settings
   ssh_username     = var.ssh_username
   ssh_password     = var.ssh_password
-  ssh_timeout      = "90m"  # Extended timeout for TCG fallback (20m for KVM)
+  ssh_timeout      = "30m"  # Timeout for KVM builds (90m was for TCG)
 
   # VM name
   vm_name          = "${var.vm_name}.qcow2"
 
   # Boot configuration - Ubuntu autoinstall
-  boot_wait        = "10s"  # Increased for potential TCG fallback
+  boot_wait        = "10s"  # Boot wait for KVM acceleration
   boot_command     = [
     "<esc><wait>",
     "e<wait>",
