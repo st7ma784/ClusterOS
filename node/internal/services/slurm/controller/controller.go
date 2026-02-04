@@ -28,6 +28,8 @@ type SLURMController struct {
 	configPath      string
 	statePath       string
 	slurmConfPath   string
+	isBackup        bool   // Whether this is a backup controller
+	backupAddr      string // Address of the backup controller
 }
 
 // Config contains configuration for the SLURM controller
@@ -476,8 +478,8 @@ func (sc *SLURMController) getSlurmdbdHost() string {
 	// Find a K3s server node to access the NodePort
 	k3sServers := sc.clusterState.GetNodesByRole("k3s-server")
 	for _, node := range k3sServers {
-		if node.Status == state.StatusAlive && node.TailscaleIP != nil {
-			return node.TailscaleIP.String()
+		if node.Status == state.StatusAlive && node.TailscaleIP != "" {
+			return node.TailscaleIP
 		}
 		// Fallback to regular address if no Tailscale IP
 		if node.Status == state.StatusAlive && node.Address != "" {

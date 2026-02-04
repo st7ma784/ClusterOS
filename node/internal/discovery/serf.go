@@ -1,18 +1,16 @@
 package discovery
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"net"
-	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cluster-os/node/internal/auth"
 	"github.com/cluster-os/node/internal/state"
-	"github.com/hashicorp/go-msgpack/codec"
 	"github.com/hashicorp/serf/serf"
 	"github.com/sirupsen/logrus"
 )
@@ -27,32 +25,40 @@ type LeaderElector interface {
 // UserEventHandler handles user events
 type UserEventHandler func(name string, payload []byte) error
 
+// MembershipChangeHandler handles membership changes
+type MembershipChangeHandler func() error
+
 // SerfDiscovery wraps HashiCorp Serf for cluster discovery
 type SerfDiscovery struct {
-	serf              *serf.Serf
-	eventCh           chan serf.Event
-	shutdownCh        chan struct{}
-	state             *state.ClusterState
-	localNode         *state.Node
-	logger            *logrus.Logger
-	clusterAuth       *auth.ClusterAuth
-	leaderElector     LeaderElector    // For Raft integration
-	raftPort          int              // Raft consensus port
-	userEventHandlers []UserEventHandler // Custom user event handlers
+	serf                     *serf.Serf
+	eventCh                  chan serf.Event
+	shutdownCh               chan struct{}
+	state                    *state.ClusterState
+	localNode                *state.Node
+	logger                   *logrus.Logger
+	clusterAuth              *auth.ClusterAuth
+	leaderElector            LeaderElector    // For Raft integration
+	raftPort                 int              // Raft consensus port
+	userEventHandlers        []UserEventHandler // Custom user event handlers
+	membershipChangeHandlers []MembershipChangeHandler // Membership change handlers
+	lanDiscoveryEnabled      bool
+	lanDiscoveryLoop         context.CancelFunc
 }
 
 // Config contains configuration for Serf discovery
 type Config struct {
-	NodeName       string
-	NodeID         string
-	BindAddr       string
-	BindPort       int
-	BootstrapPeers []string
-	EncryptKey     []byte
-	ClusterAuthKey string // Base64-encoded cluster authentication key
-	Tags           map[string]string
-	Logger         *logrus.Logger
-	RaftPort       int // Raft consensus port for cluster integration
+	NodeName         string
+	NodeID           string
+	BindAddr         string
+	BindPort         int
+	BootstrapPeers   []string
+	EncryptKey       []byte
+	ClusterAuthKey   string // Base64-encoded cluster authentication key
+	Tags             map[string]string
+	Logger           *logrus.Logger
+	RaftPort         int  // Raft consensus port for cluster integration
+	LANDiscovery     bool // Enable LAN discovery
+	LANDiscoveryScan time.Duration // How often to scan for peers on LAN
 }
 
 // New creates a new Serf discovery instance
@@ -136,11 +142,11 @@ func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node, l
 	// Start event handler
 	go sd.handleEvents()
 
-	// Start LAN discovery if enabled (default: enabled when no bootstrap peers)
-	if cfg.LANDiscovery || len(cfg.BootstrapPeers) == 0 {
-		sd.lanDiscoveryEnabled = true
-		go sd.lanDiscoveryLoop(cfg.LANDiscoveryScan)
-	}
+	// TODO: Implement LAN discovery
+	// if cfg.LANDiscovery || len(cfg.BootstrapPeers) == 0 {
+	//     sd.lanDiscoveryEnabled = true
+	//     go sd.lanDiscoveryLoop(cfg.LANDiscoveryScan)
+	// }
 
 	return sd, nil
 }
@@ -376,9 +382,9 @@ func (sd *SerfDiscovery) memberToNode(member serf.Member) *state.Node {
 	}
 
 	// Extract Tailscale IP from tags (stored in wgip tag for compatibility)
-	var tsIP net.IP
+	var tailscaleIP string
 	if tsIPStr := member.Tags["wgip"]; tsIPStr != "" {
-		tsIP = net.ParseIP(tsIPStr)
+		tailscaleIP = tsIPStr
 	}
 
 	// Extract WireGuard public key from tags
@@ -391,6 +397,7 @@ func (sd *SerfDiscovery) memberToNode(member serf.Member) *state.Node {
 		Capabilities:    capabilities,
 		Address:         member.Addr.String(),
 		WireGuardPubKey: wgPubKey,
+		TailscaleIP:     tailscaleIP,
 		Tags:            member.Tags,
 	}
 }

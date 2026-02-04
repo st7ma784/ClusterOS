@@ -17,6 +17,7 @@ type Node struct {
 	Address         string            `json:"address"`
 	WireGuardIP     net.IP            `json:"wireguard_ip,omitempty"`
 	WireGuardPubKey string            `json:"wireguard_pubkey,omitempty"` // Base64-encoded WireGuard public key
+	TailscaleIP     string            `json:"tailscale_ip,omitempty"`     // Tailscale IP address
 	Tags            map[string]string `json:"tags"`
 	LastSeen        time.Time         `json:"last_seen"`
 	JoinedAt        time.Time         `json:"joined_at"`
@@ -53,25 +54,28 @@ type ServiceEndpoint struct {
 
 // ClusterState holds the current cluster membership and state
 type ClusterState struct {
-	mu      sync.RWMutex
-	nodes   map[string]*Node      // keyed by node ID
-	leaders map[string]string     // keyed by role, value is node ID
-	secrets *ClusterSecrets       // cluster-wide secrets (replicated via Raft)
+	mu               sync.RWMutex
+	nodes            map[string]*Node                // keyed by node ID
+	leaders          map[string]string               // keyed by role, value is node ID
+	serviceEndpoints map[string]*ServiceEndpoint     // keyed by service name
+	secrets          *ClusterSecrets                 // cluster-wide secrets (replicated via Raft)
 }
 
 // ClusterSecrets holds cluster-wide secret data
 type ClusterSecrets struct {
 	MungeKey     []byte    `json:"munge_key"`
 	MungeKeyHash string    `json:"munge_key_hash"`
+	K3sToken     string    `json:"k3s_token"`
 	CreatedAt    time.Time `json:"created_at"`
 }
 
 // NewClusterState creates a new cluster state
 func NewClusterState() *ClusterState {
 	return &ClusterState{
-		nodes:   make(map[string]*Node),
-		leaders: make(map[string]string),
-		secrets: &ClusterSecrets{},
+		nodes:            make(map[string]*Node),
+		leaders:          make(map[string]string),
+		serviceEndpoints: make(map[string]*ServiceEndpoint),
+		secrets:          &ClusterSecrets{},
 	}
 }
 
@@ -285,4 +289,64 @@ func (cs *ClusterState) HasMungeKey() bool {
 	defer cs.mu.RUnlock()
 
 	return cs.secrets.MungeKey != nil && len(cs.secrets.MungeKey) > 0
+}
+
+// SetK3sToken sets the K3s cluster token
+func (cs *ClusterState) SetK3sToken(token string) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	cs.secrets.K3sToken = token
+}
+
+// GetK3sToken retrieves the K3s cluster token
+func (cs *ClusterState) GetK3sToken() (string, error) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	if cs.secrets.K3sToken == "" {
+		return "", fmt.Errorf("K3s token not set in cluster state")
+	}
+
+	return cs.secrets.K3sToken, nil
+}
+
+// GetLocalNode returns the local node from the cluster state
+func (cs *ClusterState) GetLocalNode() *Node {
+	// This is a placeholder - in a real implementation, this would be
+	// determined by the node's identity
+	// For now, return nil to indicate not implemented
+	return nil
+}
+
+// GetWireGuardIPs returns all WireGuard IPs in the cluster
+func (cs *ClusterState) GetWireGuardIPs() map[string]net.IP {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	ips := make(map[string]net.IP)
+	for id, node := range cs.nodes {
+		if node.WireGuardIP != nil {
+			ips[id] = node.WireGuardIP
+		}
+	}
+	return ips
+}
+
+// SetLocalNodeID sets the local node ID (for identification)
+func (cs *ClusterState) SetLocalNodeID(nodeID string) {
+	// This is a placeholder - in a real implementation, this would store
+	// the local node ID for identification purposes
+	// For now, we don't need to store it as it's available through other means
+}
+
+// UpdateNodeTailscaleIP updates the Tailscale IP of a node
+func (cs *ClusterState) UpdateNodeTailscaleIP(nodeID, tailscaleIP string) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	if node, ok := cs.nodes[nodeID]; ok {
+		node.TailscaleIP = tailscaleIP
+		node.LastSeen = time.Now()
+	}
 }

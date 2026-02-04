@@ -332,8 +332,8 @@ func (ks *K3sServer) findExistingK3sServer() string {
 		}
 
 		// Check if this node has a Tailscale IP (means it's reachable via mesh)
-		if node.TailscaleIP != nil {
-			serverURL := fmt.Sprintf("https://%s:6443", node.TailscaleIP.String())
+		if node.TailscaleIP != "" {
+			serverURL := fmt.Sprintf("https://%s:6443", node.TailscaleIP)
 			ks.Logger().Debugf("Found potential K3s server: %s at %s", node.Name, serverURL)
 			return serverURL
 		}
@@ -346,7 +346,7 @@ func (ks *K3sServer) findExistingK3sServer() string {
 func (ks *K3sServer) getClusterToken() string {
 	// Try to read from shared location (distributed via Serf state)
 	if ks.clusterState != nil {
-		if token := ks.clusterState.GetK3sToken(); token != "" {
+		if token, err := ks.clusterState.GetK3sToken(); err == nil && token != "" {
 			return token
 		}
 	}

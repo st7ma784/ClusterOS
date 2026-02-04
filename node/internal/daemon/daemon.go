@@ -50,6 +50,7 @@ type Daemon struct {
 	leaderElector     *state.LeaderElector     // Raft-based (persistent)
 	serfLeaderElector *state.SerfLeaderElector // Serf-based (stateless)
 	wireguard         *networking.WireGuardManager
+	tailscale         *networking.TailscaleManager
 	roleManager       *roles.Manager
 	logger            *logrus.Logger
 	ctx               context.Context
@@ -450,7 +451,7 @@ func (d *Daemon) initNetworking() error {
 	d.tailscale = ts
 
 	// Update cluster state with our Tailscale IP (stored in TailscaleIP field)
-	d.clusterState.UpdateNodeTailscaleIP(d.identity.NodeID, ts.GetLocalIP())
+	d.clusterState.UpdateNodeTailscaleIP(d.identity.NodeID, ts.GetLocalIP().String())
 
 	// Update node name to use Tailscale IP for better identification
 	tailscaleIP := ts.GetLocalIP().String()
@@ -472,24 +473,6 @@ func (d *Daemon) initNetworking() error {
 		if err := d.updateSerfTailscaleIP(ts.GetLocalIP()); err != nil {
 			d.logger.Warnf("Failed to update Serf tags with Tailscale IP: %v", err)
 		}
-	}
-
-	d.wireguard = wg
-
-	// Apply initial configuration with retries
-	maxRetries := 3
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		if err := wg.ApplyConfig(); err != nil {
-			d.logger.Warnf("Failed to apply WireGuard config (attempt %d/%d): %v", attempt, maxRetries, err)
-			if attempt < maxRetries {
-				time.Sleep(2 * time.Second)
-				continue
-			}
-			d.logger.Errorf("Failed to apply WireGuard config after %d attempts", maxRetries)
-			return fmt.Errorf("failed to apply WireGuard configuration: %w", err)
-		}
-		d.logger.Info("WireGuard configuration applied successfully")
-		break
 	}
 
 	d.logger.Infof("Tailscale networking initialized, local IP: %s", ts.GetLocalIP())
@@ -616,19 +599,6 @@ func (d *Daemon) initRoles() error {
 	registry.Register("k3s-server", k3s.NewK3sServer)
 	registry.Register("k3s-agent", k3s.NewK3sAgent)
 	registry.Register("ondemand", ondemand.NewOpenOnDemand)
-
-	// Determine which leader elector to use for manager
-	var managerLeaderElector roles.LeaderElectorManager
-	var roleLeaderElector roles.LeaderElector
-	if d.electionMode == "serf" && d.serfLeaderElector != nil {
-		managerLeaderElector = d.serfLeaderElector
-		roleLeaderElector = d.serfLeaderElector
-		d.logger.Info("Using Serf-based leader election for roles")
-	} else if d.leaderElector != nil {
-		managerLeaderElector = d.leaderElector
-		roleLeaderElector = d.leaderElector
-		d.logger.Info("Using Raft-based leader election for roles")
-	}
 
 	// Determine which leader elector to use for manager
 	var managerLeaderElector roles.LeaderElectorManager
