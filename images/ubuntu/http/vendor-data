@@ -1,0 +1,3 @@
+#cloud-config
+# Empty vendor-data - required for nocloud-net datasource
+{}

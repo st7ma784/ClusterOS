@@ -15,7 +15,36 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// LeaderElector manages per-role leader election using Raft
+// LeaderElector manages per-role leader election using Raft (persistent consensus)
+// 
+// RESILIENCE ARCHITECTURE:
+// ========================
+// This implementation provides automatic failover and re-election without service disruption:
+//
+// 1. QUORUM-BASED SAFETY:
+//    - Requires majority of nodes to reach consensus (no split-brain)
+//    - If leader fails, new leader elected from remaining healthy nodes
+//    - A node losing connection to leader doesn't trigger re-election if quorum still healthy
+//
+// 2. HEARTBEAT MONITORING (1 second interval):
+//    - If leader fails to send heartbeat within 1 second, followers detect failure
+//    - New election automatically triggered (1 second timeout + 1 second election = ~2s failover)
+//    - No manual intervention needed
+//
+// 3. MESH NETWORK RESILIENCE (Tailscale with built-in redundancy):
+//    - Multiple paths between nodes ensure redundancy
+//    - If one peer connection lost, others remain active
+//    - Persistent keepalive packets prevent NAT timeout issues
+//    - Only total loss of leader (all network paths down) triggers re-election
+//
+// 4. STATE PERSISTENCE:
+//    - Raft state persisted to disk in BoltDB
+//    - Surviving nodes can recover leadership and state after crash
+//
+// TOPOLOGY:
+//    Leader Election: Raft consensus (persistent, cross-node coordination)
+//    Service Discovery: Serf gossip (membership tracking)
+//    Networking: Tailscale mesh (CGNAT 100.64.0.0/10 with global connectivity)
 type LeaderElector struct {
 	raft       *raft.Raft
 	fsm        *clusterFSM

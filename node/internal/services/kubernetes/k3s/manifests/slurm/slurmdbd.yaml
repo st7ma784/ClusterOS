@@ -1,0 +1,262 @@
+---
+# SLURM Database Daemon (slurmdbd) running in Kubernetes
+# This provides HA for SLURM's job accounting and user database
+# The slurmdbd is deployed as a Kubernetes service, making it highly available
+# and accessible from all cluster nodes via the WireGuard mesh
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: slurm
+  labels:
+    app.kubernetes.io/part-of: cluster-os
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slurmdbd-config
+  namespace: slurm
+data:
+  slurmdbd.conf: |
+    # slurmdbd configuration - managed by ClusterOS
+    AuthType=auth/munge
+    AuthInfo=/var/run/munge/munge.socket.2
+    DbdHost=slurmdbd.slurm.svc.cluster.local
+    DbdPort=6819
+    SlurmUser=slurm
+    DebugLevel=info
+    LogFile=/var/log/slurm/slurmdbd.log
+    PidFile=/var/run/slurmdbd.pid
+    StorageType=accounting_storage/mysql
+    StorageHost=slurmdbd-mysql.slurm.svc.cluster.local
+    StoragePort=3306
+    StorageUser=slurm
+    StoragePass=slurmdbpass
+    StorageLoc=slurm_acct_db
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: slurmdbd-mysql-secret
+  namespace: slurm
+type: Opaque
+stringData:
+  mysql-root-password: "clusterosroot"
+  mysql-password: "slurmdbpass"
+
+---
+# MariaDB for slurmdbd (more lightweight than MySQL)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: slurmdbd-mysql
+  namespace: slurm
+spec:
+  serviceName: slurmdbd-mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slurmdbd-mysql
+  template:
+    metadata:
+      labels:
+        app: slurmdbd-mysql
+    spec:
+      containers:
+      - name: mariadb
+        image: mariadb:10.11
+        env:
+        - name: MARIADB_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: slurmdbd-mysql-secret
+              key: mysql-root-password
+        - name: MARIADB_DATABASE
+          value: slurm_acct_db
+        - name: MARIADB_USER
+          value: slurm
+        - name: MARIADB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: slurmdbd-mysql-secret
+              key: mysql-password
+        ports:
+        - containerPort: 3306
+          name: mysql
+        volumeMounts:
+        - name: mysql-data
+          mountPath: /var/lib/mysql
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          exec:
+            command:
+            - mariadb-admin
+            - ping
+            - -h
+            - localhost
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - mariadb-admin
+            - ping
+            - -h
+            - localhost
+          initialDelaySeconds: 5
+          periodSeconds: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: mysql-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 5Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurmdbd-mysql
+  namespace: slurm
+spec:
+  selector:
+    app: slurmdbd-mysql
+  ports:
+  - port: 3306
+    targetPort: 3306
+  clusterIP: None  # Headless for StatefulSet
+
+---
+# slurmdbd deployment using Ubuntu base with SLURM packages
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slurmdbd
+  namespace: slurm
+spec:
+  replicas: 1  # Single replica - slurmdbd handles its own HA via DB
+  strategy:
+    type: Recreate  # Avoid multiple instances competing for DB
+  selector:
+    matchLabels:
+      app: slurmdbd
+  template:
+    metadata:
+      labels:
+        app: slurmdbd
+    spec:
+      initContainers:
+      # Wait for MariaDB to be ready
+      - name: wait-for-db
+        image: busybox:1.36
+        command: ['sh', '-c', 'until nc -z slurmdbd-mysql 3306; do echo waiting for db; sleep 2; done']
+      containers:
+      - name: slurmdbd
+        image: ubuntu:24.04
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+          # Install slurm packages
+          apt-get update -qq
+          apt-get install -y -qq slurmdbd munge libmunge-dev
+
+          # Create directories
+          mkdir -p /var/log/slurm /var/run/munge /etc/slurm
+          chown slurm:slurm /var/log/slurm
+
+          # Copy config
+          cp /config/slurmdbd.conf /etc/slurm/slurmdbd.conf
+          chown slurm:slurm /etc/slurm/slurmdbd.conf
+          chmod 600 /etc/slurm/slurmdbd.conf
+
+          # Setup munge
+          cp /munge-secret/munge.key /etc/munge/munge.key
+          chown munge:munge /etc/munge/munge.key
+          chmod 400 /etc/munge/munge.key
+
+          # Start munge in background
+          runuser -u munge -- /usr/sbin/munged --foreground &
+          sleep 2
+
+          # Start slurmdbd in foreground
+          exec /usr/sbin/slurmdbd -D -vvv
+        ports:
+        - containerPort: 6819
+          name: slurmdbd
+        volumeMounts:
+        - name: slurmdbd-config
+          mountPath: /config
+        - name: munge-key
+          mountPath: /munge-secret
+        - name: slurm-log
+          mountPath: /var/log/slurm
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          tcpSocket:
+            port: 6819
+          initialDelaySeconds: 60
+          periodSeconds: 10
+        readinessProbe:
+          tcpSocket:
+            port: 6819
+          initialDelaySeconds: 30
+          periodSeconds: 5
+      volumes:
+      - name: slurmdbd-config
+        configMap:
+          name: slurmdbd-config
+      - name: munge-key
+        secret:
+          secretName: munge-key
+      - name: slurm-log
+        emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurmdbd
+  namespace: slurm
+spec:
+  selector:
+    app: slurmdbd
+  ports:
+  - port: 6819
+    targetPort: 6819
+    name: slurmdbd
+  type: ClusterIP
+
+---
+# NodePort service for external access from non-K8s nodes
+apiVersion: v1
+kind: Service
+metadata:
+  name: slurmdbd-external
+  namespace: slurm
+spec:
+  selector:
+    app: slurmdbd
+  ports:
+  - port: 6819
+    targetPort: 6819
+    nodePort: 30819
+    name: slurmdbd
+  type: NodePort

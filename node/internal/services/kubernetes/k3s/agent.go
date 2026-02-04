@@ -69,9 +69,20 @@ func (ka *K3sAgent) Start(ctx context.Context, clusterState *state.ClusterState)
 		return fmt.Errorf("failed to create data directory: %w", err)
 	}
 
-	// Start k3s agent
+	// Don't start k3s agent immediately - wait for a server to be available
+	// The agent will be started when Reconfigure detects a k3s-server leader
+	// or when OnLeadershipChange is called
+	serverNode, ok := ka.clusterState.GetLeaderNode("k3s-server")
+	if !ok || serverNode.Address == "" {
+		ka.Logger().Info("k3s agent role started (waiting for k3s-server to be available)")
+		ka.SetRunning(true)
+		return nil
+	}
+
+	// Server is available, start the agent
 	if err := ka.startK3s(); err != nil {
-		return fmt.Errorf("failed to start k3s agent: %w", err)
+		// Don't fail the role start - just log and wait for reconfigure
+		ka.Logger().Warnf("Failed to start k3s agent (will retry): %v", err)
 	}
 
 	ka.SetRunning(true)
@@ -121,8 +132,22 @@ func (ka *K3sAgent) HealthCheck() error {
 		return fmt.Errorf("k3s agent role is not running")
 	}
 
+	// If we haven't started k3s yet (waiting for server), that's OK
 	if ka.k3sCmd == nil || ka.k3sCmd.Process == nil {
-		return fmt.Errorf("k3s agent process is not running")
+		// Check if there's a server available - if not, waiting is expected
+		serverNode, ok := ka.clusterState.GetLeaderNode("k3s-server")
+		if !ok || serverNode.Address == "" {
+			// No server available yet, this is expected - not an error
+			return nil
+		}
+		// Server exists but we're not connected - try to connect
+		ka.Logger().Info("k3s server detected, attempting to connect")
+		if err := ka.startK3s(); err != nil {
+			ka.Logger().Warnf("Failed to connect to k3s server: %v", err)
+			// Don't return error - we'll retry on next health check
+			return nil
+		}
+		return nil
 	}
 
 	// Check if process is still alive
@@ -170,7 +195,7 @@ func (ka *K3sAgent) startK3s() error {
 		"--data-dir", ka.dataDir,
 	}
 
-	// Set node IP to WireGuard IP
+	// Set node IP to Tailscale IP
 	if ka.config.NodeIP != "" {
 		args = append(args, "--node-ip", ka.config.NodeIP)
 	}

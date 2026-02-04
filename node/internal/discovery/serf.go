@@ -4,11 +4,15 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cluster-os/node/internal/auth"
 	"github.com/cluster-os/node/internal/state"
+	"github.com/hashicorp/go-msgpack/codec"
 	"github.com/hashicorp/serf/serf"
 	"github.com/sirupsen/logrus"
 )
@@ -80,7 +84,7 @@ func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node, l
 		serfConfig.MemberlistConfig.SecretKey = cfg.EncryptKey
 	}
 
-	// Add tags
+	// Add tags (use short names to fit within Serf's 512-byte encoded metadata limit)
 	if cfg.Tags == nil {
 		cfg.Tags = make(map[string]string)
 	}
@@ -126,11 +130,17 @@ func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node, l
 			sd.logger.Infof("Successfully joined %d peers", n)
 		}
 	} else {
-		sd.logger.Info("Bootstrap mode: no peers to join")
+		sd.logger.Info("Bootstrap mode: no peers to join, will attempt LAN discovery")
 	}
 
 	// Start event handler
 	go sd.handleEvents()
+
+	// Start LAN discovery if enabled (default: enabled when no bootstrap peers)
+	if cfg.LANDiscovery || len(cfg.BootstrapPeers) == 0 {
+		sd.lanDiscoveryEnabled = true
+		go sd.lanDiscoveryLoop(cfg.LANDiscoveryScan)
+	}
 
 	return sd, nil
 }
@@ -160,9 +170,9 @@ func (sd *SerfDiscovery) handleEvents() {
 // handleMemberEvent handles node join/leave/update/failed events
 func (sd *SerfDiscovery) handleMemberEvent(event serf.MemberEvent) {
 	for _, member := range event.Members {
-		nodeID := member.Tags["node_id"]
+		nodeID := member.Tags["id"]
 		if nodeID == "" {
-			sd.logger.Warnf("Member %s has no node_id tag", member.Name)
+			sd.logger.Warnf("Member %s has no id tag", member.Name)
 			continue
 		}
 
@@ -247,11 +257,14 @@ func (sd *SerfDiscovery) handleMemberUpdate(member serf.Member) {
 	node := sd.memberToNode(member)
 	node.Status = state.StatusAlive
 	sd.state.AddNode(node)
+
+	// Notify membership change handlers (triggers WireGuard peer refresh etc.)
+	sd.notifyMembershipChange()
 }
 
 // handleMemberLeave processes a member leave event
 func (sd *SerfDiscovery) handleMemberLeave(member serf.Member) {
-	nodeID := member.Tags["node_id"]
+	nodeID := member.Tags["id"]
 	sd.state.UpdateNodeStatus(nodeID, state.StatusLeft)
 
 	// Remove from Raft cluster if we're the leader
@@ -268,7 +281,7 @@ func (sd *SerfDiscovery) handleMemberLeave(member serf.Member) {
 
 // handleMemberFailed processes a member failed event
 func (sd *SerfDiscovery) handleMemberFailed(member serf.Member) {
-	nodeID := member.Tags["node_id"]
+	nodeID := member.Tags["id"]
 	sd.state.UpdateNodeStatus(nodeID, state.StatusFailed)
 
 	// Remove from Raft cluster if we're the leader (after grace period)
@@ -285,8 +298,22 @@ func (sd *SerfDiscovery) handleMemberFailed(member serf.Member) {
 
 // handleMemberReap processes a member reap event
 func (sd *SerfDiscovery) handleMemberReap(member serf.Member) {
-	nodeID := member.Tags["node_id"]
+	nodeID := member.Tags["id"]
 	sd.state.RemoveNode(nodeID)
+	sd.notifyMembershipChange()
+}
+
+// RegisterMembershipChangeHandler registers a callback for cluster membership changes
+// This is called when nodes join, leave, update, or fail
+func (sd *SerfDiscovery) RegisterMembershipChangeHandler(handler MembershipChangeHandler) {
+	sd.membershipChangeHandlers = append(sd.membershipChangeHandlers, handler)
+}
+
+// notifyMembershipChange calls all registered membership change handlers
+func (sd *SerfDiscovery) notifyMembershipChange() {
+	for _, handler := range sd.membershipChangeHandlers {
+		go handler() // Run handlers asynchronously to avoid blocking
+	}
 }
 
 // handleUserEvent processes custom user events
@@ -315,21 +342,43 @@ func (sd *SerfDiscovery) handleQuery(query *serf.Query) {
 
 // memberToNode converts a Serf member to a cluster node
 func (sd *SerfDiscovery) memberToNode(member serf.Member) *state.Node {
-	nodeID := member.Tags["node_id"]
+	nodeID := member.Tags["id"]
 
-	// Parse roles
+	// Parse roles (expand ultra-short abbreviations)
 	roles := []string{}
-	if roleStr := member.Tags["roles"]; roleStr != "" {
-		roles = strings.Split(roleStr, ",")
+	if roleStr := member.Tags["r"]; roleStr != "" {
+		abbrevRoles := strings.Split(roleStr, ",")
+		for _, abbrev := range abbrevRoles {
+			switch abbrev {
+			case "w":
+				roles = append(roles, "wireguard")
+			case "c":
+				roles = append(roles, "slurm-controller")
+			case "s":
+				roles = append(roles, "slurm-worker")
+			case "k":
+				roles = append(roles, "k3s-server")
+			case "a":
+				roles = append(roles, "k3s-agent")
+			default:
+				roles = append(roles, abbrev) // fallback
+			}
+		}
 	}
 
 	// Parse capabilities
-	cpu, _ := strconv.Atoi(member.Tags["cpu"])
+	cpu, _ := strconv.Atoi(member.Tags["p"])
 	capabilities := state.Capabilities{
 		CPU:  cpu,
 		RAM:  member.Tags["ram"],
 		GPU:  member.Tags["gpu"] == "true",
-		Arch: member.Tags["arch"],
+		Arch: member.Tags["h"],
+	}
+
+	// Extract Tailscale IP from tags (stored in wgip tag for compatibility)
+	var tsIP net.IP
+	if tsIPStr := member.Tags["wgip"]; tsIPStr != "" {
+		tsIP = net.ParseIP(tsIPStr)
 	}
 
 	// Extract WireGuard public key from tags
@@ -348,9 +397,9 @@ func (sd *SerfDiscovery) memberToNode(member serf.Member) *state.Node {
 
 // UpdateTags updates the local node's tags in Serf
 func (sd *SerfDiscovery) UpdateTags(tags map[string]string) error {
-	// Preserve critical tags
-	tags["node_id"] = sd.localNode.ID
-	tags["roles"] = strings.Join(sd.localNode.Roles, ",")
+	// Preserve critical tags with short names to fit Serf's 512-byte limit
+	tags["id"] = sd.localNode.ID
+	tags["r"] = strings.Join(sd.localNode.Roles, ",")
 
 	if err := sd.serf.SetTags(tags); err != nil {
 		return fmt.Errorf("failed to update tags: %w", err)
@@ -439,7 +488,7 @@ func (sd *SerfDiscovery) IsBootstrap() bool {
 // GetMemberByNodeID finds a Serf member by node ID
 func (sd *SerfDiscovery) GetMemberByNodeID(nodeID string) (*serf.Member, bool) {
 	for _, member := range sd.serf.Members() {
-		if member.Tags["node_id"] == nodeID {
+		if member.Tags["id"] == nodeID {
 			return &member, true
 		}
 	}

@@ -88,6 +88,14 @@ test: deps
 	cd $(NODE_DIR) && $(GO) test -v -race -coverprofile=coverage.out ./...
 	@echo "Tests complete"
 
+cluster-key:
+	@if [ ! -f cluster.key ]; then \
+		echo "Generating cluster authentication key..."; \
+		bash scripts/generate-cluster-key.sh; \
+	else \
+		echo "Cluster key already exists: cluster.key"; \
+	fi
+
 test-coverage: test
 	@echo "Generating coverage report..."
 	cd $(NODE_DIR) && $(GO) tool cover -html=coverage.out -o coverage.html

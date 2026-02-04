@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"runtime"
@@ -15,6 +16,7 @@ type Config struct {
 	Identity   IdentityConfig   `mapstructure:"identity"`
 	Discovery  DiscoveryConfig  `mapstructure:"discovery"`
 	Networking NetworkingConfig `mapstructure:"networking"`
+	Tailscale  TailscaleConfig  `mapstructure:"tailscale"`
 	Roles      RolesConfig      `mapstructure:"roles"`
 	Logging    LoggingConfig    `mapstructure:"logging"`
 	Cluster    ClusterConfig    `mapstructure:"cluster"`
@@ -48,6 +50,14 @@ type WiFiConfig struct {
 	Enabled bool   `mapstructure:"enabled"`
 	SSID    string `mapstructure:"ssid"`
 	Key     string `mapstructure:"key"`
+}
+
+// TailscaleConfig contains Tailscale API settings
+type TailscaleConfig struct {
+	OAuthClientID     string `mapstructure:"oauth_client_id"`
+	OAuthClientSecret string `mapstructure:"oauth_client_secret"`
+	Tailnet           string `mapstructure:"tailnet"`
+	APIDiscovery      bool   `mapstructure:"api_discovery"`
 }
 
 // RolesConfig contains role-related settings
@@ -127,6 +137,11 @@ func Load(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
+	// Load Tailscale OAuth credentials from file if not set in config
+	if err := loadTailscaleOAuthConfig(&config); err != nil {
+		logrus.Warnf("Failed to load Tailscale OAuth config: %v", err)
+	}
+
 	// Auto-detect capabilities if not set
 	if err := autoDetectCapabilities(&config); err != nil {
 		logrus.Warnf("Failed to auto-detect capabilities: %v", err)
@@ -164,12 +179,15 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("networking.listen_port", 51820)
 	v.SetDefault("networking.subnet", "10.42.0.0/16")
 	v.SetDefault("networking.ipv6", false)
-	v.SetDefault("networking.wifi.enabled", true)
-	v.SetDefault("networking.wifi.ssid", "TALKTALK665317")
-	v.SetDefault("networking.wifi.key", "NXJP7U39")
+	v.SetDefault("networking.wifi.enabled", false)
+	v.SetDefault("networking.wifi.ssid", "")
+	v.SetDefault("networking.wifi.key", "")
+
+	// Tailscale defaults
+	v.SetDefault("tailscale.api_discovery", true)
 
 	// Roles defaults
-	v.SetDefault("roles.enabled", []string{"wireguard"})
+	v.SetDefault("roles.enabled", []string{"tailscale"})
 
 	// Logging defaults
 	v.SetDefault("logging.level", "info")
@@ -245,6 +263,117 @@ func (c *Config) GetLogLevel() logrus.Level {
 		return logrus.InfoLevel
 	}
 	return level
+}
+
+// Save writes the configuration to the specified file
+func Save(config *Config, configPath string) error {
+	v := viper.New()
+
+	// Set config file path
+	v.SetConfigFile(configPath)
+	v.SetConfigType("yaml")
+
+	// Marshal configuration back to viper
+	// We need to convert the struct back to a map that viper can write
+	configMap := map[string]interface{}{
+		"identity": map[string]interface{}{
+			"path": config.Identity.Path,
+		},
+		"discovery": map[string]interface{}{
+			"bind_addr":       config.Discovery.BindAddr,
+			"bind_port":       config.Discovery.BindPort,
+			"bootstrap_peers": config.Discovery.BootstrapPeers,
+			"node_name":       config.Discovery.NodeName,
+			"encrypt_key":     config.Discovery.EncryptKey,
+		},
+		"networking": map[string]interface{}{
+			"interface":  config.Networking.Interface,
+			"listen_port": config.Networking.ListenPort,
+			"subnet":     config.Networking.Subnet,
+			"ipv6":       config.Networking.IPv6,
+			"wifi": map[string]interface{}{
+				"enabled": config.Networking.WiFi.Enabled,
+				"ssid":    config.Networking.WiFi.SSID,
+				"key":     config.Networking.WiFi.Key,
+			},
+		},
+		"roles": map[string]interface{}{
+			"enabled": config.Roles.Enabled,
+			"capabilities": map[string]interface{}{
+				"cpu":  config.Roles.Capabilities.CPU,
+				"ram":  config.Roles.Capabilities.RAM,
+				"gpu":  config.Roles.Capabilities.GPU,
+				"arch": config.Roles.Capabilities.Arch,
+			},
+		},
+		"logging": map[string]interface{}{
+			"level":  config.Logging.Level,
+			"format": config.Logging.Format,
+		},
+		"cluster": map[string]interface{}{
+			"name":          config.Cluster.Name,
+			"region":        config.Cluster.Region,
+			"datacenter":    config.Cluster.Datacenter,
+			"auth_key":      config.Cluster.AuthKey,
+			"election_mode": config.Cluster.ElectionMode,
+		},
+	}
+
+	// Set all values in viper
+	for section, values := range configMap {
+		v.Set(section, values)
+	}
+
+	// Write config file
+	if err := v.WriteConfig(); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
+}
+
+// loadTailscaleOAuthConfig loads Tailscale OAuth credentials from /etc/cluster-os/tailscale-oauth.conf
+func loadTailscaleOAuthConfig(config *Config) error {
+	file, err := os.Open("/etc/cluster-os/tailscale-oauth.conf")
+	if err != nil {
+		if os.IsNotExist(err) || os.IsPermission(err) {
+			return nil // File doesn't exist or permission denied, not an error since config is optional
+		}
+		return err
+	}
+	defer file.Close()
+
+	// Source the file as shell environment variables
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Parse KEY="value" format
+		if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.Trim(strings.TrimSpace(parts[1]), `"`)
+			
+			switch key {
+			case "TAILSCALE_OAUTH_CLIENT_ID":
+				if config.Tailscale.OAuthClientID == "" {
+					config.Tailscale.OAuthClientID = value
+				}
+			case "TAILSCALE_OAUTH_CLIENT_SECRET":
+				if config.Tailscale.OAuthClientSecret == "" {
+					config.Tailscale.OAuthClientSecret = value
+				}
+			case "TAILSCALE_TAILNET":
+				if config.Tailscale.Tailnet == "" {
+					config.Tailscale.Tailnet = value
+				}
+			}
+		}
+	}
+
+	return scanner.Err()
 }
 
 // IsBootstrap returns true if this node should bootstrap a new cluster

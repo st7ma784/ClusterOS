@@ -89,3 +89,7 @@ slurmd.log
 kubeconfig
 *.kubeconfig
 kube/
+test/**/*.iso
+test/**/*.qcow2
+test/vm/qemu/vms/
+images/ubuntu/netplan/01-clusteros-network.yaml

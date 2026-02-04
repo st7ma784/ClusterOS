@@ -139,7 +139,7 @@ See [SECURITY.md](SECURITY.md) and [docs/cluster-authentication.md](docs/cluster
 
 2. **Discovery Layer** (Serf) - ✓ Implemented
    - Gossip-based membership
-   - Automatic node discovery
+   - Automatic node discovery (LAN + Tailscale API)
    - Event propagation
    - Tag-based metadata
 

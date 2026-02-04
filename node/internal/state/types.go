@@ -41,6 +41,16 @@ const (
 	StatusUnknown NodeStatus = "unknown"
 )
 
+// ServiceEndpoint represents a service endpoint
+type ServiceEndpoint struct {
+	ServiceName string    `json:"service_name"`
+	Address     string    `json:"address"`
+	Port        int       `json:"port"`
+	NodeID      string    `json:"node_id"`
+	Status      string    `json:"status"` // "running", "stopped", "error"
+	LastSeen    time.Time `json:"last_seen"`
+}
+
 // ClusterState holds the current cluster membership and state
 type ClusterState struct {
 	mu      sync.RWMutex
@@ -181,6 +191,48 @@ func (cs *ClusterState) RemoveLeader(role string) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	delete(cs.leaders, role)
+}
+
+// UpdateServiceEndpoint updates or adds a service endpoint
+func (cs *ClusterState) UpdateServiceEndpoint(serviceName, address string, port int, nodeID, status string) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	
+	cs.serviceEndpoints[serviceName] = &ServiceEndpoint{
+		ServiceName: serviceName,
+		Address:     address,
+		Port:        port,
+		NodeID:      nodeID,
+		Status:      status,
+		LastSeen:    time.Now(),
+	}
+}
+
+// GetServiceEndpoint returns a service endpoint by name
+func (cs *ClusterState) GetServiceEndpoint(serviceName string) (*ServiceEndpoint, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	endpoint, ok := cs.serviceEndpoints[serviceName]
+	return endpoint, ok
+}
+
+// GetAllServiceEndpoints returns all service endpoints
+func (cs *ClusterState) GetAllServiceEndpoints() map[string]*ServiceEndpoint {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	
+	endpoints := make(map[string]*ServiceEndpoint)
+	for k, v := range cs.serviceEndpoints {
+		endpoints[k] = v
+	}
+	return endpoints
+}
+
+// RemoveServiceEndpoint removes a service endpoint
+func (cs *ClusterState) RemoveServiceEndpoint(serviceName string) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	delete(cs.serviceEndpoints, serviceName)
 }
 
 // UpdateNodeStatus updates the status of a node

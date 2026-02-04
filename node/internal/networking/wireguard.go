@@ -2,7 +2,9 @@ package networking
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -84,6 +86,40 @@ func (wgm *WireGuardManager) GetLocalIP() net.IP {
 	return wgm.localIP
 }
 
+// RefreshPeers regenerates and applies WireGuard peer configuration
+// Call this when cluster membership changes to update peer endpoints
+func (wgm *WireGuardManager) RefreshPeers() error {
+	wgm.logger.Debug("Refreshing WireGuard peer configuration")
+
+	// Regenerate config with current cluster state
+	config, err := wgm.GenerateConfig()
+	if err != nil {
+		return fmt.Errorf("failed to generate config: %w", err)
+	}
+
+	// Write config to file
+	tempPath := wgm.configPath + ".tmp"
+	if err := os.WriteFile(tempPath, []byte(config), 0600); err != nil {
+		return fmt.Errorf("failed to write config: %w", err)
+	}
+
+	// Atomically move to final location
+	if err := os.Rename(tempPath, wgm.configPath); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to move config: %w", err)
+	}
+
+	// If interface is up, reload it
+	if wgm.isInterfaceUp() {
+		if err := wgm.reloadInterface(); err != nil {
+			return fmt.Errorf("failed to reload interface: %w", err)
+		}
+		wgm.logger.Info("WireGuard peers refreshed successfully")
+	}
+
+	return nil
+}
+
 // GenerateConfig generates the WireGuard configuration
 func (wgm *WireGuardManager) GenerateConfig() (string, error) {
 	// Get WireGuard private key from identity
@@ -148,6 +184,8 @@ func (wgm *WireGuardManager) buildPeerList() []Peer {
 		}
 
 		// Create peer
+		// AllowedIPs should include the peer's WireGuard IP within the mesh
+		// Using /32 to be precise about peer routing
 		peer := Peer{
 			PublicKey:           peerPublicKey,
 			Endpoint:            fmt.Sprintf("%s:%d", node.Address, wgm.listenPort),
@@ -331,6 +369,84 @@ func (wgm *WireGuardManager) StartMaintenance(interval time.Duration) {
 func (wgm *WireGuardManager) Shutdown() error {
 	wgm.logger.Info("Shutting down WireGuard manager")
 	return wgm.BringDownInterface()
+}
+
+// IPConflictCallback is called when an IP conflict is resolved
+// The callback receives the old IP, new IP, and the node that triggered the conflict
+type IPConflictCallback func(oldIP, newIP net.IP, conflictingNodeID string)
+
+// CheckAndResolveIPConflict checks if the local node's IP conflicts with another node
+// and resolves it by randomly reassigning both nodes' IPs.
+// Returns true if a conflict was detected and resolved, false otherwise.
+// The callback is invoked if the local node's IP changes.
+func (wgm *WireGuardManager) CheckAndResolveIPConflict(conflictingNodeID string, conflictingNodeIP net.IP, callback IPConflictCallback) (bool, net.IP, error) {
+	if !wgm.localIP.Equal(conflictingNodeIP) {
+		return false, nil, nil // No conflict
+	}
+
+	wgm.logger.Warnf("IP conflict detected! Local IP %s conflicts with node %s", wgm.localIP, conflictingNodeID)
+
+	// Get all current WireGuard IPs to avoid them when reassigning
+	existingIPs := wgm.clusterState.GetWireGuardIPs()
+	avoidIPs := make([]net.IP, 0, len(existingIPs))
+	for _, ip := range existingIPs {
+		avoidIPs = append(avoidIPs, ip)
+	}
+
+	// Generate a random salt for IP allocation
+	saltBytes := make([]byte, 16)
+	if _, err := rand.Read(saltBytes); err != nil {
+		return false, nil, fmt.Errorf("failed to generate random salt: %w", err)
+	}
+	salt := hex.EncodeToString(saltBytes) + "-" + wgm.identity.NodeID
+
+	// Allocate a new random IP for the local node
+	newIP, err := wgm.ipam.AllocateRandomIP(avoidIPs, salt)
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to allocate new IP during conflict resolution: %w", err)
+	}
+
+	oldIP := wgm.localIP
+	wgm.localIP = newIP
+
+	wgm.logger.Infof("IP conflict resolved: local IP changed from %s to %s", oldIP, newIP)
+
+	// Reapply WireGuard configuration with the new IP
+	if err := wgm.ApplyConfig(); err != nil {
+		// Try to revert to old IP
+		wgm.localIP = oldIP
+		return false, nil, fmt.Errorf("failed to apply new configuration: %w", err)
+	}
+
+	// Invoke callback if provided
+	if callback != nil {
+		callback(oldIP, newIP, conflictingNodeID)
+	}
+
+	return true, newIP, nil
+}
+
+// DetectConflictsOnJoin checks if a newly joined node's calculated IP conflicts with the local node
+// This should be called when a new node joins the cluster
+func (wgm *WireGuardManager) DetectConflictsOnJoin(joiningNodeID string) (bool, net.IP, error) {
+	// Calculate what IP the joining node would get
+	joiningNodeIP, err := wgm.ipam.AllocateIP(joiningNodeID)
+	if err != nil {
+		return false, nil, fmt.Errorf("failed to calculate joining node IP: %w", err)
+	}
+
+	// Check if it conflicts with our IP
+	if wgm.localIP.Equal(joiningNodeIP) {
+		wgm.logger.Warnf("Joining node %s would get IP %s which conflicts with local IP", joiningNodeID, joiningNodeIP)
+		return true, joiningNodeIP, nil
+	}
+
+	return false, joiningNodeIP, nil
+}
+
+// SetLocalIP sets a new local IP (used during conflict resolution)
+func (wgm *WireGuardManager) SetLocalIP(ip net.IP) {
+	wgm.localIP = ip
 }
 
 // configTemplate is the WireGuard configuration template

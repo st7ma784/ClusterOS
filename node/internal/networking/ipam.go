@@ -179,6 +179,72 @@ func (ipam *IPAM) GetIPRange() (net.IP, net.IP) {
 	return firstIP, lastIP
 }
 
+// AllocateIPWithConflictCheck allocates an IP for a node, checking for conflicts
+// against already assigned IPs. If a conflict is detected, it returns the conflicting
+// node ID along with an error.
+func (ipam *IPAM) AllocateIPWithConflictCheck(nodeID string, existingIPs map[string]net.IP) (net.IP, string, error) {
+	ip, err := ipam.AllocateIP(nodeID)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Check if this IP is already assigned to another node
+	for otherNodeID, otherIP := range existingIPs {
+		if otherNodeID != nodeID && ip.Equal(otherIP) {
+			return ip, otherNodeID, fmt.Errorf("IP conflict: %s is already assigned to node %s", ip, otherNodeID)
+		}
+	}
+
+	return ip, "", nil
+}
+
+// AllocateRandomIP allocates a random IP within the subnet, avoiding specified IPs
+// This is used for conflict resolution when two nodes hash to the same IP
+func (ipam *IPAM) AllocateRandomIP(avoidIPs []net.IP, salt string) (net.IP, error) {
+	networkIP := ipam.subnet.IP.To4()
+	if networkIP == nil {
+		return nil, fmt.Errorf("only IPv4 subnets are currently supported")
+	}
+
+	mask := ipam.subnet.Mask
+	ones, bits := mask.Size()
+	availableIPs := uint32(1 << uint(bits-ones))
+
+	// Convert network IP to uint32
+	networkInt := binary.BigEndian.Uint32(networkIP)
+
+	// Try different salts to find an available IP
+	for attempt := 0; attempt < 1000; attempt++ {
+		// Create a unique hash using the salt and attempt number
+		hashInput := fmt.Sprintf("%s-%d", salt, attempt)
+		hash := sha256.Sum256([]byte(hashInput))
+		hashValue := binary.BigEndian.Uint32(hash[:4])
+
+		// Map hash to available IP range (excluding network and broadcast)
+		ipOffset := (hashValue % (availableIPs - 2)) + 1
+		targetIP := networkInt + ipOffset
+
+		// Convert to IP
+		ip := make(net.IP, 4)
+		binary.BigEndian.PutUint32(ip, targetIP)
+
+		// Check if this IP conflicts with any avoided IPs
+		conflict := false
+		for _, avoidIP := range avoidIPs {
+			if ip.Equal(avoidIP) {
+				conflict = true
+				break
+			}
+		}
+
+		if !conflict {
+			return ip, nil
+		}
+	}
+
+	return nil, fmt.Errorf("failed to allocate random IP after 1000 attempts")
+}
+
 // ParseIP parses an IP address string
 func ParseIP(ipStr string) (net.IP, error) {
 	ip := net.ParseIP(ipStr)

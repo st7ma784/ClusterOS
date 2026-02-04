@@ -33,11 +33,21 @@ networking:
   # Enable IPv6
   ipv6: false
 
-  # WiFi configuration
+  # WiFi configuration (set via environment variables during image build)
   wifi:
-    enabled: true
-    ssid: "TALKTALK665317"
-    key: "NXJP7U39"
+    enabled: false
+    ssid: ""
+    key: ""
+
+# Tailscale settings
+tailscale:
+  # OAuth client credentials (loaded from /etc/cluster-os/tailscale-oauth.conf if available)
+  oauth_client_id: ""
+  oauth_client_secret: ""
+  tailnet: ""
+
+  # Enable API-based discovery (uses Tailscale API to find cluster peers)
+  api_discovery: true
 
 # Role configuration
 roles:
