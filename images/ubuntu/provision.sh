@@ -221,6 +221,7 @@ if [ -d /tmp/clusteros-files/bin ]; then
     sudo cp /tmp/clusteros-files/bin/* /usr/local/bin/
     sudo chmod +x /usr/local/bin/cluster-*
     sudo chmod +x /usr/local/bin/tailscale-auth 2>/dev/null || true
+    sudo chmod +x /usr/local/bin/wait-for-tailscale 2>/dev/null || true
 fi
 
 # SSH config - disable root login

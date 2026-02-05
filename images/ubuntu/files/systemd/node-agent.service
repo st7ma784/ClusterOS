@@ -10,8 +10,8 @@ Wants=tailscale-auth.service
 Type=simple
 User=root
 Group=root
-# Wait a bit for Tailscale to fully establish connection
-ExecStartPre=/bin/sleep 5
+# Wait for Tailscale to be ready (polls status instead of fixed delay)
+ExecStartPre=/usr/local/bin/wait-for-tailscale
 ExecStartPre=-/usr/local/bin/node-agent init --identity-path /var/lib/cluster-os/identity.json
 ExecStart=/usr/local/bin/node-agent --log-level info start --foreground
 Restart=on-failure
