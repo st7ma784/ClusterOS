@@ -12,3 +12,16 @@ network:
         name: "eth*"
       dhcp4: true
       optional: true
+  wifis:
+    all-wifi:
+      match:
+        name: "w*"
+      dhcp4: true
+      dhcp6: false
+      optional: true
+      access-points:
+        # Default WiFi network for this cluster
+        # These credentials are cluster-specific and should be changed
+        # for your deployment by rebuilding the image with your WiFi settings
+        "TALKTALK665317":
+          password: "NXJP7U39"

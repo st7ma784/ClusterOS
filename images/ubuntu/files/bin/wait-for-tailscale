@@ -1,0 +1,43 @@
+#!/bin/bash
+# Wait for Tailscale to be ready before starting node-agent
+# This script polls Tailscale status instead of using a fixed delay
+
+MAX_WAIT=60  # Maximum time to wait in seconds
+POLL_INTERVAL=2  # Check every 2 seconds
+
+log_info() {
+    echo "[wait-for-tailscale] $1"
+    logger -t wait-for-tailscale "$1"
+}
+
+# Check if tailscale is installed
+if ! command -v tailscale >/dev/null 2>&1; then
+    log_info "Tailscale not installed, skipping wait"
+    exit 0
+fi
+
+log_info "Waiting for Tailscale to be ready (max ${MAX_WAIT}s)..."
+
+elapsed=0
+while [ $elapsed -lt $MAX_WAIT ]; do
+    # Check if tailscale status can be queried
+    if tailscale status --json >/dev/null 2>&1; then
+        # Get the backend state
+        STATE=$(tailscale status --json 2>/dev/null | jq -r '.BackendState' 2>/dev/null)
+        
+        if [ "$STATE" = "Running" ]; then
+            IP=$(tailscale ip -4 2>/dev/null | head -1)
+            log_info "Tailscale is ready (IP: $IP)"
+            exit 0
+        elif [ "$STATE" = "NeedsLogin" ]; then
+            log_info "Tailscale needs authentication, continuing anyway"
+            exit 0
+        fi
+    fi
+    
+    sleep $POLL_INTERVAL
+    elapsed=$((elapsed + POLL_INTERVAL))
+done
+
+log_info "Timeout waiting for Tailscale after ${MAX_WAIT}s, continuing anyway"
+exit 0

@@ -1,0 +1,114 @@
+#!/bin/bash
+# ClusterOS Tailscale Auto-Authentication Script
+# Automatically authenticates Tailscale using OAuth or auth key
+set -e
+
+LOG_PREFIX="[tailscale-auth]"
+
+log_info() {
+    echo "$LOG_PREFIX $1"
+    logger -t tailscale-auth "$1"
+}
+
+log_error() {
+    echo "$LOG_PREFIX ERROR: $1" >&2
+    logger -t tailscale-auth -p err "$1"
+}
+
+# Check if already authenticated
+if tailscale status --json 2>/dev/null | jq -e '.BackendState == "Running"' >/dev/null 2>&1; then
+    log_info "Tailscale already authenticated and running"
+    exit 0
+fi
+
+log_info "Starting Tailscale authentication..."
+
+# Wait for tailscaled to be ready
+for i in {1..30}; do
+    if tailscale status >/dev/null 2>&1; then
+        break
+    fi
+    log_info "Waiting for tailscaled to start... ($i/30)"
+    sleep 2
+done
+
+# Load credentials if available
+TAILSCALE_OAUTH_CLIENT_ID=""
+TAILSCALE_OAUTH_CLIENT_SECRET=""
+TAILSCALE_AUTHKEY=""
+TAILSCALE_TAGS='["tag:cluster-node"]'
+
+if [ -f /etc/clusteros/tailscale.env ]; then
+    log_info "Loading Tailscale credentials from /etc/clusteros/tailscale.env"
+    # shellcheck disable=SC1091
+    source /etc/clusteros/tailscale.env
+fi
+
+# Try OAuth first (preferred method)
+if [ -n "$TAILSCALE_OAUTH_CLIENT_ID" ] && [ -n "$TAILSCALE_OAUTH_CLIENT_SECRET" ]; then
+    log_info "Authenticating with OAuth..."
+    
+    # Get OAuth access token
+    ACCESS_TOKEN=$(curl -s -X POST "https://api.tailscale.com/api/v2/oauth/token" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "client_id=${TAILSCALE_OAUTH_CLIENT_ID}&client_secret=${TAILSCALE_OAUTH_CLIENT_SECRET}" | jq -r '.access_token')
+    
+    if [ "$ACCESS_TOKEN" = "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+        log_error "Failed to get OAuth access token"
+    else
+        log_info "Got OAuth access token"
+        
+        # Generate ephemeral auth key
+        AUTH_KEY=$(curl -s -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+            -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"capabilities\":{\"devices\":{\"create\":{\"reusable\":false,\"ephemeral\":false,\"preauthorized\":true,\"tags\":${TAILSCALE_TAGS}}}},\"expirySeconds\":3600}" | jq -r '.key')
+        
+        if [ "$AUTH_KEY" = "null" ] || [ -z "$AUTH_KEY" ]; then
+            log_error "Failed to generate auth key via OAuth"
+        else
+            log_info "Generated auth key via OAuth"
+            TAILSCALE_AUTHKEY="$AUTH_KEY"
+        fi
+    fi
+fi
+
+# Try static auth key as fallback
+if [ -z "$TAILSCALE_AUTHKEY" ] && [ -f /etc/clusteros/tailscale-authkey ]; then
+    log_info "Using static auth key from /etc/clusteros/tailscale-authkey"
+    TAILSCALE_AUTHKEY=$(cat /etc/clusteros/tailscale-authkey)
+fi
+
+# Authenticate
+if [ -n "$TAILSCALE_AUTHKEY" ]; then
+    log_info "Authenticating with Tailscale..."
+    
+    # Get hostname for friendly name
+    HOSTNAME=$(hostname)
+    
+    if tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="$HOSTNAME" --accept-routes --accept-dns=false --ssh; then
+        log_info "Tailscale authentication successful"
+        
+        # Wait for connection to be established
+        for i in {1..30}; do
+            if tailscale status --json 2>/dev/null | jq -e '.BackendState == "Running"' >/dev/null 2>&1; then
+                TAILSCALE_IP=$(tailscale ip -4 2>/dev/null | head -1)
+                log_info "Tailscale connected with IP: $TAILSCALE_IP"
+                exit 0
+            fi
+            log_info "Waiting for Tailscale connection... ($i/30)"
+            sleep 2
+        done
+        
+        log_error "Tailscale authenticated but not connected after 60 seconds"
+        exit 1
+    else
+        log_error "Tailscale authentication failed"
+        exit 1
+    fi
+else
+    log_error "No Tailscale authentication credentials available"
+    log_error "Please configure OAuth credentials in /etc/clusteros/tailscale.env"
+    log_error "Or provide a static auth key in /etc/clusteros/tailscale-authkey"
+    exit 1
+fi

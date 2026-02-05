@@ -1,11 +1,11 @@
-# Binaries
-bin/
+# Binaries (but not images/ubuntu/files/bin for installer scripts)
+/bin/
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
-node-agent
+/node-agent
 /node/node-agent
 
 # Go build artifacts

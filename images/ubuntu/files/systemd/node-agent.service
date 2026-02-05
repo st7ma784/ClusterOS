@@ -1,21 +1,36 @@
 [Unit]
 Description=ClusterOS Node Agent
 Documentation=https://github.com/cluster-os
-After=network-online.target
+After=network-online.target tailscaled.service tailscale-auth.service
 Wants=network-online.target
+# Wait for Tailscale to be authenticated if the service exists
+Wants=tailscale-auth.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/node-agent
-Restart=always
-RestartSec=10
+User=root
+Group=root
+# Wait for Tailscale to be ready (polls status instead of fixed delay)
+ExecStartPre=/usr/local/bin/wait-for-tailscale
+ExecStartPre=-/usr/local/bin/node-agent init --identity-path /var/lib/cluster-os/identity.json
+ExecStart=/usr/local/bin/node-agent --log-level info start --foreground
+Restart=on-failure
+RestartSec=10s
+StartLimitInterval=60s
+StartLimitBurst=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=node-agent
 Environment="NODE_CONFIG_PATH=/etc/clusteros/node.yaml"
 EnvironmentFile=-/etc/clusteros/node.env
 
-# Security hardening
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Security settings
 NoNewPrivileges=false
-ProtectSystem=full
-ProtectHome=read-only
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

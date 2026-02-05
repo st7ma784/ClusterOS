@@ -1,0 +1,393 @@
+#!/bin/bash
+# ClusterOS Bare-Metal Installer
+# Installs ClusterOS image to a target disk with proper EFI boot support
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info() { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_ok() { echo -e "${GREEN}[OK]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    log_error "This script must be run as root"
+    echo "Usage: sudo cluster-os-install /dev/sdX"
+    exit 1
+fi
+
+# Check for target device argument
+if [ -z "$1" ]; then
+    log_error "No target device specified"
+    echo ""
+    echo "Usage: sudo cluster-os-install /dev/sdX"
+    echo ""
+    echo "Available block devices:"
+    lsblk -d -o NAME,SIZE,TYPE,MODEL | grep disk
+    exit 1
+fi
+
+TARGET_DEVICE="$1"
+
+# Validate target device
+if [ ! -b "$TARGET_DEVICE" ]; then
+    log_error "Device $TARGET_DEVICE does not exist or is not a block device"
+    exit 1
+fi
+
+# Check if device is mounted
+if mount | grep -q "^$TARGET_DEVICE"; then
+    log_error "Device $TARGET_DEVICE or its partitions are currently mounted"
+    log_error "Please unmount them first"
+    exit 1
+fi
+
+# Show device information
+log_info "========================================="
+log_info "ClusterOS Bare-Metal Installer"
+log_info "========================================="
+echo ""
+log_info "Target device: $TARGET_DEVICE"
+lsblk "$TARGET_DEVICE" 2>/dev/null || true
+echo ""
+
+# Confirm installation
+log_warn "WARNING: This will ERASE ALL DATA on $TARGET_DEVICE"
+echo ""
+read -p "Type 'yes' to continue: " confirm
+if [ "$confirm" != "yes" ]; then
+    log_info "Installation cancelled"
+    exit 0
+fi
+
+echo ""
+log_info "Starting installation..."
+
+# Find the installer image
+INSTALLER_IMAGE=""
+if [ -f "/usr/share/clusteros/installer.img.gz" ]; then
+    log_info "Found embedded installer image"
+    INSTALLER_IMAGE="/usr/share/clusteros/installer.img.gz"
+elif [ -f "/run/live/medium/cluster-os.img" ]; then
+    log_info "Found installer image on live medium"
+    INSTALLER_IMAGE="/run/live/medium/cluster-os.img"
+elif [ -f "/cluster-os.img" ]; then
+    log_info "Found installer image in root"
+    INSTALLER_IMAGE="/cluster-os.img"
+else
+    log_error "Could not find installer image"
+    log_error "Expected locations:"
+    log_error "  /usr/share/clusteros/installer.img.gz (embedded)"
+    log_error "  /run/live/medium/cluster-os.img (live medium)"
+    log_error "  /cluster-os.img (root)"
+    exit 1
+fi
+
+# Write image to disk
+log_info "Writing ClusterOS image to $TARGET_DEVICE..."
+log_info "This may take several minutes..."
+
+if [[ "$INSTALLER_IMAGE" == *.gz ]]; then
+    log_info "Decompressing and writing image..."
+    gunzip -c "$INSTALLER_IMAGE" | dd of="$TARGET_DEVICE" bs=4M status=progress conv=fsync
+else
+    log_info "Writing image..."
+    dd if="$INSTALLER_IMAGE" of="$TARGET_DEVICE" bs=4M status=progress conv=fsync
+fi
+
+log_ok "Image written successfully"
+
+# Ensure kernel picks up partition changes
+log_info "Refreshing partition table..."
+partprobe "$TARGET_DEVICE" 2>/dev/null || true
+sleep 3
+
+# Show partition table for debugging
+log_info "Current partition table:"
+parted -s "$TARGET_DEVICE" print 2>/dev/null || fdisk -l "$TARGET_DEVICE" 2>/dev/null || true
+
+# Find the partitions
+EFI_PART=""
+ROOT_PART=""
+BIOS_BOOT_PART=""
+
+# Detect partition scheme (GPT or MBR)
+PART_SCHEME="unknown"
+if parted -s "$TARGET_DEVICE" print 2>/dev/null | grep -q "Partition Table: gpt"; then
+    PART_SCHEME="gpt"
+    log_info "Detected GPT partition table"
+elif parted -s "$TARGET_DEVICE" print 2>/dev/null | grep -q "Partition Table: msdos"; then
+    PART_SCHEME="mbr"
+    log_info "Detected MBR/DOS partition table"
+fi
+
+# Try common partition naming schemes
+for suffix in 1 2 3 4 p1 p2 p3 p4; do
+    if [ -b "${TARGET_DEVICE}${suffix}" ]; then
+        PART_TYPE=$(blkid -s TYPE -o value "${TARGET_DEVICE}${suffix}" 2>/dev/null || echo "unknown")
+        
+        # Check if it's an EFI partition (type code ef00 or FAT filesystem)
+        if parted -s "$TARGET_DEVICE" print 2>/dev/null | grep -q "^ *${suffix#p}.*boot, esp"; then
+            EFI_PART="${TARGET_DEVICE}${suffix}"
+            log_info "Found EFI partition: $EFI_PART (type: $PART_TYPE)"
+        elif [ "$PART_TYPE" = "vfat" ] && [ -z "$EFI_PART" ]; then
+            # FAT partition could be EFI
+            EFI_PART="${TARGET_DEVICE}${suffix}"
+            log_info "Found potential EFI partition: $EFI_PART (type: $PART_TYPE)"
+        elif parted -s "$TARGET_DEVICE" print 2>/dev/null | grep -q "^ *${suffix#p}.*bios_grub"; then
+            # BIOS boot partition (for GPT with BIOS boot)
+            BIOS_BOOT_PART="${TARGET_DEVICE}${suffix}"
+            log_info "Found BIOS boot partition: $BIOS_BOOT_PART"
+        elif [ "$PART_TYPE" != "vfat" ] && [ -z "$ROOT_PART" ]; then
+            # Assume the first non-FAT partition is root
+            ROOT_PART="${TARGET_DEVICE}${suffix}"
+            log_info "Found root partition: $ROOT_PART (type: $PART_TYPE)"
+        fi
+    fi
+done
+
+# Fallback: just use first two partitions
+if [ -z "$EFI_PART" ]; then
+    if [ -b "${TARGET_DEVICE}1" ]; then
+        PART_TYPE=$(blkid -s TYPE -o value "${TARGET_DEVICE}1" 2>/dev/null || echo "unknown")
+        if [ "$PART_TYPE" = "vfat" ]; then
+            EFI_PART="${TARGET_DEVICE}1"
+            log_warn "Using ${TARGET_DEVICE}1 as EFI partition (fallback)"
+        fi
+    elif [ -b "${TARGET_DEVICE}p1" ]; then
+        PART_TYPE=$(blkid -s TYPE -o value "${TARGET_DEVICE}p1" 2>/dev/null || echo "unknown")
+        if [ "$PART_TYPE" = "vfat" ]; then
+            EFI_PART="${TARGET_DEVICE}p1"
+            log_warn "Using ${TARGET_DEVICE}p1 as EFI partition (fallback)"
+        fi
+    fi
+fi
+
+if [ -z "$ROOT_PART" ]; then
+    # Try partition 2 as root
+    if [ -b "${TARGET_DEVICE}2" ]; then
+        ROOT_PART="${TARGET_DEVICE}2"
+        log_warn "Using ${TARGET_DEVICE}2 as root partition (fallback)"
+    elif [ -b "${TARGET_DEVICE}p2" ]; then
+        ROOT_PART="${TARGET_DEVICE}p2"
+        log_warn "Using ${TARGET_DEVICE}p2 as root partition (fallback)"
+    # Or try partition 1 if no EFI was found
+    elif [ -b "${TARGET_DEVICE}1" ] && [ -z "$EFI_PART" ]; then
+        ROOT_PART="${TARGET_DEVICE}1"
+        log_warn "Using ${TARGET_DEVICE}1 as root partition (fallback, single partition)"
+    elif [ -b "${TARGET_DEVICE}p1" ] && [ -z "$EFI_PART" ]; then
+        ROOT_PART="${TARGET_DEVICE}p1"
+        log_warn "Using ${TARGET_DEVICE}p1 as root partition (fallback, single partition)"
+    fi
+fi
+
+if [ -z "$ROOT_PART" ]; then
+    log_error "Could not find root partition on $TARGET_DEVICE"
+    log_error "Please check the device manually"
+    lsblk "$TARGET_DEVICE"
+    exit 1
+fi
+
+log_info "Partition configuration:"
+log_info "  Root partition: $ROOT_PART"
+[ -n "$EFI_PART" ] && log_info "  EFI partition: $EFI_PART"
+[ -n "$BIOS_BOOT_PART" ] && log_info "  BIOS boot partition: $BIOS_BOOT_PART"
+[ -n "$PART_SCHEME" ] && log_info "  Partition scheme: $PART_SCHEME"
+
+# Install EFI bootloader
+log_info "Installing EFI bootloader..."
+
+# Create mount points
+MOUNT_ROOT="/tmp/clusteros-install-root-$$"
+MOUNT_EFI="/tmp/clusteros-install-efi-$$"
+mkdir -p "$MOUNT_ROOT" "$MOUNT_EFI"
+
+# Cleanup function
+cleanup() {
+    log_info "Cleaning up..."
+    umount "$MOUNT_ROOT/boot/efi" 2>/dev/null || true
+    umount "$MOUNT_ROOT/proc" 2>/dev/null || true
+    umount "$MOUNT_ROOT/sys" 2>/dev/null || true
+    umount "$MOUNT_ROOT/dev" 2>/dev/null || true
+    umount "$MOUNT_ROOT" 2>/dev/null || true
+    rmdir "$MOUNT_ROOT" "$MOUNT_EFI" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# Mount root filesystem
+log_info "Mounting root filesystem..."
+if ! mount "$ROOT_PART" "$MOUNT_ROOT"; then
+    log_error "Failed to mount root partition $ROOT_PART"
+    exit 1
+fi
+
+# Mount EFI partition if it exists
+if [ -n "$EFI_PART" ]; then
+    log_info "Mounting EFI partition..."
+    mkdir -p "$MOUNT_ROOT/boot/efi"
+    if mount "$EFI_PART" "$MOUNT_ROOT/boot/efi" 2>/dev/null; then
+        log_ok "EFI partition mounted"
+    else
+        log_warn "Could not mount EFI partition $EFI_PART"
+    fi
+fi
+
+# Bind mount necessary filesystems for chroot
+log_info "Preparing chroot environment..."
+mount --bind /proc "$MOUNT_ROOT/proc"
+mount --bind /sys "$MOUNT_ROOT/sys"
+mount --bind /dev "$MOUNT_ROOT/dev"
+
+# Set boot flag on boot partition
+log_info "Setting boot flags..."
+if [ "$PART_SCHEME" = "mbr" ]; then
+    # For MBR, set boot flag on first partition
+    BOOT_PART_NUM=$(echo "$ROOT_PART" | grep -o '[0-9]*$')
+    if [ -z "$BOOT_PART_NUM" ]; then
+        BOOT_PART_NUM=1
+    fi
+    log_info "Setting boot flag on partition $BOOT_PART_NUM (MBR)"
+    parted -s "$TARGET_DEVICE" set "$BOOT_PART_NUM" boot on 2>/dev/null || true
+elif [ "$PART_SCHEME" = "gpt" ] && [ -n "$EFI_PART" ]; then
+    # For GPT with EFI, set esp flag
+    EFI_PART_NUM=$(echo "$EFI_PART" | grep -o '[0-9]*$')
+    if [ -n "$EFI_PART_NUM" ]; then
+        log_info "Setting ESP flag on partition $EFI_PART_NUM (GPT)"
+        parted -s "$TARGET_DEVICE" set "$EFI_PART_NUM" esp on 2>/dev/null || true
+    fi
+fi
+
+# Install GRUB for EFI
+log_info "Installing GRUB bootloader..."
+
+GRUB_INSTALLED=false
+
+# Try EFI installation first if EFI partition exists
+if [ -n "$EFI_PART" ] && [ -d "$MOUNT_ROOT/boot/efi" ]; then
+    log_info "Attempting EFI bootloader installation..."
+    
+    # Install grub-efi if not present
+    if ! chroot "$MOUNT_ROOT" which grub-install >/dev/null 2>&1; then
+        log_info "Installing GRUB EFI packages..."
+        chroot "$MOUNT_ROOT" apt-get update >/dev/null 2>&1 || true
+        chroot "$MOUNT_ROOT" DEBIAN_FRONTEND=noninteractive apt-get install -y grub-efi-amd64 grub-efi-amd64-signed shim-signed efibootmgr >/dev/null 2>&1 || true
+    fi
+    
+    # Install GRUB to EFI
+    log_info "Running grub-install for EFI..."
+    if chroot "$MOUNT_ROOT" grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ClusterOS --recheck --no-floppy 2>&1 | tee /tmp/grub-install.log; then
+        log_ok "GRUB EFI bootloader installed"
+        GRUB_INSTALLED=true
+        
+        # Create EFI boot entry
+        log_info "Creating EFI boot entry..."
+        chroot "$MOUNT_ROOT" efibootmgr -c -d "$TARGET_DEVICE" -p 1 -L "ClusterOS" -l '\EFI\ClusterOS\grubx64.efi' 2>/dev/null || true
+        
+        # Update GRUB configuration
+        log_info "Updating GRUB configuration..."
+        chroot "$MOUNT_ROOT" update-grub 2>&1 | grep -v "^Sourcing" || true
+        log_ok "GRUB configuration updated"
+    else
+        log_warn "GRUB EFI installation failed"
+        log_warn "Error log: $(cat /tmp/grub-install.log 2>/dev/null | tail -5)"
+    fi
+fi
+
+# Try BIOS installation if EFI failed or not available
+if [ "$GRUB_INSTALLED" = "false" ]; then
+    log_info "Attempting BIOS/MBR bootloader installation..."
+    
+    # Install GRUB for BIOS if not present
+    if ! chroot "$MOUNT_ROOT" which grub-install >/dev/null 2>&1; then
+        log_info "Installing GRUB BIOS packages..."
+        chroot "$MOUNT_ROOT" apt-get update >/dev/null 2>&1 || true
+        chroot "$MOUNT_ROOT" DEBIAN_FRONTEND=noninteractive apt-get install -y grub-pc >/dev/null 2>&1 || true
+    fi
+    
+    log_info "Running grub-install for BIOS/MBR..."
+    if chroot "$MOUNT_ROOT" grub-install --target=i386-pc --recheck --no-floppy "$TARGET_DEVICE" 2>&1 | tee /tmp/grub-install-bios.log; then
+        log_ok "GRUB BIOS bootloader installed to MBR"
+        GRUB_INSTALLED=true
+        
+        # Update GRUB configuration
+        log_info "Updating GRUB configuration..."
+        chroot "$MOUNT_ROOT" update-grub 2>&1 | grep -v "^Sourcing" || true
+        log_ok "GRUB configuration updated"
+    else
+        log_error "GRUB BIOS installation failed"
+        log_error "Error log: $(cat /tmp/grub-install-bios.log 2>/dev/null | tail -5)"
+    fi
+fi
+
+if [ "$GRUB_INSTALLED" = "false" ]; then
+    log_error "Failed to install GRUB bootloader (tried both EFI and BIOS)"
+    log_error "The system may not boot. Please install GRUB manually."
+else
+    log_ok "Bootloader installation complete"
+fi
+
+# Ensure fstab is correct
+log_info "Configuring fstab..."
+ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+if [ -n "$ROOT_UUID" ]; then
+    # Update fstab with correct root UUID
+    if grep -q "^UUID=" "$MOUNT_ROOT/etc/fstab"; then
+        sed -i "s|^UUID=[^ ]*|UUID=$ROOT_UUID|" "$MOUNT_ROOT/etc/fstab"
+    fi
+fi
+
+if [ -n "$EFI_PART" ]; then
+    EFI_UUID=$(blkid -s UUID -o value "$EFI_PART")
+    if [ -n "$EFI_UUID" ]; then
+        # Add EFI partition to fstab if not present
+        if ! grep -q "/boot/efi" "$MOUNT_ROOT/etc/fstab"; then
+            echo "UUID=$EFI_UUID  /boot/efi  vfat  umask=0077  0  1" >> "$MOUNT_ROOT/etc/fstab"
+        fi
+    fi
+fi
+
+log_ok "fstab configured"
+
+# Copy cluster key if available
+if [ -f "/etc/clusteros/cluster.key" ]; then
+    log_info "Copying cluster key..."
+    mkdir -p "$MOUNT_ROOT/etc/clusteros"
+    cp /etc/clusteros/cluster.key "$MOUNT_ROOT/etc/clusteros/"
+    chmod 600 "$MOUNT_ROOT/etc/clusteros/cluster.key"
+    log_ok "Cluster key copied"
+fi
+
+# Copy Tailscale credentials if available
+if [ -f "/etc/clusteros/tailscale.env" ]; then
+    log_info "Copying Tailscale credentials..."
+    mkdir -p "$MOUNT_ROOT/etc/clusteros"
+    cp /etc/clusteros/tailscale.env "$MOUNT_ROOT/etc/clusteros/"
+    chmod 600 "$MOUNT_ROOT/etc/clusteros/tailscale.env"
+    log_ok "Tailscale credentials copied"
+fi
+
+# Cleanup
+cleanup
+trap - EXIT
+
+echo ""
+log_ok "========================================="
+log_ok "Installation complete!"
+log_ok "========================================="
+echo ""
+log_info "You can now:"
+log_info "  1. Remove the installation media"
+log_info "  2. Reboot the system: sudo reboot"
+log_info "  3. The system will boot into ClusterOS"
+echo ""
+log_info "On first boot, the node will:"
+log_info "  - Connect to Tailscale automatically"
+log_info "  - Join the cluster"
+log_info "  - Start accepting workloads"
+echo ""

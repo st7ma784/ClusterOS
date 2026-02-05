@@ -41,6 +41,10 @@ packages:
   - iproute2
   - wireguard
   - wireguard-tools
+  - wpasupplicant
+  - wireless-tools
+  - iw
+  - rfkill
 
 # Write files
 write_files:

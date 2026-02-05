@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/cluster-os/node/internal/auth"
+	"github.com/cluster-os/node/internal/networking"
 	"github.com/cluster-os/node/internal/state"
 	"github.com/hashicorp/serf/serf"
 	"github.com/sirupsen/logrus"
@@ -127,26 +128,58 @@ func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node, l
 	}
 
 	// Join bootstrap peers if provided
-	if len(cfg.BootstrapPeers) > 0 {
-		sd.logger.Infof("Joining cluster via peers: %v", cfg.BootstrapPeers)
-		n, err := serfInstance.Join(cfg.BootstrapPeers, true)
+	peersToJoin := cfg.BootstrapPeers
+
+	// If no explicit bootstrap peers, try Tailscale peer discovery
+	if len(peersToJoin) == 0 && networking.IsTailscaleAvailable() {
+		sd.logger.Info("No bootstrap peers configured, attempting Tailscale peer discovery...")
+
+		// First try to find cluster-tagged peers
+		discoveredPeers, err := networking.DiscoverClusterPeers(cfg.BindPort)
+		if err != nil {
+			sd.logger.Warnf("Tailscale cluster peer discovery failed: %v", err)
+		} else if len(discoveredPeers) > 0 {
+			sd.logger.Infof("Discovered %d cluster peers via Tailscale: %v", len(discoveredPeers), discoveredPeers)
+			peersToJoin = discoveredPeers
+		} else {
+			// No tagged peers found - try all Tailscale peers (initial cluster setup)
+			sd.logger.Info("No tagged cluster peers found, trying all Tailscale peers...")
+			allPeers, err := networking.DiscoverAllTailscalePeers(cfg.BindPort)
+			if err != nil {
+				sd.logger.Warnf("Tailscale peer discovery failed: %v", err)
+			} else if len(allPeers) > 0 {
+				sd.logger.Infof("Discovered %d Tailscale peers to try: %v", len(allPeers), allPeers)
+				peersToJoin = allPeers
+			}
+		}
+	}
+
+	if len(peersToJoin) > 0 {
+		sd.logger.Infof("Joining cluster via peers: %v", peersToJoin)
+		n, err := serfInstance.Join(peersToJoin, true)
 		if err != nil {
 			sd.logger.Warnf("Failed to join some peers: %v", err)
 		} else {
 			sd.logger.Infof("Successfully joined %d peers", n)
 		}
 	} else {
-		sd.logger.Info("Bootstrap mode: no peers to join, will attempt LAN discovery")
+		sd.logger.Info("Bootstrap mode: starting as cluster of 1 (will discover other nodes via Tailscale)")
 	}
 
 	// Start event handler
 	go sd.handleEvents()
 
-	// TODO: Implement LAN discovery
-	// if cfg.LANDiscovery || len(cfg.BootstrapPeers) == 0 {
-	//     sd.lanDiscoveryEnabled = true
-	//     go sd.lanDiscoveryLoop(cfg.LANDiscoveryScan)
-	// }
+	// Start background Tailscale peer discovery loop if enabled
+	if cfg.LANDiscovery || len(cfg.BootstrapPeers) == 0 {
+		sd.lanDiscoveryEnabled = true
+		ctx, cancel := context.WithCancel(context.Background())
+		sd.lanDiscoveryLoop = cancel
+		interval := cfg.LANDiscoveryScan
+		if interval == 0 {
+			interval = 30 * time.Second // Default: check for new peers every 30 seconds
+		}
+		go sd.tailscalePeerDiscoveryLoop(ctx, cfg.BindPort, interval)
+	}
 
 	return sd, nil
 }
@@ -581,5 +614,87 @@ func (sd *SerfDiscovery) Addr() net.Addr {
 	return &net.TCPAddr{
 		IP:   localMember.Addr,
 		Port: int(localMember.Port),
+	}
+}
+
+// tailscalePeerDiscoveryLoop periodically checks for new Tailscale peers to join
+func (sd *SerfDiscovery) tailscalePeerDiscoveryLoop(ctx context.Context, serfPort int, interval time.Duration) {
+	sd.logger.Info("Starting Tailscale peer discovery loop")
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Track peers we've already tried to avoid spamming
+	triedPeers := make(map[string]time.Time)
+	retryAfter := 5 * time.Minute // Don't retry failed peers for 5 minutes
+
+	for {
+		select {
+		case <-ctx.Done():
+			sd.logger.Info("Tailscale peer discovery loop stopped")
+			return
+		case <-sd.shutdownCh:
+			sd.logger.Info("Tailscale peer discovery loop stopped (shutdown)")
+			return
+		case <-ticker.C:
+			// Check if Tailscale is still available
+			if !networking.IsTailscaleAvailable() {
+				sd.logger.Debug("Tailscale not available, skipping peer discovery")
+				continue
+			}
+
+			// Get current cluster members to avoid trying to join existing members
+			currentMembers := make(map[string]bool)
+			for _, member := range sd.serf.Members() {
+				if member.Status == serf.StatusAlive || member.Status == serf.StatusLeaving {
+					currentMembers[member.Addr.String()] = true
+				}
+			}
+
+			// Try to discover new peers
+			peers, err := networking.DiscoverClusterPeers(serfPort)
+			if err != nil {
+				sd.logger.Debugf("Cluster peer discovery failed: %v", err)
+				// Try all peers as fallback
+				peers, _ = networking.DiscoverAllTailscalePeers(serfPort)
+			}
+
+			var newPeers []string
+			now := time.Now()
+			for _, peer := range peers {
+				// Extract IP from peer address
+				host, _, _ := net.SplitHostPort(peer)
+
+				// Skip if already a member
+				if currentMembers[host] {
+					continue
+				}
+
+				// Skip if we tried recently and it failed
+				if lastTry, ok := triedPeers[peer]; ok && now.Sub(lastTry) < retryAfter {
+					continue
+				}
+
+				newPeers = append(newPeers, peer)
+				triedPeers[peer] = now
+			}
+
+			if len(newPeers) > 0 {
+				sd.logger.Infof("Discovered %d new potential peers via Tailscale: %v", len(newPeers), newPeers)
+				n, err := sd.serf.Join(newPeers, true)
+				if err != nil {
+					sd.logger.Warnf("Failed to join some discovered peers: %v", err)
+				}
+				if n > 0 {
+					sd.logger.Infof("Successfully joined %d new peers via Tailscale discovery", n)
+				}
+			}
+
+			// Clean up old entries from triedPeers
+			for peer, lastTry := range triedPeers {
+				if now.Sub(lastTry) > retryAfter {
+					delete(triedPeers, peer)
+				}
+			}
+		}
 	}
 }

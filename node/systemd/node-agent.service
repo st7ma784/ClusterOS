@@ -1,13 +1,17 @@
 [Unit]
 Description=Cluster-OS Node Agent
 Documentation=https://github.com/cluster-os
-After=network-online.target
+After=network-online.target tailscaled.service tailscale-auth.service
 Wants=network-online.target
+# Wait for Tailscale to be authenticated if the service exists
+Wants=tailscale-auth.service
 
 [Service]
 Type=simple
 User=root
 Group=root
+# Wait a bit for Tailscale to fully establish connection
+ExecStartPre=/bin/sleep 5
 ExecStartPre=-/usr/local/bin/node-agent init --identity-path /var/lib/cluster-os/identity.json
 ExecStart=/usr/local/bin/node-agent --log-level info start --foreground
 Restart=on-failure
