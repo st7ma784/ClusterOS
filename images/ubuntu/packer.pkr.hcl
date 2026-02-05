@@ -69,6 +69,42 @@ variable "output_dir" {
   description = "Directory for output images"
 }
 
+# Tailscale OAuth credentials (from .env)
+variable "tailscale_oauth_client_id" {
+  type        = string
+  default     = env("TAILSCALE_OAUTH_CLIENT_ID")
+  description = "Tailscale OAuth Client ID"
+}
+
+variable "tailscale_oauth_client_secret" {
+  type        = string
+  default     = env("TAILSCALE_OAUTH_CLIENT_SECRET")
+  sensitive   = true
+  description = "Tailscale OAuth Client Secret"
+}
+
+variable "tailscale_authkey" {
+  type        = string
+  default     = env("TAILSCALE_AUTHKEY")
+  sensitive   = true
+  description = "Tailscale auth key (fallback)"
+}
+
+# Cluster authentication key (from .env or auto-generated)
+variable "cluster_auth_key" {
+  type        = string
+  default     = env("CLUSTER_AUTH_KEY")
+  sensitive   = true
+  description = "Cluster authentication key (base64)"
+}
+
+variable "serf_encrypt_key" {
+  type        = string
+  default     = env("SERF_ENCRYPT_KEY")
+  sensitive   = true
+  description = "Serf encryption key (base64)"
+}
+
 # Ubuntu 24.04 cloud image (pre-installed, no installer needed)
 variable "iso_url" {
   type        = string
@@ -198,6 +234,44 @@ build {
   provisioner "file" {
     source      = "files/tailscale"
     destination = "/tmp/clusteros-files"
+  }
+
+  # Generate and inject cluster credentials during build
+  provisioner "shell" {
+    inline = [
+      "echo 'Configuring cluster credentials...'",
+      "mkdir -p /tmp/clusteros-files/secrets",
+      
+      # Generate cluster auth key if not provided
+      "if [ -z '${var.cluster_auth_key}' ]; then",
+      "  echo 'Generating new cluster authentication key...'",
+      "  CLUSTER_KEY=$(openssl rand -base64 32)",
+      "else",
+      "  CLUSTER_KEY='${var.cluster_auth_key}'",
+      "fi",
+      "echo \"$CLUSTER_KEY\" > /tmp/clusteros-files/secrets/cluster.key",
+      
+      # Use same key for Serf encryption if not provided
+      "if [ -z '${var.serf_encrypt_key}' ]; then",
+      "  SERF_KEY=\"$CLUSTER_KEY\"",
+      "else",
+      "  SERF_KEY='${var.serf_encrypt_key}'",
+      "fi",
+      "echo \"$SERF_KEY\" > /tmp/clusteros-files/secrets/serf.key",
+      
+      # Create Tailscale env file with OAuth credentials
+      "cat > /tmp/clusteros-files/tailscale/tailscale.env << 'EOF'",
+      "# Tailscale Configuration for ClusterOS",
+      "# Generated during image build",
+      "",
+      "TAILSCALE_OAUTH_CLIENT_ID=${var.tailscale_oauth_client_id}",
+      "TAILSCALE_OAUTH_CLIENT_SECRET=${var.tailscale_oauth_client_secret}",
+      "TAILSCALE_AUTHKEY=${var.tailscale_authkey}",
+      "TAILSCALE_TAGS=[\"tag:cluster-node\"]",
+      "EOF",
+      
+      "echo 'Credentials configured'"
+    ]
   }
 
   # Run provisioning script

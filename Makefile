@@ -174,7 +174,7 @@ test-full: node
 	@echo "Full test suite complete!"
 	@echo "=========================================="
 
-image: node
+image: node cluster-key
 	@echo "========================================="
 	@echo "Building OS image with Packer"
 	@echo "========================================="
@@ -194,17 +194,29 @@ image: node
 		echo "Install with: sudo apt-get install qemu-system-x86 qemu-utils"; \
 		exit 1; \
 	fi
-	@echo "Initializing Packer plugins..."
-	cd images/ubuntu && $(PACKER) init .
-	@echo "Cleaning previous build output..."
-	rm -rf /data/packer-output/cluster-os-node
-	@echo "Building image (this may take 10-20 minutes)..."
-	cd images/ubuntu && $(PACKER) build packer.pkr.hcl
+	@# Load .env if it exists and run packer
+	@if [ -f images/ubuntu/.env ]; then \
+		echo "Loading credentials from images/ubuntu/.env"; \
+		set -a && . images/ubuntu/.env && set +a; \
+	else \
+		echo "WARNING: images/ubuntu/.env not found"; \
+		echo "Create from .env.example with Tailscale OAuth credentials for auto-joining"; \
+	fi; \
+	export CLUSTER_AUTH_KEY=$$(cat cluster.key 2>/dev/null || echo ""); \
+	echo "Initializing Packer plugins..."; \
+	cd images/ubuntu && $(PACKER) init . && \
+	echo "Cleaning previous build output..." && \
+	rm -rf /data/packer-output/cluster-os-node && \
+	echo "Building image (this may take 10-20 minutes)..." && \
+	$(PACKER) build packer.pkr.hcl
 	@echo ""
 	@echo "========================================="
 	@echo "OS image built successfully!"
 	@echo "========================================="
 	@ls -lh /data/packer-output/cluster-os-node/
+	@echo ""
+	@echo "Cluster key embedded: $$(cat cluster.key | head -c 20)..."
+	@echo "All nodes from this build can join each other automatically."
 
 usb: image
 	@echo "Creating USB installer..."

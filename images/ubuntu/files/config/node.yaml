@@ -1,17 +1,75 @@
 # ClusterOS Node Configuration
 # Generated at image build time
 
-node:
-  data_dir: /var/lib/clusteros
-  log_dir: /var/log/clusteros
+# Node identity
+identity:
+  path: /var/lib/cluster-os/identity.json
 
+# Discovery settings
 discovery:
+  # Serf bind address (0.0.0.0 for all interfaces)
+  bind_addr: 0.0.0.0
   bind_port: 7946
-  bootstrap_nodes: []
 
-wireguard:
+  # Bootstrap nodes to join (empty = auto-discover via Tailscale)
+  bootstrap_peers: []
+
+  # Node name (defaults to hostname)
+  node_name: ""
+
+  # Serf encryption key (base64 encoded, set during build)
+  # This key is shared across all nodes from the same build
+  encrypt_key: ""
+
+# Networking settings
+networking:
+  # WireGuard interface name
+  interface: wg0
+
+  # WireGuard listen port
   listen_port: 51820
-  mtu: 1420
 
+  # WireGuard subnet (10.42.0.0/16)
+  subnet: "10.42.0.0/16"
+
+  # Enable IPv6
+  ipv6: false
+
+# Tailscale settings
+tailscale:
+  # OAuth credentials are in /etc/clusteros/tailscale.env
+  # Enable peer discovery via Tailscale network
+  api_discovery: true
+
+# Role configuration
 roles:
-  enabled: []
+  # All roles enabled by default - leader election determines who runs what
+  enabled:
+    - slurm-controller
+    - slurm-worker
+    - k3s-server
+    - k3s-agent
+
+  # Node capabilities (auto-detected at runtime)
+  capabilities:
+    cpu: 0
+    ram: ""
+    gpu: false
+    arch: ""
+
+# Logging configuration
+logging:
+  level: info
+  format: text
+  output: stdout
+
+# Cluster settings
+cluster:
+  name: cluster-os
+  region: default
+  datacenter: default
+
+  # Cluster authentication key (REQUIRED)
+  # Set during image build - all nodes from same build share this key
+  # This ensures only nodes from your build can join each other
+  auth_key: ""
