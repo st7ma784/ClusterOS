@@ -6,10 +6,10 @@ COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_TIME := $(shell date -u '+%Y-%m-%d_%H:%M:%S')
 
 # Go configuration
-GOPATH := $(shell $(HOME)/go/bin/go env GOPATH)
+GO := $(shell which go || echo "/usr/bin/go")
+GOPATH := $(shell $(GO) env GOPATH)
 GOBIN := $(GOPATH)/bin
-GO := $(HOME)/go/bin/go
-GOFMT := $(HOME)/go/bin/gofmt
+GOFMT := $(shell which gofmt || echo "gofmt")
 
 # Build configuration
 BINARY_NAME := node-agent
