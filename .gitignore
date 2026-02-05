@@ -5,7 +5,7 @@
 *.dll
 *.so
 *.dylib
-node-agent
+/node-agent
 /node/node-agent
 
 # Go build artifacts
