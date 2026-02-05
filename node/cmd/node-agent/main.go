@@ -135,11 +135,17 @@ func startCommand(c *cli.Context) error {
 		return fmt.Errorf("failed to create identity directory: %w", err)
 	}
 
-	id, _, err := identity.LoadOrGenerate(identityPath)
+	id, isNew, err := identity.LoadOrGenerate(identityPath)
 	if err != nil {
 		return fmt.Errorf("failed to load or create identity: %w", err)
 	}
 
+	if isNew {
+		logger.Infof("Created new identity at %s", identityPath)
+	} else {
+		logger.Infof("Loaded existing identity from %s", identityPath)
+	}
+	
 	logger.Infof("Node ID: %s", id.NodeID)
 
 	// Create and start daemon

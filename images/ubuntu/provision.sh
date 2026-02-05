@@ -158,8 +158,8 @@ if [ -f /tmp/clusteros-files/tailscale/tailscale.env ]; then
     sudo cp /tmp/clusteros-files/tailscale/tailscale.env /etc/clusteros/
     sudo chmod 600 /etc/clusteros/tailscale.env
     
-    # Check if credentials are actually set
-    if grep -q "TAILSCALE_OAUTH_CLIENT_ID=." /etc/clusteros/tailscale.env 2>/dev/null; then
+    # Check if credentials are actually set (match non-empty values)
+    if grep -q "TAILSCALE_OAUTH_CLIENT_ID=[^[:space:]]" /etc/clusteros/tailscale.env 2>/dev/null; then
         echo "  Tailscale OAuth credentials configured"
     else
         echo "  WARNING: Tailscale OAuth credentials not set - nodes won't auto-join Tailnet"
