@@ -74,7 +74,8 @@ echo "[3/6] Installing SLURM..."
 sudo apt-get install -y munge slurm-wlm slurm-client
 
 # Install tools needed for cluster-os-install
-sudo apt-get install -y rsync gdisk dosfstools efibootmgr parted
+# systemd-boot provides systemd-bootx64.efi for UEFI booting
+sudo apt-get install -y rsync gdisk dosfstools efibootmgr parted systemd-boot
 
 # Create directories
 sudo mkdir -p /etc/slurm /etc/munge /var/spool/slurm /var/log/slurm
