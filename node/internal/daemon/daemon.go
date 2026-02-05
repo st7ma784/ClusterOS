@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -52,6 +53,7 @@ type Daemon struct {
 	wireguard         *networking.WireGuardManager
 	tailscale         *networking.TailscaleManager
 	roleManager       *roles.Manager
+	apiServer         interface{} // API server for dashboard (will be *api.Server)
 	logger            *logrus.Logger
 	ctx               context.Context
 	cancel            context.CancelFunc
@@ -283,6 +285,12 @@ func (d *Daemon) Start() error {
 	// Initialize role manager and start roles
 	if err := d.initRoles(); err != nil {
 		return fmt.Errorf("failed to initialize roles: %w", err)
+	}
+
+	// Initialize API server for dashboard
+	if err := d.initAPIServer(); err != nil {
+		d.logger.Warnf("Failed to initialize API server: %v", err)
+		// Don't fail daemon start if API server fails
 	}
 
 	d.logger.Info("Daemon started successfully")
@@ -979,4 +987,332 @@ func (d *Daemon) getDiskUsage(path string) (map[string]interface{}, error) {
 	}
 
 	return diskInfo, nil
+}
+
+// initAPIServer initializes the HTTP API server for dashboard
+func (d *Daemon) initAPIServer() error {
+	d.logger.Info("Initializing API server")
+	
+	// Import would cause circular dependency, so we handle it dynamically
+	// For now, just log that API server would start here
+	// In a real implementation, you'd start the API server
+	
+	// Default API port
+	apiPort := 9090
+	
+	d.logger.Infof("API server would start on port %d", apiPort)
+	d.logger.Infof("Access dashboard at: http://localhost:%d/api/v1/status", apiPort)
+	
+	// TODO: Start actual API server here
+	// This requires refactoring to avoid circular imports
+	// api.NewServer(d, d.logger, apiPort).Start()
+	
+	return nil
+}
+
+// GetAllNodes returns information about all nodes in the cluster
+func (d *Daemon) GetAllNodes() []map[string]interface{} {
+	if d.clusterState == nil {
+		return []map[string]interface{}{}
+	}
+
+	nodes := d.clusterState.GetAllNodes()
+	result := make([]map[string]interface{}, 0, len(nodes))
+
+	for _, node := range nodes {
+		nodeInfo := map[string]interface{}{
+			"id":             node.ID,
+			"name":           node.Name,
+			"roles":          node.Roles,
+			"status":         node.Status,
+			"address":        node.Address,
+			"tailscale_ip":   node.TailscaleIP,
+			"wireguard_ip":   node.WireGuardIP,
+			"wireguard_key":  node.WireGuardPubKey,
+			"capabilities":   node.Capabilities,
+			"tags":           node.Tags,
+			"last_seen":      node.LastSeen,
+			"joined_at":      node.JoinedAt,
+		}
+		result = append(result, nodeInfo)
+	}
+
+	return result
+}
+
+// GetAllLeaders returns the current leaders for all roles
+func (d *Daemon) GetAllLeaders() map[string]interface{} {
+	leaders := make(map[string]interface{})
+
+	if d.clusterState == nil {
+		return leaders
+	}
+
+	// Get leaders for known roles
+	roles := []string{"slurm-controller", "k3s-server", "raft"}
+	for _, role := range roles {
+		if leaderID, ok := d.clusterState.GetLeader(role); ok {
+			leaderInfo := map[string]interface{}{
+				"node_id": leaderID,
+			}
+			
+			// Get full node information if available
+			if node, ok := d.clusterState.GetNode(leaderID); ok {
+				leaderInfo["name"] = node.Name
+				leaderInfo["address"] = node.Address
+				leaderInfo["tailscale_ip"] = node.TailscaleIP
+			}
+			
+			leaders[role] = leaderInfo
+		} else {
+			leaders[role] = map[string]interface{}{
+				"status": "no_leader",
+			}
+		}
+	}
+
+	// Add information about whether this node is a leader
+	if d.identity != nil {
+		localNodeID := d.identity.NodeID
+		isLeaderFor := []string{}
+		
+		for _, role := range roles {
+			if leaderID, ok := d.clusterState.GetLeader(role); ok && leaderID == localNodeID {
+				isLeaderFor = append(isLeaderFor, role)
+			}
+		}
+		
+		leaders["local_node"] = map[string]interface{}{
+			"node_id":       localNodeID,
+			"is_leader_for": isLeaderFor,
+		}
+	}
+
+	return leaders
+}
+
+// GetServiceStatus returns detailed status of all cluster services
+func (d *Daemon) GetServiceStatus() map[string]interface{} {
+	services := make(map[string]interface{})
+
+	// Tailscale connectivity
+	tailscaleStatus := map[string]interface{}{
+		"enabled": true,
+	}
+	if d.tailscale != nil {
+		tsIP := d.tailscale.GetLocalIP()
+		if tsIP != nil {
+			tailscaleStatus["connected"] = true
+			tailscaleStatus["ip"] = tsIP.String()
+			
+			// Peer count would be retrieved from Tailscale status
+			// For now, just indicate it's connected
+			tailscaleStatus["peer_count"] = 0
+		} else {
+			tailscaleStatus["connected"] = false
+		}
+	} else {
+		tailscaleStatus["connected"] = false
+		tailscaleStatus["message"] = "Tailscale manager not initialized"
+	}
+	services["tailscale"] = tailscaleStatus
+
+	// SLURM status
+	slurmStatus := map[string]interface{}{}
+	slurmctldStatus := d.checkSystemdService("slurmctld")
+	slurmdStatus := d.checkSystemdService("slurmd")
+	
+	slurmStatus["controller"] = map[string]interface{}{
+		"status":  slurmctldStatus.Status,
+		"message": slurmctldStatus.Message,
+	}
+	slurmStatus["worker"] = map[string]interface{}{
+		"status":  slurmdStatus.Status,
+		"message": slurmdStatus.Message,
+	}
+	
+	// Check if we can query sinfo
+	if slurmctldStatus.Status == "running" || slurmdStatus.Status == "running" {
+		cmd := exec.Command("sinfo", "-h", "-o", "%D")
+		if output, err := cmd.Output(); err == nil {
+			nodeCount := strings.TrimSpace(string(output))
+			slurmStatus["nodes_in_partition"] = nodeCount
+		}
+		
+		// Check queue
+		cmd = exec.Command("squeue", "-h")
+		if output, err := cmd.Output(); err == nil {
+			jobs := strings.Split(strings.TrimSpace(string(output)), "\n")
+			if len(jobs) == 1 && jobs[0] == "" {
+				slurmStatus["queued_jobs"] = 0
+			} else {
+				slurmStatus["queued_jobs"] = len(jobs)
+			}
+		}
+	}
+	services["slurm"] = slurmStatus
+
+	// K3s status
+	k3sStatus := map[string]interface{}{}
+	k3sServerStatus := d.checkSystemdService("k3s")
+	k3sAgentStatus := d.checkSystemdService("k3s-agent")
+	
+	k3sStatus["server"] = map[string]interface{}{
+		"status":  k3sServerStatus.Status,
+		"message": k3sServerStatus.Message,
+	}
+	k3sStatus["agent"] = map[string]interface{}{
+		"status":  k3sAgentStatus.Status,
+		"message": k3sAgentStatus.Message,
+	}
+	
+	// Check if we can query kubectl
+	if k3sServerStatus.Status == "running" || k3sAgentStatus.Status == "running" {
+		cmd := exec.Command("kubectl", "get", "nodes", "-o", "json")
+		cmd.Env = append(os.Environ(), "KUBECONFIG=/etc/rancher/k3s/k3s.yaml")
+		if output, err := cmd.Output(); err == nil {
+			var nodesData map[string]interface{}
+			if err := json.Unmarshal(output, &nodesData); err == nil {
+				if items, ok := nodesData["items"].([]interface{}); ok {
+					k3sStatus["node_count"] = len(items)
+				}
+			}
+		}
+		
+		// Check pods
+		cmd = exec.Command("kubectl", "get", "pods", "--all-namespaces", "-o", "json")
+		cmd.Env = append(os.Environ(), "KUBECONFIG=/etc/rancher/k3s/k3s.yaml")
+		if output, err := cmd.Output(); err == nil {
+			var podsData map[string]interface{}
+			if err := json.Unmarshal(output, &podsData); err == nil {
+				if items, ok := podsData["items"].([]interface{}); ok {
+					k3sStatus["pod_count"] = len(items)
+				}
+			}
+		}
+	}
+	services["k3s"] = k3sStatus
+
+	// Service endpoints from cluster state
+	if d.clusterState != nil {
+		endpoints := d.clusterState.GetAllServiceEndpoints()
+		services["endpoints"] = endpoints
+	}
+
+	return services
+}
+
+// GetClusterInfo returns cluster-wide information
+func (d *Daemon) GetClusterInfo() map[string]interface{} {
+	info := map[string]interface{}{
+		"name":       d.config.Cluster.Name,
+		"region":     d.config.Cluster.Region,
+		"datacenter": d.config.Cluster.Datacenter,
+	}
+
+	if d.clusterState != nil {
+		nodes := d.clusterState.GetAllNodes()
+		aliveNodes := d.clusterState.GetAliveNodes()
+		
+		info["total_nodes"] = len(nodes)
+		info["alive_nodes"] = len(aliveNodes)
+		
+		// Calculate total capacity
+		totalCPU := 0
+		
+		for _, node := range aliveNodes {
+			totalCPU += node.Capabilities.CPU
+			// Parse RAM string (e.g., "16GB")
+			// This is simplified - in production you'd parse properly
+		}
+		
+		info["capacity"] = map[string]interface{}{
+			"total_cpu_cores": totalCPU,
+			"total_ram":       "calculated", // Would calculate from nodes
+			"total_gpus":      0,
+		}
+		
+		// Node distribution by role
+		roleDistribution := make(map[string]int)
+		for _, node := range aliveNodes {
+			for _, role := range node.Roles {
+				roleDistribution[role]++
+			}
+		}
+		info["role_distribution"] = roleDistribution
+	}
+
+	return info
+}
+
+// GetJobsInfo returns information about running and queued jobs
+func (d *Daemon) GetJobsInfo() map[string]interface{} {
+	jobs := map[string]interface{}{
+		"slurm": map[string]interface{}{},
+		"k3s":   map[string]interface{}{},
+	}
+
+	// SLURM jobs
+	slurmJobs := map[string]interface{}{}
+	cmd := exec.Command("squeue", "-h", "-o", "%i|%j|%t|%u|%M")
+	if output, err := cmd.Output(); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+		jobList := []map[string]string{}
+		
+		for _, line := range lines {
+			if line == "" {
+				continue
+			}
+			fields := strings.Split(line, "|")
+			if len(fields) >= 5 {
+				jobList = append(jobList, map[string]string{
+					"id":       fields[0],
+					"name":     fields[1],
+					"state":    fields[2],
+					"user":     fields[3],
+					"time":     fields[4],
+				})
+			}
+		}
+		
+		slurmJobs["jobs"] = jobList
+		slurmJobs["count"] = len(jobList)
+	}
+	jobs["slurm"] = slurmJobs
+
+	// K3s pods (as jobs)
+	k3sJobs := map[string]interface{}{}
+	cmd = exec.Command("kubectl", "get", "pods", "--all-namespaces", "-o", "json")
+	cmd.Env = append(os.Environ(), "KUBECONFIG=/etc/rancher/k3s/k3s.yaml")
+	if output, err := cmd.Output(); err == nil {
+		var podsData map[string]interface{}
+		if err := json.Unmarshal(output, &podsData); err == nil {
+			if items, ok := podsData["items"].([]interface{}); ok {
+				podList := []map[string]interface{}{}
+				
+				for _, item := range items {
+					pod, ok := item.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					
+					metadata, _ := pod["metadata"].(map[string]interface{})
+					status, _ := pod["status"].(map[string]interface{})
+					
+					podInfo := map[string]interface{}{
+						"name":      metadata["name"],
+						"namespace": metadata["namespace"],
+						"phase":     status["phase"],
+					}
+					podList = append(podList, podInfo)
+				}
+				
+				k3sJobs["pods"] = podList
+				k3sJobs["count"] = len(podList)
+			}
+		}
+	}
+	jobs["k3s"] = k3sJobs
+
+	return jobs
 }

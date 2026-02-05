@@ -1,9 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/cluster-os/node/internal/config"
 	"github.com/cluster-os/node/internal/daemon"
@@ -237,12 +240,93 @@ func infoCommand(c *cli.Context) error {
 }
 
 func statusCommand(c *cli.Context) error {
-	// This would connect to the running daemon to get status
-	// For now, just show basic info
-	fmt.Println("Node Status")
-	fmt.Println("===========")
-	fmt.Println("Status: Check systemctl status node-agent")
+	// Try to connect to the API server to get comprehensive status
+	apiPort := 9090
+	apiURL := fmt.Sprintf("http://localhost:%d/api/v1/status", apiPort)
+	
+	fmt.Println("ClusterOS Node Status")
+	fmt.Println("====================")
+	fmt.Println()
+	
+	// Try HTTP request first
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(apiURL)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		defer resp.Body.Close()
+		
+		var status map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&status); err == nil {
+			// Display status in a readable format
+			displayStatus(status)
+			return nil
+		}
+	}
+	
+	// Fallback: show basic info from systemctl
+	fmt.Println("Status: Unable to connect to node-agent API")
+	fmt.Println()
+	fmt.Println("Check if node-agent is running:")
+	fmt.Println("  systemctl status node-agent")
+	fmt.Println()
+	fmt.Println("View logs:")
+	fmt.Println("  journalctl -u node-agent -f")
 	fmt.Println()
 	
 	return nil
+}
+
+func displayStatus(status map[string]interface{}) {
+	// Display node information
+	if node, ok := status["node"].(map[string]interface{}); ok {
+		fmt.Println("Node Information:")
+		fmt.Printf("  ID:         %v\n", node["id"])
+		fmt.Printf("  Name:       %v\n", node["name"])
+		fmt.Printf("  Cluster:    %v\n", node["cluster"])
+		fmt.Printf("  Region:     %v\n", node["region"])
+		fmt.Printf("  Datacenter: %v\n", node["datacenter"])
+		fmt.Println()
+	}
+	
+	// Display networking status
+	if network, ok := status["networking"].(map[string]interface{}); ok {
+		fmt.Println("Network Status:")
+		fmt.Printf("  Type:       %v\n", network["type"])
+		fmt.Printf("  Connected:  %v\n", network["connected"])
+		if ip, ok := network["tailscale_ip"]; ok {
+			fmt.Printf("  Tailscale:  %v\n", ip)
+		}
+		fmt.Println()
+	}
+	
+	// Display leadership info
+	if leadership, ok := status["leadership"].(map[string]interface{}); ok {
+		fmt.Println("Leadership:")
+		fmt.Printf("  Mode:      %v\n", leadership["mode"])
+		fmt.Printf("  Is Leader: %v\n", leadership["is_leader"])
+		if leader, ok := leadership["leader"]; ok && leader != nil {
+			fmt.Printf("  Leader:    %v\n", leader)
+		}
+		fmt.Println()
+	}
+	
+	// Display roles
+	if roles, ok := status["roles"].([]interface{}); ok && len(roles) > 0 {
+		fmt.Println("Roles:")
+		for _, r := range roles {
+			role, ok := r.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			fmt.Printf("  - %v: running=%v, healthy=%v, leader=%v\n",
+				role["name"], role["running"], role["healthy"], role["is_leader"])
+		}
+		fmt.Println()
+	}
+	
+	// Display discovery
+	if discovery, ok := status["discovery"].(map[string]interface{}); ok {
+		fmt.Println("Cluster Discovery:")
+		fmt.Printf("  Members: %v\n", discovery["members"])
+		fmt.Println()
+	}
 }
