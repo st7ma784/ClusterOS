@@ -3,7 +3,6 @@ Description=ClusterOS Tailscale Auto-Authentication
 After=network-online.target tailscaled.service
 Wants=network-online.target tailscaled.service
 ConditionPathExists=/etc/clusteros/tailscale.env
-ConditionPathExists=!/var/lib/tailscale/tailscaled.state
 
 [Service]
 Type=oneshot

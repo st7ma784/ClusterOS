@@ -14,10 +14,14 @@ echo "[1/7] Installing node-agent and CLI tools..."
 
 sudo install -m 755 /tmp/node-agent /usr/local/bin/node-agent
 
-# Install cluster-os-install (the remote installer script)
-if [ -f /tmp/cluster-os-install ]; then
+# Install cluster-os-install from files/bin
+if [ -f /tmp/clusteros-files/bin/cluster-os-install ]; then
+    sudo install -m 755 /tmp/clusteros-files/bin/cluster-os-install /usr/local/bin/cluster-os-install
+    echo "  cluster-os-install installed from files/bin"
+elif [ -f /tmp/cluster-os-install ]; then
+    # Fallback to old location for backwards compatibility
     sudo install -m 755 /tmp/cluster-os-install /usr/local/bin/cluster-os-install
-    echo "  cluster-os-install installed"
+    echo "  cluster-os-install installed from tmp"
 fi
 
 # Create directories

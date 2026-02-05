@@ -12,3 +12,13 @@ network:
         name: "eth*"
       dhcp4: true
       optional: true
+  wifis:
+    all-wifi:
+      match:
+        name: "w*"
+      dhcp4: true
+      dhcp6: false
+      optional: true
+      access-points:
+        "TALKTALK665317":
+          password: "NXJP7U39"
