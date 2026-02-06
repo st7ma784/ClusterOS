@@ -82,6 +82,10 @@ create_usb_image() {
     local img_size=$(du -h "$IMG_OUTPUT" | cut -f1)
     log_info "USB image created: $IMG_OUTPUT ($img_size)"
 
+    # Fix UEFI boot (replace systemd-boot with GRUB for better compatibility)
+    log_info "Fixing UEFI boot configuration..."
+    fix_uefi_boot
+
     # Embed the installer image into the image itself (self-replicating)
     log_info "Embedding installer image for self-replication..."
     embed_installer_image
@@ -93,9 +97,114 @@ create_usb_image() {
     echo ""
     echo "To write to USB drive:"
     echo "  sudo dd if=$IMG_OUTPUT of=/dev/sdX bs=4M status=progress oflag=sync"
+    echo "  sudo sgdisk -e /dev/sdX   # IMPORTANT: Fix GPT backup header location"
+    echo "  sync"
     echo ""
     echo "Replace /dev/sdX with your USB device (use lsblk to find it)"
     echo "WARNING: This will erase all data on the USB drive!"
+    echo ""
+    echo "The sgdisk command is REQUIRED - it fixes the GPT partition table"
+    echo "so the backup header is at the end of your actual USB drive."
+}
+
+# Fix UEFI boot by replacing systemd-boot with GRUB for better USB compatibility
+# Ubuntu cloud images use systemd-boot which requires XBOOTLDR partition discovery
+# This often fails on real hardware when booting from USB
+fix_uefi_boot() {
+    local LOOP_DEV=""
+    local EFI_MOUNT="/tmp/clusteros-efi-$$"
+    
+    # Set up loop device
+    LOOP_DEV=$(sudo losetup --find --show --partscan "$IMG_OUTPUT")
+    if [ -z "$LOOP_DEV" ]; then
+        log_warn "Failed to set up loop device for EFI fix"
+        return 0
+    fi
+    
+    # Wait for partitions to appear
+    sleep 2
+    
+    # Find the EFI partition (usually p15 on Ubuntu cloud images)
+    local EFI_PART=""
+    for part in "${LOOP_DEV}p15" "${LOOP_DEV}p1" "${LOOP_DEV}p2"; do
+        if [ -b "$part" ]; then
+            # Check if it's a FAT partition (EFI)
+            if sudo blkid "$part" 2>/dev/null | grep -qi "vfat\|fat32"; then
+                EFI_PART="$part"
+                break
+            fi
+        fi
+    done
+    
+    if [ -z "$EFI_PART" ]; then
+        log_warn "Could not find EFI partition, skipping UEFI fix"
+        sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
+        return 0
+    fi
+    
+    log_info "Found EFI partition: $EFI_PART"
+    
+    # Mount EFI partition
+    mkdir -p "$EFI_MOUNT"
+    if ! sudo mount "$EFI_PART" "$EFI_MOUNT" 2>/dev/null; then
+        log_warn "Failed to mount EFI partition"
+        sudo losetup -d "$LOOP_DEV" 2>/dev/null || true
+        rmdir "$EFI_MOUNT" 2>/dev/null || true
+        return 0
+    fi
+    
+    # Check if GRUB is available to use
+    if [ -f "$EFI_MOUNT/EFI/ubuntu/shimx64.efi" ]; then
+        log_info "Replacing systemd-boot with shim+GRUB for Secure Boot compatibility..."
+        # Use shim which chains to GRUB (supports Secure Boot)
+        sudo cp "$EFI_MOUNT/EFI/ubuntu/shimx64.efi" "$EFI_MOUNT/EFI/BOOT/BOOTX64.EFI"
+        log_info "Installed shim as BOOTX64.EFI"
+    elif [ -f "$EFI_MOUNT/EFI/ubuntu/grubx64.efi" ]; then
+        log_info "Replacing systemd-boot with GRUB..."
+        sudo cp "$EFI_MOUNT/EFI/ubuntu/grubx64.efi" "$EFI_MOUNT/EFI/BOOT/BOOTX64.EFI"
+        log_info "Installed GRUB as BOOTX64.EFI"
+    else
+        log_warn "No GRUB found, keeping systemd-boot"
+    fi
+    
+    # Ensure GRUB can find the boot partition
+    # Create a fallback grub.cfg directly in EFI/BOOT/
+    log_info "Creating fallback GRUB configuration..."
+    sudo tee "$EFI_MOUNT/EFI/BOOT/grub.cfg" > /dev/null <<'GRUBCFG'
+# Fallback GRUB config for USB boot
+# Search for the boot partition by label or UUID
+
+set timeout=3
+set default=0
+
+# Try to find boot partition
+search --no-floppy --label BOOT --set=boot_part
+if [ -z "$boot_part" ]; then
+    search --no-floppy --fs-uuid 2bab0d29-6c12-4665-83d4-f986119f946f --set=boot_part
+fi
+
+# If found, load main GRUB config
+if [ -n "$boot_part" ]; then
+    set root=$boot_part
+    set prefix=($root)/grub
+    configfile $prefix/grub.cfg
+fi
+
+# Fallback boot entry if main config fails
+menuentry "ClusterOS (fallback)" {
+    search --no-floppy --label cloudimg-rootfs --set=root
+    linux /vmlinuz root=LABEL=cloudimg-rootfs ro console=tty1 console=ttyS0
+    initrd /initrd.img
+}
+GRUBCFG
+    log_info "Fallback GRUB config created"
+    
+    # Cleanup
+    sudo umount "$EFI_MOUNT"
+    sudo losetup -d "$LOOP_DEV"
+    rmdir "$EFI_MOUNT" 2>/dev/null || true
+    
+    log_info "UEFI boot fix complete"
 }
 
 # Embed the installer image into the built image for self-replication

@@ -13,5 +13,20 @@ wireguard:
   listen_port: 51820
   mtu: 1420
 
+# Roles to enable on this node
+# The node-agent will manage these services based on cluster state and leader election
 roles:
-  enabled: []
+  enabled:
+    - tailscale
+    - slurm-controller
+    - slurm-worker
+    - k3s-server
+    - k3s-agent
+
+# Tailscale settings
+tailscale:
+  api_discovery: true
+
+# Cluster settings
+cluster:
+  election_mode: serf

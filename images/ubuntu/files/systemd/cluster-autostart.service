@@ -1,0 +1,16 @@
+[Unit]
+Description=ClusterOS Auto-Assembly Service
+Documentation=https://github.com/cluster-os
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/cluster-autostart
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

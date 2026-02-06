@@ -1,11 +1,12 @@
 [Unit]
 Description=ClusterOS Node Agent
 Documentation=https://github.com/cluster-os
-After=network-online.target
+After=network-online.target tailscaled.service
 Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sleep 5
 ExecStart=/usr/local/bin/node-agent
 Restart=always
 RestartSec=10

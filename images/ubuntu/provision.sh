@@ -77,6 +77,57 @@ sudo apt-get install -y munge slurm-wlm slurm-client
 # systemd-boot provides systemd-bootx64.efi for UEFI booting
 sudo apt-get install -y rsync gdisk dosfstools efibootmgr parted systemd-boot
 
+# Install WiFi support packages and firmware
+echo "  Installing WiFi support and firmware..."
+sudo apt-get install -y wpasupplicant wireless-tools iw rfkill
+
+# Install WiFi firmware for common chipsets
+echo "  Installing WiFi firmware..."
+# Main firmware package - contains most WiFi firmware (Intel, Realtek, Atheros, etc.)
+sudo apt-get install -y linux-firmware || true
+
+# CRITICAL: Cloud images use minimal kernels without WiFi drivers
+# We need to install linux-modules-extra for the INSTALLED kernel, not the running one
+# The running kernel during Packer build is the VM's kernel, not the target
+INSTALLED_KERNEL=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|/boot/vmlinuz-||' | sort -V | tail -1)
+echo "  Installed kernel: $INSTALLED_KERNEL"
+
+if [ -n "$INSTALLED_KERNEL" ]; then
+    echo "  Installing extra kernel modules for WiFi support..."
+    sudo apt-get install -y "linux-modules-extra-${INSTALLED_KERNEL}" || {
+        echo "  Trying generic modules-extra package..."
+        sudo apt-get install -y linux-modules-extra-generic || true
+    }
+fi
+
+# Also install the generic kernel modules package as fallback
+sudo apt-get install -y linux-modules-extra-generic 2>/dev/null || true
+
+# Broadcom WiFi - proprietary driver for some chipsets
+sudo apt-get install -y broadcom-sta-dkms 2>/dev/null || true
+# Broadcom open-source driver (brcmfmac/brcmsmac)
+sudo apt-get install -y bcmwl-kernel-source 2>/dev/null || true
+
+# Realtek USB WiFi adapters (rtl8xxxu, rtl88xxau)
+sudo apt-get install -y realtek-rtl88xxau-dkms 2>/dev/null || true
+
+# NetworkManager as backup for complex WiFi scenarios  
+sudo apt-get install -y network-manager 2>/dev/null || true
+
+# Verify WiFi modules are available
+echo "  Verifying WiFi modules..."
+for mod in iwlwifi ath9k ath10k_pci brcmfmac rtw88_pci mt7921e cfg80211 mac80211; do
+    if modinfo "$mod" &>/dev/null; then
+        echo "    ✓ $mod available"
+    else
+        echo "    ✗ $mod NOT found"
+    fi
+done
+
+# Rebuild initramfs to include firmware and modules
+echo "  Rebuilding initramfs..."
+sudo update-initramfs -u -k all 2>/dev/null || true
+
 # Create directories
 sudo mkdir -p /etc/slurm /etc/munge /var/spool/slurm /var/log/slurm
 sudo chmod 700 /etc/munge
@@ -119,13 +170,38 @@ fi
 # ------------------------------------------------------------------------------
 echo "[5/6] Configuring network..."
 
-# Copy netplan config
+# Copy netplan config (includes WiFi configuration)
 sudo cp /tmp/clusteros-files/netplan/99-clusteros.yaml /etc/netplan/
 sudo chmod 600 /etc/netplan/99-clusteros.yaml
 
 # Ensure networkd is used
 sudo systemctl enable systemd-networkd
 sudo systemctl enable systemd-resolved
+
+# Install systemd-networkd-wait-online override to reduce boot timeout
+# This prevents long delays when network interfaces aren't available
+if [ -d /tmp/clusteros-files/systemd/systemd-networkd-wait-online.service.d ]; then
+    sudo mkdir -p /etc/systemd/system/systemd-networkd-wait-online.service.d
+    sudo cp /tmp/clusteros-files/systemd/systemd-networkd-wait-online.service.d/*.conf \
+        /etc/systemd/system/systemd-networkd-wait-online.service.d/
+    echo "  Network wait timeout reduced to 10 seconds"
+fi
+
+# DISABLE system wpa_supplicant - our cluster-wifi.service manages it
+# The system service conflicts with manual wpa_supplicant management
+sudo systemctl disable wpa_supplicant.service 2>/dev/null || true
+sudo systemctl mask wpa_supplicant.service 2>/dev/null || true
+
+# Disable NetworkManager WiFi management - we use systemd-networkd + cluster-wifi
+sudo systemctl disable NetworkManager.service 2>/dev/null || true
+
+# Install and enable WiFi setup service
+if [ -f /tmp/clusteros-files/systemd/cluster-wifi.service ]; then
+    sudo cp /tmp/clusteros-files/systemd/cluster-wifi.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable cluster-wifi.service
+    echo "  WiFi auto-connect service enabled (manages wpa_supplicant)"
+fi
 
 # WireGuard directory
 sudo mkdir -p /etc/wireguard
@@ -154,6 +230,17 @@ echo "  Installing ClusterOS commands..."
 if [ -d /tmp/clusteros-files/bin ]; then
     sudo cp /tmp/clusteros-files/bin/* /usr/local/bin/
     sudo chmod +x /usr/local/bin/cluster-*
+    sudo chmod +x /usr/local/bin/cluster-autostart 2>/dev/null || true
+    sudo chmod +x /usr/local/bin/cluster-wifi-setup 2>/dev/null || true
+fi
+
+# Install and enable cluster-autostart service
+echo "  Installing cluster auto-assembly service..."
+if [ -f /tmp/clusteros-files/systemd/cluster-autostart.service ]; then
+    sudo cp /tmp/clusteros-files/systemd/cluster-autostart.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable cluster-autostart.service
+    echo "  Cluster auto-assembly enabled"
 fi
 
 # SSH config - disable root login
@@ -176,7 +263,9 @@ echo "ClusterOS commands installed:"
 ls -1 /usr/local/bin/cluster-* 2>/dev/null || echo "  (none)"
 echo ""
 echo "Enabled services:"
-systemctl list-unit-files | grep -E "node-agent|k3s|slurm|munge" | head -10
+systemctl list-unit-files | grep -E "node-agent|k3s|slurm|munge|tailscale|cluster-autostart|cluster-wifi" | head -20
+echo ""
+echo "WiFi configured: MANDER84"
 echo ""
 echo "============================================"
 echo "Provisioning Complete"

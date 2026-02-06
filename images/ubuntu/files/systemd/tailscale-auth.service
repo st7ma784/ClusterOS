@@ -1,25 +1,18 @@
 [Unit]
 Description=ClusterOS Tailscale Auto-Authentication
-After=network-online.target tailscaled.service
+After=network-online.target tailscaled.service cluster-wifi.service
 Wants=network-online.target tailscaled.service
+# Only run if credentials file exists
 ConditionPathExists=/etc/clusteros/tailscale.env
-ConditionPathExists=!/var/lib/tailscale/tailscaled.state
+# Remove the state check - we handle re-auth in the script
 
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/clusteros/tailscale.env
-ExecStart=/bin/bash -c '\
-    if [ -n "$TAILSCALE_AUTHKEY" ]; then \
-        echo "Authenticating Tailscale with auth key..."; \
-        tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="$(hostname)" --accept-routes --accept-dns=false; \
-    elif [ -n "$TAILSCALE_OAUTH_CLIENT_SECRET" ]; then \
-        echo "Authenticating Tailscale with OAuth..."; \
-        tailscale up --auth-key="$TAILSCALE_OAUTH_CLIENT_SECRET" --hostname="$(hostname)" --accept-routes --accept-dns=false; \
-    else \
-        echo "No Tailscale credentials found"; \
-        exit 1; \
-    fi'
+ExecStart=/usr/local/bin/tailscale-auth
 RemainAfterExit=yes
+# Give network time to stabilize
+ExecStartPre=/bin/sleep 5
 
 [Install]
 WantedBy=multi-user.target

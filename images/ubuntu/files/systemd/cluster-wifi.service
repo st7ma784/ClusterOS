@@ -1,0 +1,21 @@
+[Unit]
+Description=ClusterOS WiFi Setup
+After=systemd-modules-load.service systemd-udevd.service systemd-networkd.service
+Wants=systemd-networkd.service
+# Ensure modules are loaded before we try to use WiFi
+Requires=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Give udev time to settle after module loading
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/local/bin/cluster-wifi-setup
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+# Don't fail boot if WiFi fails
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target

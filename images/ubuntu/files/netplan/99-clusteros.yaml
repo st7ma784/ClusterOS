@@ -12,3 +12,5 @@ network:
         name: "eth*"
       dhcp4: true
       optional: true
+  # WiFi is handled by cluster-wifi.service via wpa_supplicant
+  # Removing direct wlan0 reference to avoid blocking boot when no WiFi hardware exists
