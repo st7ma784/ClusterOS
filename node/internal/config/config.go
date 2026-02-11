@@ -92,6 +92,7 @@ type ClusterConfig struct {
 
 // DefaultConfigPaths are the default paths to search for configuration files
 var DefaultConfigPaths = []string{
+	"/etc/clusteros",
 	"/etc/cluster-os",
 	"$HOME/.cluster-os",
 	"./config",
@@ -223,8 +224,8 @@ func autoDetectCapabilities(config *Config) error {
 // Validate validates the configuration
 func (c *Config) Validate() error {
 	// Validate cluster authentication key
-	if c.Cluster.AuthKey == "" {
-		return fmt.Errorf("cluster.auth_key must be set - run scripts/generate-cluster-key.sh to create one")
+	if c.Cluster.AuthKey == "" || c.Cluster.AuthKey == "GENERATE_AT_BUILD_TIME" {
+		return fmt.Errorf("cluster.auth_key is not set (still has placeholder) - run scripts/generate-cluster-key.sh and rebuild, or set CLUSTEROS_CLUSTER_AUTH_KEY")
 	}
 
 	// Validate discovery settings

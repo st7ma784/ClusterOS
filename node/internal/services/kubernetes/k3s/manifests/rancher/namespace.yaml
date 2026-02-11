@@ -1,0 +1,18 @@
+---
+# Rancher management UI namespace
+# Rancher provides web-based cluster management, Helm catalog, and monitoring
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cattle-system
+  labels:
+    app.kubernetes.io/part-of: cluster-os
+
+---
+# cert-manager namespace (required by Rancher for TLS)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-manager
+  labels:
+    app.kubernetes.io/part-of: cluster-os

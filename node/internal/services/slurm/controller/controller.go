@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,13 +24,14 @@ type SLURMController struct {
 	clusterState    *state.ClusterState
 	leaderElector   auth.RaftMungeKeyApplier
 	slurmctldCmd    *exec.Cmd
-	mungeKey        []byte
-	mungeKeyManager *auth.MungeKeyManager
-	configPath      string
-	statePath       string
-	slurmConfPath   string
-	isBackup        bool   // Whether this is a backup controller
-	backupAddr      string // Address of the backup controller
+	mungeKey           []byte
+	mungeKeyManager    *auth.MungeKeyManager
+	configPath         string
+	statePath          string
+	slurmConfPath      string
+	isBackup           bool   // Whether this is a backup controller
+	backupAddr         string // Address of the backup controller
+	accountingEnabled  bool   // Whether accounting via slurmdbd is active
 }
 
 // Config contains configuration for the SLURM controller
@@ -167,6 +169,20 @@ func (sc *SLURMController) Reconfigure(clusterState *state.ClusterState) error {
 
 	// Only reconfigure if we're the leader
 	if sc.IsLeader() {
+		// Check if SlurmDBD became available since we started
+		// If we started without accounting and SlurmDBD is now reachable,
+		// we need to restart slurmctld (can't change AccountingStorageType via SIGHUP)
+		if !sc.accountingEnabled && sc.config.UseKubeSlurmdbd {
+			slurmdbdHost := sc.getSlurmdbdHost()
+			if slurmdbdHost != "" && sc.isSlurmdbdReachable(slurmdbdHost, sc.config.SlurmdbdPort) {
+				sc.Logger().Info("SlurmDBD is now available — restarting slurmctld with accounting enabled")
+				if err := sc.stopSlurmctld(); err != nil {
+					sc.Logger().Warnf("Failed to stop slurmctld for accounting restart: %v", err)
+				}
+				return sc.startSlurmctld()
+			}
+		}
+
 		// Regenerate configuration
 		if err := sc.generateConfig(); err != nil {
 			return fmt.Errorf("failed to generate config: %w", err)
@@ -176,7 +192,7 @@ func (sc *SLURMController) Reconfigure(clusterState *state.ClusterState) error {
 		if sc.slurmctldCmd != nil && sc.slurmctldCmd.Process != nil {
 			sc.Logger().Info("Reloading slurmctld configuration")
 			// Send SIGHUP to reload config
-			if err := sc.slurmctldCmd.Process.Signal(os.Signal(os.Interrupt)); err != nil {
+			if err := sc.slurmctldCmd.Process.Signal(syscall.SIGHUP); err != nil {
 				sc.Logger().Warnf("Failed to send reload signal: %v", err)
 			}
 		}
@@ -263,6 +279,12 @@ func (sc *SLURMController) createDirectories() error {
 // startSlurmctld starts the slurmctld daemon
 func (sc *SLURMController) startSlurmctld() error {
 	sc.Logger().Infof("Starting slurmctld daemon (%s)", sc.getRoleString())
+
+	// Wait for SlurmDBD on K3s before generating config
+	// This ensures K3s has time to start and deploy the SlurmDBD pod
+	if sc.config.UseKubeSlurmdbd {
+		sc.waitForSlurmDBD()
+	}
 
 	// Generate configuration
 	if err := sc.generateConfig(); err != nil {
@@ -352,28 +374,56 @@ func (sc *SLURMController) generateConfig() error {
 	// Get all nodes with slurm-worker role
 	workers := sc.clusterState.GetNodesByRole("slurm-worker")
 
-	// Get controller node info
+	// Get controller node info — use Tailscale IP for reliable addressing
 	controllerName := ""
 	if leaderNode, ok := sc.clusterState.GetLeaderNode("slurm-controller"); ok {
-		// Use node name for SlurmctldHost (resolves via DNS in Docker)
-		controllerName = leaderNode.Name
-		sc.Logger().Infof("SLURM controller node: %s (address: %s)", leaderNode.Name, leaderNode.Address)
+		// Prefer Tailscale IP (always reachable), fall back to Address, then Name
+		if leaderNode.TailscaleIP != "" {
+			controllerName = leaderNode.TailscaleIP
+		} else if leaderNode.Address != "" {
+			controllerName = leaderNode.Address
+		} else {
+			controllerName = leaderNode.Name
+		}
+		sc.Logger().Infof("SLURM controller: %s (node: %s)", controllerName, leaderNode.Name)
 	} else {
-		sc.Logger().Warn("No SLURM controller leader found, using placeholder")
+		sc.Logger().Warn("No SLURM controller leader found, using localhost")
 		controllerName = "localhost"
 	}
 
-	// Prepare template data
+	// Get slurmdbd host if K3s is running it
+	slurmdbdHost := ""
+	slurmdbdPort := sc.config.SlurmdbdPort
+	if sc.config.UseKubeSlurmdbd {
+		slurmdbdHost = sc.getSlurmdbdHost()
+		if slurmdbdHost != "" {
+			sc.Logger().Infof("Using slurmdbd at %s:%d", slurmdbdHost, slurmdbdPort)
+			sc.accountingEnabled = true
+		} else {
+			sc.Logger().Warn("SlurmDBD not available yet — starting without accounting (will retry on reconfigure)")
+			sc.accountingEnabled = false
+		}
+	}
+
+	// Prepare template data — populate ALL fields so the template renders correctly
 	data := struct {
-		ClusterName    string
-		ControllerNode string
-		Port           int
-		Nodes          []*state.Node
+		ClusterName           string
+		ControllerNode        string
+		Port                  int
+		EnableHA              bool
+		BackupController      string
+		BackupAddr            string
+		AccountingStorageHost string
+		AccountingStoragePort int
+		Nodes                 []*state.Node
 	}{
-		ClusterName:    sc.config.ClusterName,
-		ControllerNode: controllerName,
-		Port:           sc.config.Port,
-		Nodes:          workers,
+		ClusterName:           sc.config.ClusterName,
+		ControllerNode:        controllerName,
+		Port:                  sc.config.Port,
+		EnableHA:              sc.config.EnableHA,
+		AccountingStorageHost: slurmdbdHost,
+		AccountingStoragePort: slurmdbdPort,
+		Nodes:                 workers,
 	}
 
 	// Parse template
@@ -492,6 +542,48 @@ func (sc *SLURMController) getSlurmdbdHost() string {
 	return ""
 }
 
+// waitForSlurmDBD waits for the Kubernetes-hosted SlurmDBD to become reachable.
+// This gives K3s time to start, deploy the SlurmDBD manifest, and have the pod become ready.
+// Waits up to 3 minutes, then proceeds anyway (slurmctld will start without accounting
+// and Reconfigure() will pick up SlurmDBD when it becomes available later).
+func (sc *SLURMController) waitForSlurmDBD() {
+	const maxAttempts = 36 // 36 × 5s = 3 minutes
+	const interval = 5 * time.Second
+
+	sc.Logger().Info("Waiting for SlurmDBD on K3s to become reachable...")
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		host := sc.getSlurmdbdHost()
+		if host != "" && sc.isSlurmdbdReachable(host, sc.config.SlurmdbdPort) {
+			sc.Logger().Infof("SlurmDBD reachable at %s:%d (after %d attempts)", host, sc.config.SlurmdbdPort, attempt)
+			return
+		}
+
+		if attempt%6 == 0 { // Log every 30s
+			if host == "" {
+				sc.Logger().Infof("Still waiting for K3s server node to appear... (%ds)", attempt*5)
+			} else {
+				sc.Logger().Infof("K3s server found at %s, waiting for SlurmDBD pod on port %d... (%ds)", host, sc.config.SlurmdbdPort, attempt*5)
+			}
+		}
+
+		time.Sleep(interval)
+	}
+
+	sc.Logger().Warn("SlurmDBD not reachable after 3 minutes — proceeding without accounting (will retry on reconfigure)")
+}
+
+// isSlurmdbdReachable checks if the SlurmDBD service is accepting connections
+func (sc *SLURMController) isSlurmdbdReachable(host string, port int) bool {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
 const slurmConfHATemplate = `# SLURM Configuration (Auto-generated by Cluster-OS with HA)
 # Cluster: {{.ClusterName}}
 
@@ -550,7 +642,7 @@ PrologFlags=Alloc
 
 # Node definitions
 {{range .Nodes}}
-NodeName={{.Name}} NodeAddr={{.Address}} CPUs={{if le .Capabilities.CPU 1}}1{{else}}{{.Capabilities.CPU}}{{end}} RealMemory=4096 State=UNKNOWN
+NodeName={{.Name}} NodeAddr={{if .TailscaleIP}}{{.TailscaleIP}}{{else}}{{.Address}}{{end}} CPUs={{if le .Capabilities.CPU 1}}1{{else}}{{.Capabilities.CPU}}{{end}} RealMemory=4096 State=UNKNOWN
 {{end}}
 
 # Partition definitions

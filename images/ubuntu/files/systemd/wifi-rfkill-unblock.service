@@ -1,0 +1,14 @@
+[Unit]
+Description=Keep WiFi RF unblocked
+# Run after everything that might block WiFi
+After=cloud-init.target cloud-final.service
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/rfkill unblock wifi
+ExecStart=/usr/sbin/rfkill unblock all
+
+[Install]
+WantedBy=multi-user.target

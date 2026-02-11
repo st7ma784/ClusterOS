@@ -99,12 +99,9 @@ func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node, l
 	cfg.Tags["cpu"] = strconv.Itoa(localNode.Capabilities.CPU)
 	cfg.Tags["arch"] = localNode.Capabilities.Arch
 
-	// Generate and add authentication token
-	joinToken, err := clusterAuth.CreateJoinToken(cfg.NodeID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create join token: %w", err)
-	}
-	cfg.Tags["auth_token"] = joinToken
+	// Generate and add compact authentication token (fits within Serf's 512-byte tag limit)
+	joinToken := clusterAuth.CreateCompactJoinToken(cfg.NodeID)
+	cfg.Tags["auth"] = joinToken
 
 	serfConfig.Tags = cfg.Tags
 
@@ -176,9 +173,9 @@ func (sd *SerfDiscovery) handleEvents() {
 // handleMemberEvent handles node join/leave/update/failed events
 func (sd *SerfDiscovery) handleMemberEvent(event serf.MemberEvent) {
 	for _, member := range event.Members {
-		nodeID := member.Tags["id"]
+		nodeID := member.Tags["node_id"]
 		if nodeID == "" {
-			sd.logger.Warnf("Member %s has no id tag", member.Name)
+			sd.logger.Warnf("Member %s has no node_id tag", member.Name)
 			continue
 		}
 
@@ -215,23 +212,15 @@ func (sd *SerfDiscovery) handleMemberJoin(member serf.Member) {
 	}
 
 	// Validate authentication token
-	authToken := member.Tags["auth_token"]
+	authToken := member.Tags["auth"]
 	if authToken == "" {
 		sd.logger.Warnf("Node %s attempted to join without auth token - rejecting", member.Name)
 		return
 	}
 
-	// Verify the join token
-	verifiedNodeID, err := sd.clusterAuth.VerifyJoinToken(authToken)
-	if err != nil {
+	// Verify the compact join token
+	if err := sd.clusterAuth.VerifyCompactJoinToken(nodeID, authToken); err != nil {
 		sd.logger.Warnf("Node %s failed authentication: %v - rejecting", member.Name, err)
-		return
-	}
-
-	// Verify the node ID matches
-	if verifiedNodeID != nodeID {
-		sd.logger.Warnf("Node %s auth token node ID mismatch (expected %s, got %s) - rejecting",
-			member.Name, nodeID, verifiedNodeID)
 		return
 	}
 
@@ -270,7 +259,7 @@ func (sd *SerfDiscovery) handleMemberUpdate(member serf.Member) {
 
 // handleMemberLeave processes a member leave event
 func (sd *SerfDiscovery) handleMemberLeave(member serf.Member) {
-	nodeID := member.Tags["id"]
+	nodeID := member.Tags["node_id"]
 	sd.state.UpdateNodeStatus(nodeID, state.StatusLeft)
 
 	// Remove from Raft cluster if we're the leader
@@ -287,7 +276,7 @@ func (sd *SerfDiscovery) handleMemberLeave(member serf.Member) {
 
 // handleMemberFailed processes a member failed event
 func (sd *SerfDiscovery) handleMemberFailed(member serf.Member) {
-	nodeID := member.Tags["id"]
+	nodeID := member.Tags["node_id"]
 	sd.state.UpdateNodeStatus(nodeID, state.StatusFailed)
 
 	// Remove from Raft cluster if we're the leader (after grace period)
@@ -304,7 +293,7 @@ func (sd *SerfDiscovery) handleMemberFailed(member serf.Member) {
 
 // handleMemberReap processes a member reap event
 func (sd *SerfDiscovery) handleMemberReap(member serf.Member) {
-	nodeID := member.Tags["id"]
+	nodeID := member.Tags["node_id"]
 	sd.state.RemoveNode(nodeID)
 	sd.notifyMembershipChange()
 }
@@ -348,7 +337,7 @@ func (sd *SerfDiscovery) handleQuery(query *serf.Query) {
 
 // memberToNode converts a Serf member to a cluster node
 func (sd *SerfDiscovery) memberToNode(member serf.Member) *state.Node {
-	nodeID := member.Tags["id"]
+	nodeID := member.Tags["node_id"]
 
 	// Parse roles (expand ultra-short abbreviations)
 	roles := []string{}
@@ -495,7 +484,7 @@ func (sd *SerfDiscovery) IsBootstrap() bool {
 // GetMemberByNodeID finds a Serf member by node ID
 func (sd *SerfDiscovery) GetMemberByNodeID(nodeID string) (*serf.Member, bool) {
 	for _, member := range sd.serf.Members() {
-		if member.Tags["id"] == nodeID {
+		if member.Tags["node_id"] == nodeID {
 			return &member, true
 		}
 	}

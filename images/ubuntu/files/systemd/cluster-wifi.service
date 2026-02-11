@@ -1,17 +1,20 @@
 [Unit]
 Description=ClusterOS WiFi Setup
-After=systemd-modules-load.service systemd-udevd.service systemd-networkd.service
+# Run AFTER cloud-init completes - cloud-init may block rfkill
+After=systemd-modules-load.service systemd-udevd.service systemd-networkd.service cloud-init.target
 Wants=systemd-networkd.service
-# Ensure modules are loaded before we try to use WiFi
 Requires=systemd-modules-load.service
+Before=tailscaled.service tailscale-auth.service cluster-autostart.service network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# Give udev time to settle after module loading
-ExecStartPre=/bin/sleep 2
+# Give cloud-init and udev time to settle
+ExecStartPre=/bin/sleep 3
+# Unblock WiFi BEFORE running setup (in case something blocked it)
+ExecStartPre=/usr/sbin/rfkill unblock wifi
 ExecStart=/usr/local/bin/cluster-wifi-setup
-TimeoutStartSec=120
+TimeoutStartSec=180
 StandardOutput=journal
 StandardError=journal
 # Don't fail boot if WiFi fails

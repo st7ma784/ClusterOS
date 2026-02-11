@@ -1,0 +1,100 @@
+#!/bin/bash
+# ClusterOS - Show cluster status
+# Usage: cluster-status
+
+set -e
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+echo -e "${CYAN}=== ClusterOS Cluster Status ===${NC}"
+echo ""
+
+# Node info
+echo -e "${YELLOW}Node Information:${NC}"
+echo "  Hostname:  $(hostname)"
+echo "  IP:        $(hostname -I 2>/dev/null | awk '{print $1}' || echo 'N/A')"
+echo ""
+
+# Node agent status
+echo -e "${YELLOW}Services:${NC}"
+if systemctl is-active --quiet node-agent 2>/dev/null; then
+    echo -e "  node-agent:  ${GREEN}● running${NC}"
+else
+    echo -e "  node-agent:  ${RED}○ stopped${NC}"
+fi
+
+# Cluster membership (read from node-agent status file)
+STATUS_FILE="/run/clusteros/status.json"
+if [ -f "$STATUS_FILE" ] && command -v jq &>/dev/null; then
+    JOINED=$(jq -r '.joined' "$STATUS_FILE" 2>/dev/null)
+    MEMBERS=$(jq -r '.member_count' "$STATUS_FILE" 2>/dev/null)
+    if [ "$JOINED" = "true" ] && [ "$MEMBERS" -gt 0 ] 2>/dev/null; then
+        echo -e "  cluster:     ${GREEN}● $MEMBERS members${NC}"
+    else
+        echo -e "  cluster:     ${YELLOW}○ not joined${NC}"
+    fi
+else
+    echo -e "  cluster:     ${YELLOW}○ not joined${NC}"
+fi
+
+# WireGuard status
+if ip link show wg0 &>/dev/null 2>&1; then
+    PEERS=$(sudo wg show wg0 peers 2>/dev/null | wc -l || echo "0")
+    echo -e "  wireguard:   ${GREEN}● $PEERS peers${NC}"
+else
+    echo -e "  wireguard:   ${YELLOW}○ not configured${NC}"
+fi
+
+# K3s status
+if systemctl is-active --quiet k3s 2>/dev/null; then
+    NODES=$(sudo k3s kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
+    echo -e "  k3s:         ${GREEN}● $NODES nodes${NC}"
+elif systemctl is-active --quiet k3s-agent 2>/dev/null; then
+    echo -e "  k3s-agent:   ${GREEN}● running${NC}"
+else
+    echo -e "  k3s:         ${YELLOW}○ disabled${NC}"
+fi
+
+# SLURM status (node-agent manages slurmd/slurmctld directly, systemd services are masked)
+if pgrep -x slurmctld &>/dev/null; then
+    NODES=$(sinfo -h -o "%D" 2>/dev/null || echo "?")
+    echo -e "  slurm:       ${GREEN}● controller ($NODES nodes)${NC}"
+elif pgrep -x slurmd &>/dev/null; then
+    echo -e "  slurmd:      ${GREEN}● running${NC}"
+else
+    echo -e "  slurm:       ${YELLOW}○ waiting (node-agent managed)${NC}"
+fi
+
+# Tailscale status
+if systemctl is-active --quiet tailscaled 2>/dev/null; then
+    TS_IP=$(tailscale ip -4 2>/dev/null || echo '')
+    TS_STATUS=$(tailscale status --self 2>/dev/null | awk 'NR==1 {print $2}' || echo '')
+    if [ -n "$TS_IP" ]; then
+        echo -e "  tailscale:   ${GREEN}● $TS_IP${NC}"
+    else
+        echo -e "  tailscale:   ${GREEN}● running${NC}"
+    fi
+else
+    echo -e "  tailscale:   ${YELLOW}○ not running${NC}"
+fi
+
+echo ""
+
+# Show cluster members if available
+if [ -f "$STATUS_FILE" ] && command -v jq &>/dev/null; then
+    MEMBER_COUNT=$(jq -r '.member_count' "$STATUS_FILE" 2>/dev/null)
+    if [ "$MEMBER_COUNT" -gt 0 ] 2>/dev/null; then
+        echo -e "${YELLOW}Cluster Members:${NC}"
+        jq -r '.members[] | "\(.status) \(.name) \(.addr)"' "$STATUS_FILE" 2>/dev/null | while read status name addr; do
+            case "$status" in
+                alive)  echo -e "  ${GREEN}●${NC} $name  $addr  alive" ;;
+                failed) echo -e "  ${RED}●${NC} $name  $addr  failed" ;;
+                *)      echo -e "  ${YELLOW}●${NC} $name  $addr  $status" ;;
+            esac
+        done
+    fi
+fi

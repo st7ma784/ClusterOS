@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -280,6 +281,12 @@ func (d *Daemon) Start() error {
 		return fmt.Errorf("failed to initialize networking: %w", err)
 	}
 
+	// After networking is up, discover Tailscale peers and join them
+	// This is the primary cluster assembly mechanism
+	if d.tailscale != nil && d.config.Tailscale.APIDiscovery {
+		go d.tailscalePeerDiscoveryLoop()
+	}
+
 	// Initialize role manager and start roles
 	if err := d.initRoles(); err != nil {
 		return fmt.Errorf("failed to initialize roles: %w", err)
@@ -554,6 +561,122 @@ func (d *Daemon) setUniqueHostname(tsIP net.IP) error {
 	return nil
 }
 
+// tailscalePeerDiscoveryLoop periodically discovers Tailscale peers and joins them via Serf.
+// This is the primary mechanism for automatic cluster assembly.
+func (d *Daemon) tailscalePeerDiscoveryLoop() {
+	// Initial attempt immediately
+	d.discoverAndJoinTailscalePeers()
+
+	// Then retry periodically — peers may come online at different times
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if d.discovery.GetClusterSize() <= 1 {
+				// Still alone — keep trying
+				d.discoverAndJoinTailscalePeers()
+			} else {
+				// We've joined a cluster. Slow down to maintenance cadence
+				// to pick up any new nodes that appear later.
+				d.discoverAndJoinTailscalePeers()
+			}
+		case <-d.ctx.Done():
+			return
+		}
+	}
+}
+
+// discoverAndJoinTailscalePeers uses `tailscale status --json` to find other
+// machines on the Tailnet, then tries to join them on the Serf gossip port.
+func (d *Daemon) discoverAndJoinTailscalePeers() {
+	cmd := exec.Command("tailscale", "status", "--json")
+	output, err := cmd.Output()
+	if err != nil {
+		d.logger.Debugf("Failed to get tailscale status: %v", err)
+		return
+	}
+
+	// Parse the JSON output
+	var tsStatus struct {
+		Self *struct {
+			TailscaleIPs []string `json:"TailscaleIPs"`
+		} `json:"Self"`
+		Peer map[string]*struct {
+			HostName     string   `json:"HostName"`
+			TailscaleIPs []string `json:"TailscaleIPs"`
+			Online       bool     `json:"Online"`
+			Tags         []string `json:"Tags,omitempty"` // e.g. ["tag:clusteros"]
+			OS           string   `json:"OS"`
+		} `json:"Peer"`
+	}
+
+	if err := json.Unmarshal(output, &tsStatus); err != nil {
+		d.logger.Debugf("Failed to parse tailscale status: %v", err)
+		return
+	}
+
+	// Get our own Tailscale IP to skip self
+	var selfIP string
+	if tsStatus.Self != nil && len(tsStatus.Self.TailscaleIPs) > 0 {
+		selfIP = tsStatus.Self.TailscaleIPs[0]
+	}
+
+	// Collect IPs of online peers to try joining
+	var peersToJoin []string
+	serfPort := d.config.Discovery.BindPort
+	if serfPort == 0 {
+		serfPort = 7946
+	}
+
+	// Build set of already-known members to avoid redundant joins
+	knownAddrs := make(map[string]bool)
+	for _, m := range d.discovery.Members() {
+		knownAddrs[m.Addr.String()] = true
+	}
+
+	for _, peer := range tsStatus.Peer {
+		if !peer.Online {
+			continue
+		}
+		if len(peer.TailscaleIPs) == 0 {
+			continue
+		}
+
+		peerIP := peer.TailscaleIPs[0]
+
+		// Skip self
+		if peerIP == selfIP {
+			continue
+		}
+
+		// Skip already-known members
+		if knownAddrs[peerIP] {
+			continue
+		}
+
+		// Try all peers on the Tailnet — if they're running ClusterOS,
+		// they'll have Serf listening on the gossip port.
+		// If they're not ClusterOS nodes, the connection will simply fail silently.
+		peerAddr := fmt.Sprintf("%s:%d", peerIP, serfPort)
+		peersToJoin = append(peersToJoin, peerAddr)
+	}
+
+	if len(peersToJoin) == 0 {
+		return
+	}
+
+	d.logger.Infof("Tailscale discovery: attempting to join %d peer(s): %v", len(peersToJoin), peersToJoin)
+	n, err := d.discovery.Join(peersToJoin)
+	if err != nil {
+		d.logger.Debugf("Tailscale peer join: %v (joined %d)", err, n)
+	}
+	if n > 0 {
+		d.logger.Infof("Tailscale discovery: successfully joined %d new peer(s)", n)
+	}
+}
+
 // updateHostsFile adds the new hostname to /etc/hosts
 func (d *Daemon) updateHostsFile(hostname string, ip net.IP) {
 	hostsEntry := fmt.Sprintf("%s\t%s\n", ip.String(), hostname)
@@ -664,6 +787,10 @@ func (d *Daemon) initRoles() error {
 func (d *Daemon) Run() error {
 	d.logger.Info("Daemon running, waiting for signals")
 
+	// Write initial status file and start periodic updates
+	d.writeStatusFile()
+	go d.statusFileLoop()
+
 	// Set up signal handling
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -709,6 +836,119 @@ func (d *Daemon) Shutdown() error {
 
 	d.logger.Info("Daemon shut down successfully")
 	return nil
+}
+
+// statusFileLoop periodically writes cluster status to a file readable by cluster-status
+func (d *Daemon) statusFileLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			d.writeStatusFile()
+		case <-d.ctx.Done():
+			return
+		}
+	}
+}
+
+// writeStatusFile writes cluster membership info to /run/clusteros/status.json
+// This is read by the cluster-status shell script instead of calling `serf members`
+func (d *Daemon) writeStatusFile() {
+	statusDir := "/run/clusteros"
+	statusFile := statusDir + "/status.json"
+
+	// Ensure directory exists
+	if err := os.MkdirAll(statusDir, 0755); err != nil {
+		d.logger.Warnf("Failed to create status dir: %v", err)
+		return
+	}
+
+	// Build member list from discovery
+	type memberInfo struct {
+		Name    string `json:"name"`
+		Addr    string `json:"addr"`
+		Status  string `json:"status"`
+		NodeID  string `json:"node_id"`
+	}
+
+	members := []memberInfo{}
+	aliveCount := 0
+
+	if d.discovery != nil {
+		for _, m := range d.discovery.Members() {
+			status := "alive"
+			switch m.Status {
+			case 1: // StatusAlive
+				status = "alive"
+				aliveCount++
+			case 2: // StatusLeaving
+				status = "leaving"
+			case 3: // StatusLeft
+				status = "left"
+			case 4: // StatusFailed
+				status = "failed"
+			default:
+				status = "unknown"
+			}
+			members = append(members, memberInfo{
+				Name:   m.Name,
+				Addr:   m.Addr.String(),
+				Status: status,
+				NodeID: m.Tags["node_id"],
+			})
+		}
+	}
+
+	// Build JSON manually to avoid encoding/json import (keep it simple)
+	// Actually let's use encoding/json for correctness
+	type statusData struct {
+		Joined       bool         `json:"joined"`
+		MemberCount  int          `json:"member_count"`
+		Members      []memberInfo `json:"members"`
+		LeaderMode   string       `json:"leader_mode"`
+		IsLeader     bool         `json:"is_leader"`
+		Leader       string       `json:"leader"`
+		UpdatedAt    string       `json:"updated_at"`
+	}
+
+	sd := statusData{
+		Joined:      aliveCount > 0,
+		MemberCount: aliveCount,
+		Members:     members,
+		LeaderMode:  d.electionMode,
+		UpdatedAt:   time.Now().Format(time.RFC3339),
+	}
+
+	// Check leader status
+	if d.electionMode == "serf" && d.serfLeaderElector != nil {
+		sd.IsLeader = d.serfLeaderElector.IsLeader()
+		if leader, err := d.serfLeaderElector.GetLeader(); err == nil {
+			sd.Leader = leader
+		}
+	} else if d.electionMode == "raft" && d.leaderElector != nil {
+		sd.IsLeader = d.leaderElector.IsLeader()
+		if leader, err := d.leaderElector.GetLeader(); err == nil {
+			sd.Leader = leader
+		}
+	}
+
+	jsonData, err := json.MarshalIndent(sd, "", "  ")
+	if err != nil {
+		d.logger.Warnf("Failed to marshal status: %v", err)
+		return
+	}
+
+	// Write atomically via temp file
+	tmpFile := statusFile + ".tmp"
+	if err := os.WriteFile(tmpFile, jsonData, 0644); err != nil {
+		d.logger.Warnf("Failed to write status file: %v", err)
+		return
+	}
+	if err := os.Rename(tmpFile, statusFile); err != nil {
+		d.logger.Warnf("Failed to rename status file: %v", err)
+	}
 }
 
 // setupFirewallRules configures firewall rules to allow essential services

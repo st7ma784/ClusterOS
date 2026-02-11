@@ -9,6 +9,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/cluster-autostart
 TimeoutStartSec=600
+TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
 

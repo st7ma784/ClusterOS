@@ -93,3 +93,5 @@ test/**/*.iso
 test/**/*.qcow2
 test/vm/qemu/vms/
 images/ubuntu/netplan/01-clusteros-network.yaml
+images/ubuntu/files/tailscale/tailscale.env
+*.env

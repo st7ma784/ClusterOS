@@ -122,7 +122,8 @@ source "qemu" "clusteros" {
   ssh_timeout      = "10m"
   
   # Shutdown
-  shutdown_command = "echo '${var.ssh_password}' | sudo -S shutdown -P now"
+  shutdown_command = "echo '${var.ssh_password}' | sudo -S systemctl stop cluster-autostart.service 2>/dev/null || true; echo '${var.ssh_password}' | sudo -S shutdown -P now"
+  shutdown_timeout = "10m"
   
   # Display
   headless         = var.headless
@@ -200,6 +201,18 @@ build {
     destination = "/tmp/clusteros-files"
   }
 
+  # Copy build environment file for credential injection
+  provisioner "file" {
+    source      = ".env"
+    destination = "/tmp/clusteros-files/.env"
+  }
+
+  # Copy cluster auth key (generated from git repo identity)
+  provisioner "file" {
+    source      = "../../cluster.key"
+    destination = "/tmp/cluster.key"
+  }
+
   # Run provisioning script
   provisioner "shell" {
     script = "provision.sh"
@@ -217,6 +230,16 @@ build {
       "sudo cloud-init clean --logs --seed",
       "sudo rm -f /etc/machine-id",
       "sudo truncate -s 0 /etc/machine-id",
+      "sudo sync"
+    ]
+  }
+
+  # Final setup - enable services that were disabled during build
+  provisioner "shell" {
+    inline = [
+      "echo 'Enabling cluster-autostart service for production use...'",
+      "sudo systemctl enable cluster-autostart.service 2>/dev/null || true",
+      "echo 'Services enabled for production image'",
       "sudo sync"
     ]
   }

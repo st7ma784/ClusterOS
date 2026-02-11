@@ -1,0 +1,12 @@
+---
+# Longhorn - Distributed block storage for Kubernetes
+# Provides replicated PersistentVolumeClaims across cluster nodes
+# Required for MariaDB (slurmdbd) and other stateful services
+# Ref: https://longhorn.io
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: longhorn-system
+  labels:
+    app.kubernetes.io/part-of: cluster-os

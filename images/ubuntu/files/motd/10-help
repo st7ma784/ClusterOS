@@ -12,6 +12,8 @@ echo -e "  ${GREEN}cluster-os-create-usb${NC} - Create new USB installer"
 echo -e "  ${GREEN}cluster-init${NC}          - Initialize a new cluster"
 echo -e "  ${GREEN}cluster-join${NC}          - Join an existing cluster"
 echo -e "  ${GREEN}cluster-status${NC}        - Show cluster status"
+echo -e "  ${GREEN}cluster-test${NC}          - Run deployment tests"
+echo -e "  ${GREEN}cluster-dashboard${NC}     - Live cluster dashboard"
 echo -e "  ${GREEN}cluster-help${NC}          - Show all commands"
 echo ""
 echo -e "${YELLOW}Services:${NC}"
@@ -32,13 +34,11 @@ else
     echo -e "  k3s:         disabled"
 fi
 
-# Check slurm status
-if systemctl is-active --quiet slurmd 2>/dev/null; then
+# Check slurm status (node-agent manages slurmd/slurmctld directly, systemd services are masked)
+if pgrep -x slurmd &>/dev/null || pgrep -x slurmctld &>/dev/null; then
     echo -e "  slurm:       ${GREEN}running${NC}"
-elif systemctl is-enabled --quiet slurmd 2>/dev/null; then
-    echo -e "  slurm:       ${YELLOW}enabled (not running)${NC}"
 else
-    echo -e "  slurm:       disabled"
+    echo -e "  slurm:       ${YELLOW}waiting (node-agent managed)${NC}"
 fi
 
 # Check Tailscale status

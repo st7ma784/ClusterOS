@@ -29,6 +29,16 @@ sudo chmod 700 /var/lib/clusteros
 sudo cp /tmp/clusteros-files/config/node.yaml /etc/clusteros/
 sudo chmod 644 /etc/clusteros/node.yaml
 
+# Inject cluster auth key (generated at build time from git repo identity)
+if [ -f /tmp/cluster.key ]; then
+    CLUSTER_KEY=$(cat /tmp/cluster.key | tr -d '[:space:]')
+    sudo sed -i "s|auth_key:.*|auth_key: \"$CLUSTER_KEY\"|" /etc/clusteros/node.yaml
+    echo "  Cluster auth key injected from cluster.key"
+else
+    echo "  WARNING: No cluster.key found — nodes will fail to authenticate!"
+    echo "  Run 'make cluster-key' before building the image."
+fi
+
 # Copy and enable systemd service
 sudo cp /tmp/clusteros-files/systemd/node-agent.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -71,7 +81,8 @@ sudo systemctl disable k3s-agent.service 2>/dev/null || true
 # ------------------------------------------------------------------------------
 echo "[3/6] Installing SLURM..."
 
-sudo apt-get install -y munge slurm-wlm slurm-client
+sudo apt-get install -y munge slurm-wlm slurm-client libpmix-dev \
+    openmpi-bin libopenmpi-dev python3-mpi4py build-essential
 
 # Install tools needed for cluster-os-install
 # systemd-boot provides systemd-bootx64.efi for UEFI booting
@@ -129,14 +140,23 @@ echo "  Rebuilding initramfs..."
 sudo update-initramfs -u -k all 2>/dev/null || true
 
 # Create directories
-sudo mkdir -p /etc/slurm /etc/munge /var/spool/slurm /var/log/slurm
-sudo chmod 700 /etc/munge
-sudo chmod 755 /etc/slurm /var/spool/slurm /var/log/slurm
+sudo mkdir -p /etc/slurm /etc/munge /var/spool/slurm /var/log/slurm /var/lib/munge /var/run/munge
+sudo chmod 700 /etc/munge /var/lib/munge
+sudo chmod 755 /etc/slurm /var/spool/slurm /var/log/slurm /var/run/munge
 
-# Disable SLURM services (node-agent will enable when needed)
+# Set munge directory ownership (munge user created by apt install)
+sudo chown -R munge:munge /etc/munge /var/lib/munge /var/run/munge /var/log/munge 2>/dev/null || true
+
+# Mask SLURM services — node-agent manages these daemons directly via exec.Command.
+# "disable" only removes WantedBy symlinks; "mask" symlinks to /dev/null and prevents
+# ALL activation (boot, dependencies, dbus, manual start). Without this, slurmd.service
+# starts before slurm.conf exists and fails with DNS SRV lookup errors.
 sudo systemctl disable munge.service 2>/dev/null || true
+sudo systemctl mask munge.service 2>/dev/null || true
 sudo systemctl disable slurmctld.service 2>/dev/null || true
+sudo systemctl mask slurmctld.service 2>/dev/null || true
 sudo systemctl disable slurmd.service 2>/dev/null || true
+sudo systemctl mask slurmd.service 2>/dev/null || true
 
 # ------------------------------------------------------------------------------
 # Install Tailscale
@@ -146,22 +166,97 @@ echo "[4/6] Installing Tailscale..."
 # Install Tailscale
 curl -fsSL https://tailscale.com/install.sh | sh
 
+# Ensure Tailscale directories exist with correct permissions
+sudo mkdir -p /var/lib/tailscale /var/run/tailscale
+sudo chmod 700 /var/lib/tailscale
+sudo chown root:root /var/lib/tailscale /var/run/tailscale
+
 # Enable tailscaled but don't start (will auth on first boot)
 sudo systemctl enable tailscaled
 
 # Install Tailscale auth config if provided
-if [ -f /tmp/clusteros-files/tailscale/tailscale.env ]; then
-    echo "  Installing Tailscale credentials..."
+if [ -f /tmp/clusteros-files/.env ]; then
+    echo "  Creating Tailscale configuration from build environment..."
+    
+    # Source the build environment
+    set -a  # auto-export variables
+    source /tmp/clusteros-files/.env
+    set +a  # stop auto-export
+    
+    echo "  Loaded environment variables:"
+    echo "    TAILSCALE_OAUTH_CLIENT_ID: ${TAILSCALE_OAUTH_CLIENT_ID:-NOT SET}"
+    echo "    TAILSCALE_OAUTH_CLIENT_SECRET: ${TAILSCALE_OAUTH_CLIENT_SECRET:+SET (length ${#TAILSCALE_OAUTH_CLIENT_SECRET})} ${TAILSCALE_OAUTH_CLIENT_SECRET:-NOT SET}"
+    echo "    TAILSCALE_AUTHKEY: ${TAILSCALE_AUTHKEY:+SET (length ${#TAILSCALE_AUTHKEY})} ${TAILSCALE_AUTHKEY:-NOT SET}"
+    
+    sudo mkdir -p /etc/clusteros
+    
+    # Create the final tailscale.env file directly
+    sudo tee /etc/clusteros/tailscale.env > /dev/null <<TSENV
+# Tailscale Configuration for ClusterOS
+# Generated during image build
+
+# OAuth Client credentials (recommended - never expire)
+TAILSCALE_OAUTH_CLIENT_ID=${TAILSCALE_OAUTH_CLIENT_ID:-your_oauth_client_id_here}
+TAILSCALE_OAUTH_CLIENT_SECRET=${TAILSCALE_OAUTH_CLIENT_SECRET:-your_oauth_client_secret_here}
+
+# Tailscale Tags (required for OAuth in most orgs)
+TAILSCALE_TAGS=clusteros
+
+# Auth Key (alternative method)
+TAILSCALE_AUTHKEY=${TAILSCALE_AUTHKEY:-your_auth_key_here}
+
+# Optional: Custom hostname
+# TAILSCALE_HOSTNAME=cluster-node
+TSENV
+    
+    sudo chmod 600 /etc/clusteros/tailscale.env
+    
+    echo "  Tailscale configuration created at: /etc/clusteros/tailscale.env"
+    echo "  Final file content:"
+    sudo cat /etc/clusteros/tailscale.env | head -10
+
+elif [ -f /tmp/clusteros-files/tailscale/tailscale.env ]; then
+    echo "  Installing Tailscale template configuration..."
     sudo mkdir -p /etc/clusteros
     sudo cp /tmp/clusteros-files/tailscale/tailscale.env /etc/clusteros/
     sudo chmod 600 /etc/clusteros/tailscale.env
+    echo "  Template file copied (manual configuration required)"
+fi
+
+if [ -f /etc/clusteros/tailscale.env ]; then
     
-    # Install and enable auto-auth service
+    # Check if valid credentials are configured (after creation)
+    echo "  Checking for Tailscale credentials..."
+    HAS_OAUTH_ID=$(sudo grep -v '^#\|^$' /etc/clusteros/tailscale.env | grep -q 'TAILSCALE_OAUTH_CLIENT_ID=.*[^r]$' && echo "yes" || echo "no")
+    HAS_OAUTH_SECRET=$(sudo grep -v '^#\|^$' /etc/clusteros/tailscale.env | grep -q 'TAILSCALE_OAUTH_CLIENT_SECRET=.*[^r]$' && echo "yes" || echo "no")
+    HAS_AUTHKEY=$(sudo grep -v '^#\|^$' /etc/clusteros/tailscale.env | grep -q 'TAILSCALE_AUTHKEY=.*[^r]$' && echo "yes" || echo "no")
+    
+    # OAuth requires BOTH credentials
+    if [ "$HAS_OAUTH_ID" = "yes" ] && [ "$HAS_OAUTH_SECRET" = "yes" ]; then
+        HAS_OAUTH="yes"
+    else
+        HAS_OAUTH="no"
+    fi
+    
+    echo "  OAuth Client ID detected: $HAS_OAUTH_ID"
+    echo "  OAuth Client Secret detected: $HAS_OAUTH_SECRET"
+    echo "  OAuth (complete) detected: $HAS_OAUTH"
+    echo "  AuthKey detected: $HAS_AUTHKEY"
+    
+    # Debug: Show what we found
+    echo "  OAuth ID line: $(sudo grep -v '^#\|^$' /etc/clusteros/tailscale.env | grep 'TAILSCALE_OAUTH_CLIENT_ID' || echo 'NOT FOUND')"
+    echo "  OAuth Secret line: $(sudo grep -v '^#\|^$' /etc/clusteros/tailscale.env | grep 'TAILSCALE_OAUTH_CLIENT_SECRET' | sed 's/=.*/=***REDACTED***/' || echo 'NOT FOUND')"
+    echo "  AuthKey line: $(sudo grep -v '^#\|^$' /etc/clusteros/tailscale.env | grep 'TAILSCALE_AUTHKEY' | sed 's/=.*/=***REDACTED***/' || echo 'NOT FOUND')"
+    
+    # Install auto-auth service
     if [ -f /tmp/clusteros-files/systemd/tailscale-auth.service ]; then
         sudo cp /tmp/clusteros-files/systemd/tailscale-auth.service /etc/systemd/system/
         sudo systemctl daemon-reload
+        
+        # Always enable the service - it will handle missing credentials gracefully
         sudo systemctl enable tailscale-auth.service
-        echo "  Tailscale auto-auth enabled"
+        echo "  Tailscale auto-auth service enabled"
+        echo "  Service will attempt authentication on first boot"
     fi
 fi
 
@@ -187,20 +282,48 @@ if [ -d /tmp/clusteros-files/systemd/systemd-networkd-wait-online.service.d ]; t
     echo "  Network wait timeout reduced to 10 seconds"
 fi
 
-# DISABLE system wpa_supplicant - our cluster-wifi.service manages it
-# The system service conflicts with manual wpa_supplicant management
-sudo systemctl disable wpa_supplicant.service 2>/dev/null || true
-sudo systemctl mask wpa_supplicant.service 2>/dev/null || true
+# Install tailscaled service override to wait for WiFi before starting
+if [ -d /tmp/clusteros-files/systemd/tailscaled.service.d ]; then
+    sudo mkdir -p /etc/systemd/system/tailscaled.service.d
+    sudo cp /tmp/clusteros-files/systemd/tailscaled.service.d/*.conf \
+        /etc/systemd/system/tailscaled.service.d/
+    sudo systemctl daemon-reload
+    echo "  tailscaled configured to wait for WiFi"
+fi
 
-# Disable NetworkManager WiFi management - we use systemd-networkd + cluster-wifi
+# DISABLE the main wpa_supplicant.service (D-Bus service for NetworkManager)
+# Netplan manages its own wpa_supplicant processes for WiFi
+sudo systemctl unmask wpa_supplicant.service 2>/dev/null || true
+sudo systemctl disable wpa_supplicant.service 2>/dev/null || true
+
+# Disable NetworkManager - we use systemd-networkd + netplan + cluster-wifi
 sudo systemctl disable NetworkManager.service 2>/dev/null || true
+
+# Disable systemd-rfkill - it can restore a "blocked" state from previous boot
+# Our cluster-wifi.service will handle rfkill unblocking
+sudo systemctl disable systemd-rfkill.service 2>/dev/null || true
+sudo systemctl mask systemd-rfkill.service 2>/dev/null || true
+sudo systemctl disable systemd-rfkill.socket 2>/dev/null || true
+sudo systemctl mask systemd-rfkill.socket 2>/dev/null || true
+# Pre-unblock rfkill during image build (create a clean state)
+sudo mkdir -p /var/lib/systemd/rfkill
+echo "0" | sudo tee /var/lib/systemd/rfkill/platform-*:wlan 2>/dev/null || true
+echo "  Disabled systemd-rfkill (prevents restoring blocked state)"
 
 # Install and enable WiFi setup service
 if [ -f /tmp/clusteros-files/systemd/cluster-wifi.service ]; then
     sudo cp /tmp/clusteros-files/systemd/cluster-wifi.service /etc/systemd/system/
     sudo systemctl daemon-reload
     sudo systemctl enable cluster-wifi.service
-    echo "  WiFi auto-connect service enabled (manages wpa_supplicant)"
+    echo "  WiFi auto-connect service enabled (uses netplan)"
+fi
+
+# Install rfkill unblock service - keeps WiFi unblocked after cloud-init
+if [ -f /tmp/clusteros-files/systemd/wifi-rfkill-unblock.service ]; then
+    sudo cp /tmp/clusteros-files/systemd/wifi-rfkill-unblock.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable wifi-rfkill-unblock.service
+    echo "  WiFi rfkill unblock service enabled"
 fi
 
 # WireGuard directory
@@ -232,6 +355,8 @@ if [ -d /tmp/clusteros-files/bin ]; then
     sudo chmod +x /usr/local/bin/cluster-*
     sudo chmod +x /usr/local/bin/cluster-autostart 2>/dev/null || true
     sudo chmod +x /usr/local/bin/cluster-wifi-setup 2>/dev/null || true
+    sudo chmod +x /usr/local/bin/tailscale-auth 2>/dev/null || true
+    sudo chmod +x /usr/local/bin/debug-tailscale 2>/dev/null || true
 fi
 
 # Install and enable cluster-autostart service
@@ -239,8 +364,10 @@ echo "  Installing cluster auto-assembly service..."
 if [ -f /tmp/clusteros-files/systemd/cluster-autostart.service ]; then
     sudo cp /tmp/clusteros-files/systemd/cluster-autostart.service /etc/systemd/system/
     sudo systemctl daemon-reload
-    sudo systemctl enable cluster-autostart.service
-    echo "  Cluster auto-assembly enabled"
+    # DISABLED during build to prevent shutdown delays
+    # Will be enabled via post-processor
+    sudo systemctl disable cluster-autostart.service
+    echo "  Cluster auto-assembly installed (disabled during build)"
 fi
 
 # SSH config - disable root login
@@ -250,6 +377,35 @@ sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
 sudo sysctl --system
 
 # Verify installation
+echo ""
+echo "============================================"
+echo "Cleanup for Image Distribution"
+echo "============================================"
+
+# CRITICAL: Remove any identity file created during build.
+# Each node MUST generate its own unique identity on first boot.
+# Without this, all nodes cloned from this image share the same NodeID
+# and Serf treats them as a single node.
+sudo rm -f /var/lib/cluster-os/identity.json /var/lib/cluster-os/identity.json.tmp
+echo "  Removed identity file (will regenerate on first boot)"
+
+# Remove any K3s state from build (etcd DB has wrong member entries if cloned)
+sudo rm -rf /var/lib/rancher/k3s/server/db /var/lib/rancher/k3s/agent
+echo "  Removed K3s runtime state (will initialize fresh on first boot)"
+
+# Remove any SLURM config (controller generates it after cluster assembly)
+sudo rm -f /etc/slurm/slurm.conf
+echo "  Removed slurm.conf (will be generated by controller)"
+
+# Remove any Raft state
+sudo rm -rf /var/lib/cluster-os/raft
+echo "  Removed Raft state (will bootstrap fresh)"
+
+# Also clean up any machine-id that cloud-init may have cached
+# (some distros bake this into images, causing duplicate DHCP leases)
+sudo truncate -s 0 /etc/machine-id 2>/dev/null || true
+echo "  Reset machine-id (will regenerate on first boot)"
+
 echo ""
 echo "============================================"
 echo "Installation Summary"

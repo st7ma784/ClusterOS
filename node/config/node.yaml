@@ -56,10 +56,10 @@ roles:
   # All nodes can be K3s server or agent - Raft elects the leader
   enabled:
     - wireguard
-    - slurm-controller
-    - slurm-worker
     - k3s-server
     - k3s-agent
+    - slurm-controller
+    - slurm-worker
 
   # Node capabilities (auto-detected if empty)
   capabilities:
@@ -81,7 +81,6 @@ cluster:
   datacenter: default
 
   # Cluster authentication key (REQUIRED)
-  # This key ensures only authorized nodes can join your cluster
-  # Generate with: scripts/generate-cluster-key.sh
-  # IMPORTANT: Regenerate this when forking to create your own cluster!
-  auth_key: "7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s="
+  # Auto-generated at build time from git repo identity.
+  # Each fork derives its own unique key. Override with env: CLUSTEROS_CLUSTER_AUTH_KEY
+  auth_key: "GENERATE_AT_BUILD_TIME"

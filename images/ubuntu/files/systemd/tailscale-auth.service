@@ -1,18 +1,23 @@
 [Unit]
 Description=ClusterOS Tailscale Auto-Authentication
 After=network-online.target tailscaled.service cluster-wifi.service
-Wants=network-online.target tailscaled.service
+Wants=network-online.target 
+Requires=tailscaled.service
 # Only run if credentials file exists
 ConditionPathExists=/etc/clusteros/tailscale.env
-# Remove the state check - we handle re-auth in the script
 
 [Service]
 Type=oneshot
-EnvironmentFile=/etc/clusteros/tailscale.env
 ExecStart=/usr/local/bin/tailscale-auth
 RemainAfterExit=yes
-# Give network time to stabilize
-ExecStartPre=/bin/sleep 5
+# Give WiFi/network and tailscaled more time to stabilize
+# Increased to 15 seconds to ensure network is fully ready
+ExecStartPre=/bin/sleep 15
+# Much longer timeout since tailscaled can take time to initialize
+TimeoutStartSec=300
+# Don't restart on failure to avoid auth loops
+# Restart=on-failure
+# RestartSec=30
 
 [Install]
 WantedBy=multi-user.target

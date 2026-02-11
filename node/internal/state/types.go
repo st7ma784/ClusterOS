@@ -59,6 +59,7 @@ type ClusterState struct {
 	leaders          map[string]string               // keyed by role, value is node ID
 	serviceEndpoints map[string]*ServiceEndpoint     // keyed by service name
 	secrets          *ClusterSecrets                 // cluster-wide secrets (replicated via Raft)
+	localNodeID      string                          // ID of the local node
 }
 
 // ClusterSecrets holds cluster-wide secret data
@@ -313,10 +314,13 @@ func (cs *ClusterState) GetK3sToken() (string, error) {
 
 // GetLocalNode returns the local node from the cluster state
 func (cs *ClusterState) GetLocalNode() *Node {
-	// This is a placeholder - in a real implementation, this would be
-	// determined by the node's identity
-	// For now, return nil to indicate not implemented
-	return nil
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+
+	if cs.localNodeID == "" {
+		return nil
+	}
+	return cs.nodes[cs.localNodeID]
 }
 
 // GetWireGuardIPs returns all WireGuard IPs in the cluster
@@ -335,9 +339,9 @@ func (cs *ClusterState) GetWireGuardIPs() map[string]net.IP {
 
 // SetLocalNodeID sets the local node ID (for identification)
 func (cs *ClusterState) SetLocalNodeID(nodeID string) {
-	// This is a placeholder - in a real implementation, this would store
-	// the local node ID for identification purposes
-	// For now, we don't need to store it as it's available through other means
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	cs.localNodeID = nodeID
 }
 
 // UpdateNodeTailscaleIP updates the Tailscale IP of a node

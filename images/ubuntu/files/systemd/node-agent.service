@@ -6,16 +6,31 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=root
+Group=root
 ExecStartPre=/bin/sleep 5
-ExecStart=/usr/local/bin/node-agent
-Restart=always
+ExecStartPre=-/usr/local/bin/node-agent init --identity-path /var/lib/cluster-os/identity.json
+ExecStart=/usr/local/bin/node-agent --log-level info start --foreground
+Restart=on-failure
 RestartSec=10
-Environment="NODE_CONFIG_PATH=/etc/clusteros/node.yaml"
+StartLimitInterval=60s
+StartLimitBurst=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=node-agent
+Environment="CLUSTEROS_CONFIG=/etc/clusteros/node.yaml"
+Environment="CLUSTEROS_LOG_LEVEL=info"
 EnvironmentFile=-/etc/clusteros/node.env
 
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
 # Security hardening
+# Note: ProtectSystem cannot be 'full' because K3s needs to write to /etc/rancher
+# and SLURM/WireGuard need access to /etc as well
 NoNewPrivileges=false
-ProtectSystem=full
+ProtectSystem=false
 ProtectHome=read-only
 
 [Install]

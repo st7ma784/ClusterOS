@@ -7,7 +7,7 @@ node:
 
 discovery:
   bind_port: 7946
-  bootstrap_nodes: []
+  bootstrap_peers: []
 
 wireguard:
   listen_port: 51820
@@ -18,10 +18,10 @@ wireguard:
 roles:
   enabled:
     - tailscale
-    - slurm-controller
-    - slurm-worker
     - k3s-server
     - k3s-agent
+    - slurm-controller
+    - slurm-worker
 
 # Tailscale settings
 tailscale:
@@ -30,3 +30,8 @@ tailscale:
 # Cluster settings
 cluster:
   election_mode: serf
+  # Cluster authentication key (REQUIRED)
+  # Auto-generated at build time from git repo identity.
+  # Each fork derives its own unique key — nodes from different forks
+  # cannot join each other. Override with env: CLUSTEROS_CLUSTER_AUTH_KEY
+  auth_key: "GENERATE_AT_BUILD_TIME"

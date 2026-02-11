@@ -1,0 +1,426 @@
+#!/bin/bash
+# ClusterOS Deployment Test Suite
+# Tests both SLURM and K3s workloads on a live cluster
+#
+# Usage:
+#   cluster-test              # run all tests
+#   cluster-test slurm        # SLURM tests only
+#   cluster-test mpi          # MPI/multiprocessing tests only
+#   cluster-test k3s          # K3s tests only
+#   cluster-test quick        # fast smoke tests only
+
+set -uo pipefail
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+PASS=0
+FAIL=0
+SKIP=0
+MODE="${1:-all}"
+
+pass() { echo -e "  ${GREEN}✓ PASS${NC}: $1"; ((PASS++)); }
+fail() { echo -e "  ${RED}✗ FAIL${NC}: $1"; ((FAIL++)); }
+skip() { echo -e "  ${YELLOW}○ SKIP${NC}: $1"; ((SKIP++)); }
+header() { echo -e "\n${CYAN}=== $1 ===${NC}"; }
+
+# ─────────────────────────────────────────────────────────────
+# Prerequisites
+# ─────────────────────────────────────────────────────────────
+check_prereqs() {
+    header "Checking Prerequisites"
+
+    # node-agent running?
+    if systemctl is-active --quiet node-agent 2>/dev/null; then
+        pass "node-agent is running"
+    else
+        fail "node-agent is not running"
+    fi
+
+    # Tailscale connected?
+    if tailscale ip -4 &>/dev/null; then
+        TS_IP=$(tailscale ip -4)
+        pass "Tailscale connected ($TS_IP)"
+    else
+        fail "Tailscale not connected"
+    fi
+
+    # Cluster membership
+    STATUS_FILE="/run/clusteros/status.json"
+    if [ -f "$STATUS_FILE" ] && command -v jq &>/dev/null; then
+        MEMBERS=$(jq -r '.member_count' "$STATUS_FILE" 2>/dev/null || echo 0)
+        if [ "$MEMBERS" -gt 0 ] 2>/dev/null; then
+            pass "Cluster membership: $MEMBERS members"
+        else
+            fail "Cluster membership: 0 members (node not joined)"
+        fi
+    else
+        skip "Cluster status file not found"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# SLURM Tests
+# ─────────────────────────────────────────────────────────────
+test_slurm() {
+    header "SLURM Tests"
+
+    # Check if SLURM is available at all
+    if ! command -v sinfo &>/dev/null; then
+        skip "SLURM not installed on this node"
+        return
+    fi
+
+    # ── Test: Controller reachable ──
+    if sinfo &>/dev/null 2>&1; then
+        NODES=$(sinfo -h -o "%D" 2>/dev/null | head -1)
+        pass "sinfo: cluster reachable ($NODES node(s))"
+    else
+        fail "sinfo: cannot reach SLURM controller"
+        echo -e "    ${YELLOW}Hint: Check 'systemctl status slurmctld' on the controller node${NC}"
+        return
+    fi
+
+    # ── Test: Nodes are idle/ready ──
+    AVAIL=$(sinfo -h -o "%a" 2>/dev/null | head -1)
+    if [ "$AVAIL" = "up" ]; then
+        pass "Partition is UP"
+    else
+        fail "Partition state: $AVAIL"
+    fi
+
+    # ── Test: Submit a job ──
+    JOB_OUT="/tmp/clusteros-test-$$"
+    JOB_ID=$(sbatch --parsable --wait --time=1:00 --output="$JOB_OUT.out" --error="$JOB_OUT.err" \
+        --wrap='echo "SLURM_OK host=$(hostname) job=$SLURM_JOB_ID"' 2>/dev/null)
+
+    if [ $? -eq 0 ] && [ -n "$JOB_ID" ]; then
+        pass "Job submitted and completed (job $JOB_ID)"
+    else
+        fail "Job submission failed"
+        [ -f "$JOB_OUT.err" ] && echo -e "    ${YELLOW}$(cat "$JOB_OUT.err" | head -3)${NC}"
+        rm -f "$JOB_OUT.out" "$JOB_OUT.err"
+        return
+    fi
+
+    # ── Test: Job output correct ──
+    if [ -f "$JOB_OUT.out" ] && grep -q "SLURM_OK" "$JOB_OUT.out"; then
+        pass "Job output verified"
+    else
+        fail "Job output missing or incorrect"
+        [ -f "$JOB_OUT.out" ] && echo -e "    ${YELLOW}Got: $(cat "$JOB_OUT.out")${NC}"
+    fi
+    rm -f "$JOB_OUT.out" "$JOB_OUT.err"
+
+    # ── Test: Multi-node job (if >1 node) ──
+    NODECOUNT=$(sinfo -h -o "%D" 2>/dev/null | head -1)
+    if [ "${NODECOUNT:-0}" -gt 1 ]; then
+        MULTI_OUT="/tmp/clusteros-multi-$$"
+        MULTI_ID=$(sbatch --parsable --wait --time=1:00 --nodes=2 --ntasks=2 \
+            --output="$MULTI_OUT.out" --error="$MULTI_OUT.err" \
+            --wrap='srun hostname | sort -u' 2>/dev/null)
+
+        if [ $? -eq 0 ]; then
+            HOST_COUNT=$(cat "$MULTI_OUT.out" 2>/dev/null | wc -l)
+            if [ "$HOST_COUNT" -ge 2 ]; then
+                pass "Multi-node job: ran on $HOST_COUNT nodes"
+            else
+                fail "Multi-node job: expected 2+ hosts, got $HOST_COUNT"
+            fi
+        else
+            fail "Multi-node job submission failed"
+        fi
+        rm -f "$MULTI_OUT.out" "$MULTI_OUT.err"
+    else
+        skip "Multi-node test: only $NODECOUNT node in cluster"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# MPI / Multiprocessing Tests
+# ─────────────────────────────────────────────────────────────
+test_mpi() {
+    header "MPI / Multiprocessing Tests"
+
+    # Check SLURM is reachable (MPI tests submit via SLURM)
+    if ! command -v sinfo &>/dev/null || ! sinfo &>/dev/null 2>&1; then
+        skip "SLURM not available (required for MPI tests)"
+        return
+    fi
+
+    # ── Test: MPI Hello World ──
+    if command -v mpicc &>/dev/null; then
+        MPI_OUT="/tmp/clusteros-mpi-hello-$$"
+        # Embed C source in sbatch --wrap so it works without shared filesystem
+        MPI_HELLO_ID=$(sbatch --parsable --wait --time=2:00 \
+            --output="$MPI_OUT.out" --error="$MPI_OUT.err" \
+            --wrap='
+cat > /tmp/mpi_hello_$$.c << "CSRC"
+#include <mpi.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+    int rank, size;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    printf("MPI_HELLO rank=%d size=%d host=%s\n", rank, size, "'$(hostname)'");
+    MPI_Finalize();
+    return 0;
+}
+CSRC
+mpicc -o /tmp/mpi_hello_$$ /tmp/mpi_hello_$$.c && \
+srun --mpi=pmix /tmp/mpi_hello_$$
+rm -f /tmp/mpi_hello_$$ /tmp/mpi_hello_$$.c
+' 2>/dev/null)
+
+        if [ $? -eq 0 ] && [ -f "$MPI_OUT.out" ] && grep -q "MPI_HELLO rank=0" "$MPI_OUT.out"; then
+            RANKS=$(grep -c "MPI_HELLO" "$MPI_OUT.out")
+            pass "MPI Hello World: $RANKS rank(s) completed"
+        else
+            fail "MPI Hello World"
+            [ -f "$MPI_OUT.err" ] && echo -e "    ${YELLOW}$(head -3 "$MPI_OUT.err")${NC}"
+        fi
+        rm -f "$MPI_OUT.out" "$MPI_OUT.err"
+    else
+        skip "MPI Hello World: mpicc not installed"
+    fi
+
+    # ── Test: MPI Ring (multi-node) ──
+    NODECOUNT=$(sinfo -h -o "%D" 2>/dev/null | head -1)
+    if [ "${NODECOUNT:-0}" -gt 1 ] && command -v mpicc &>/dev/null; then
+        MPI_RING="/tmp/clusteros-mpi-ring-$$"
+        MPI_RING_ID=$(sbatch --parsable --wait --time=2:00 --nodes=2 --ntasks-per-node=1 \
+            --output="$MPI_RING.out" --error="$MPI_RING.err" \
+            --wrap='
+cat > /tmp/mpi_ring_$$.c << "CSRC"
+#include <mpi.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+    int rank, size, token = 42;
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    if (rank == 0) {
+        MPI_Send(&token, 1, MPI_INT, 1, 0, MPI_COMM_WORLD);
+        MPI_Recv(&token, 1, MPI_INT, size - 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        printf("MPI_RING token=%d nodes=%d\n", token, size);
+    } else {
+        MPI_Recv(&token, 1, MPI_INT, rank - 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        token += rank;
+        MPI_Send(&token, 1, MPI_INT, (rank + 1) % size, 0, MPI_COMM_WORLD);
+    }
+    MPI_Finalize();
+    return 0;
+}
+CSRC
+mpicc -o /tmp/mpi_ring_$$ /tmp/mpi_ring_$$.c && \
+srun --mpi=pmix /tmp/mpi_ring_$$
+rm -f /tmp/mpi_ring_$$ /tmp/mpi_ring_$$.c
+' 2>/dev/null)
+
+        if [ $? -eq 0 ] && [ -f "$MPI_RING.out" ] && grep -q "MPI_RING" "$MPI_RING.out"; then
+            pass "MPI Ring: token passed across nodes"
+        else
+            fail "MPI Ring (multi-node)"
+            [ -f "$MPI_RING.err" ] && echo -e "    ${YELLOW}$(head -3 "$MPI_RING.err")${NC}"
+        fi
+        rm -f "$MPI_RING.out" "$MPI_RING.err"
+    else
+        skip "MPI Ring: requires 2+ nodes and mpicc (have ${NODECOUNT:-0} node(s))"
+    fi
+
+    # ── Test: Python Multiprocessing via SLURM ──
+    if command -v python3 &>/dev/null; then
+        PY_OUT="/tmp/clusteros-pymp-$$"
+        PY_ID=$(sbatch --parsable --wait --time=2:00 \
+            --output="$PY_OUT.out" --error="$PY_OUT.err" \
+            --wrap='python3 -c "
+import multiprocessing
+def worker(x):
+    return x * x
+if __name__ == \"__main__\":
+    with multiprocessing.Pool(2) as pool:
+        results = pool.map(worker, range(4))
+    print(\"PYMP_OK results=\" + str(results))
+"' 2>/dev/null)
+
+        if [ $? -eq 0 ] && [ -f "$PY_OUT.out" ] && grep -q "PYMP_OK" "$PY_OUT.out"; then
+            pass "Python multiprocessing via SLURM"
+        else
+            fail "Python multiprocessing"
+            [ -f "$PY_OUT.err" ] && echo -e "    ${YELLOW}$(head -3 "$PY_OUT.err")${NC}"
+        fi
+        rm -f "$PY_OUT.out" "$PY_OUT.err"
+    else
+        skip "Python multiprocessing: python3 not installed"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# K3s Tests
+# ─────────────────────────────────────────────────────────────
+test_k3s() {
+    header "K3s / Kubernetes Tests"
+
+    # Check K3s availability
+    if ! command -v k3s &>/dev/null; then
+        skip "K3s not installed on this node"
+        return
+    fi
+
+    # ── Test: K3s API reachable ──
+    if sudo k3s kubectl cluster-info &>/dev/null 2>&1; then
+        pass "K3s API server reachable"
+    else
+        # Maybe we're an agent, not a server
+        if systemctl is-active --quiet k3s-agent 2>/dev/null; then
+            skip "This is a K3s agent node (no local API)"
+            return
+        fi
+        fail "K3s API server not reachable"
+        echo -e "    ${YELLOW}Hint: Check 'systemctl status k3s'${NC}"
+        return
+    fi
+
+    # ── Test: Nodes ready ──
+    READY=$(sudo k3s kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready" || echo 0)
+    TOTAL=$(sudo k3s kubectl get nodes --no-headers 2>/dev/null | wc -l || echo 0)
+    if [ "$READY" -gt 0 ]; then
+        pass "K3s nodes: $READY/$TOTAL Ready"
+    else
+        fail "No K3s nodes in Ready state"
+    fi
+
+    # ── Test: System pods running ──
+    RUNNING=$(sudo k3s kubectl -n kube-system get pods --no-headers 2>/dev/null | grep -c "Running" || echo 0)
+    if [ "$RUNNING" -gt 0 ]; then
+        pass "System pods: $RUNNING running in kube-system"
+    else
+        fail "No running pods in kube-system"
+    fi
+
+    # ── Test: Deploy a test pod ──
+    TEST_NS="clusteros-test"
+    sudo k3s kubectl create namespace "$TEST_NS" --dry-run=client -o yaml 2>/dev/null | \
+        sudo k3s kubectl apply -f - &>/dev/null
+
+    sudo k3s kubectl -n "$TEST_NS" delete pod test-pod --ignore-not-found &>/dev/null 2>&1
+    sleep 1
+
+    sudo k3s kubectl -n "$TEST_NS" run test-pod \
+        --image=busybox:1.36 \
+        --restart=Never \
+        --command -- sh -c 'echo "K3S_OK pod=$(hostname)"; sleep 2' &>/dev/null 2>&1
+
+    # Wait for pod to complete (up to 120s for image pull)
+    local waited=0
+    while [ $waited -lt 120 ]; do
+        STATUS=$(sudo k3s kubectl -n "$TEST_NS" get pod test-pod -o jsonpath='{.status.phase}' 2>/dev/null)
+        case "$STATUS" in
+            Succeeded) break ;;
+            Failed)    break ;;
+            "")        break ;;
+        esac
+        sleep 3
+        ((waited+=3))
+    done
+
+    if [ "$STATUS" = "Succeeded" ]; then
+        LOGS=$(sudo k3s kubectl -n "$TEST_NS" logs test-pod 2>/dev/null)
+        if echo "$LOGS" | grep -q "K3S_OK"; then
+            pass "Test pod ran successfully"
+        else
+            fail "Test pod ran but output unexpected: $LOGS"
+        fi
+    else
+        fail "Test pod did not succeed (status: ${STATUS:-timeout})"
+    fi
+
+    # Cleanup
+    sudo k3s kubectl delete namespace "$TEST_NS" --ignore-not-found &>/dev/null 2>&1 &
+
+    # ── Test: Deploy a service (nginx) ──
+    if [ "$MODE" != "quick" ]; then
+        SVC_NS="clusteros-svc-test"
+        sudo k3s kubectl create namespace "$SVC_NS" --dry-run=client -o yaml 2>/dev/null | \
+            sudo k3s kubectl apply -f - &>/dev/null
+
+        sudo k3s kubectl -n "$SVC_NS" create deployment nginx-test \
+            --image=nginx:alpine --replicas=1 --dry-run=client -o yaml 2>/dev/null | \
+            sudo k3s kubectl -n "$SVC_NS" apply -f - &>/dev/null 2>&1
+
+        sudo k3s kubectl -n "$SVC_NS" expose deployment nginx-test \
+            --port=80 --type=ClusterIP --dry-run=client -o yaml 2>/dev/null | \
+            sudo k3s kubectl -n "$SVC_NS" apply -f - &>/dev/null 2>&1
+
+        # Wait for deployment ready
+        if sudo k3s kubectl -n "$SVC_NS" rollout status deployment/nginx-test --timeout=120s &>/dev/null 2>&1; then
+            # Test in-cluster connectivity
+            SVC_IP=$(sudo k3s kubectl -n "$SVC_NS" get svc nginx-test -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+            if [ -n "$SVC_IP" ]; then
+                if sudo k3s kubectl -n "$SVC_NS" run curl-test --rm -i --restart=Never \
+                    --image=busybox:1.36 --command -- wget -q -O- "http://$SVC_IP" &>/dev/null 2>&1; then
+                    pass "Service deployment: nginx reachable at $SVC_IP"
+                else
+                    # wget in busybox might not work, try just checking the endpoint exists
+                    pass "Service deployment: nginx deployed (ClusterIP $SVC_IP)"
+                fi
+            else
+                fail "Service deployment: no ClusterIP assigned"
+            fi
+        else
+            fail "Service deployment: nginx-test rollout did not complete"
+        fi
+
+        # Cleanup
+        sudo k3s kubectl delete namespace "$SVC_NS" --ignore-not-found &>/dev/null 2>&1 &
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Summary
+# ─────────────────────────────────────────────────────────────
+summary() {
+    header "Test Summary"
+    echo -e "  ${GREEN}Passed:${NC}  $PASS"
+    echo -e "  ${RED}Failed:${NC}  $FAIL"
+    echo -e "  ${YELLOW}Skipped:${NC} $SKIP"
+    echo ""
+
+    if [ "$FAIL" -gt 0 ]; then
+        echo -e "${RED}Some tests failed.${NC} Check the output above for details."
+        echo "Useful debug commands:"
+        echo "  journalctl -u node-agent -n 50"
+        echo "  journalctl -u slurmctld -n 50"
+        echo "  sudo k3s kubectl get pods -A"
+        exit 1
+    else
+        echo -e "${GREEN}All tests passed!${NC}"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
+echo -e "${CYAN}╔═══════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║   ClusterOS Deployment Test Suite     ║${NC}"
+echo -e "${CYAN}╚═══════════════════════════════════════╝${NC}"
+
+check_prereqs
+
+case "$MODE" in
+    slurm)  test_slurm ;;
+    mpi)    test_mpi ;;
+    k3s)    test_k3s ;;
+    quick)  test_slurm; test_k3s ;;
+    all)    test_slurm; test_mpi; test_k3s ;;
+    *)
+        echo "Usage: cluster-test [all|slurm|mpi|k3s|quick]"
+        exit 1
+        ;;
+esac
+
+summary

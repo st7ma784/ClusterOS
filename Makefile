@@ -90,7 +90,7 @@ test: deps
 
 cluster-key:
 	@if [ ! -f cluster.key ]; then \
-		echo "Generating cluster authentication key..."; \
+		echo "Generating cluster key from git repo identity..."; \
 		bash scripts/generate-cluster-key.sh; \
 	else \
 		echo "Cluster key already exists: cluster.key"; \
@@ -174,7 +174,7 @@ test-full: node
 	@echo "Full test suite complete!"
 	@echo "=========================================="
 
-image: node
+image: node cluster-key
 	@echo "========================================="
 	@echo "Building OS image with Packer"
 	@echo "========================================="

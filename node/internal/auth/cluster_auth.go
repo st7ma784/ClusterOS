@@ -146,6 +146,24 @@ func (ca *ClusterAuth) CreateJoinToken(nodeID string) (string, error) {
 	return token, nil
 }
 
+// CreateCompactJoinToken creates a short join token suitable for Serf tags (< 80 bytes).
+// It's an HMAC-SHA256 of the nodeID, proving the node holds the cluster key.
+func (ca *ClusterAuth) CreateCompactJoinToken(nodeID string) string {
+	h := hmac.New(sha256.New, ca.authKey)
+	h.Write([]byte(nodeID))
+	sig := h.Sum(nil)
+	return base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// VerifyCompactJoinToken verifies a compact join token against the expected nodeID.
+func (ca *ClusterAuth) VerifyCompactJoinToken(nodeID, token string) error {
+	expected := ca.CreateCompactJoinToken(nodeID)
+	if !hmac.Equal([]byte(expected), []byte(token)) {
+		return fmt.Errorf("invalid compact token - node does not have correct cluster auth key")
+	}
+	return nil
+}
+
 // VerifyJoinToken verifies a join token
 func (ca *ClusterAuth) VerifyJoinToken(token string) (string, error) {
 	// Decode the token

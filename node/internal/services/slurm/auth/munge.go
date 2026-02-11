@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/user"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -257,24 +258,40 @@ func (m *MungeKeyManager) StartMungeDaemon() error {
 		return nil
 	}
 
-	// Ensure /var/run/munge exists with correct permissions
-	if err := os.MkdirAll("/var/run/munge", 0755); err != nil {
-		return fmt.Errorf("failed to create /var/run/munge: %w", err)
+	// Create all required munge directories
+	mungeDirs := []struct {
+		path string
+		mode os.FileMode
+	}{
+		{"/var/run/munge", 0755},
+		{"/var/log/munge", 0700},
+		{"/var/lib/munge", 0700},
+		{"/etc/munge", 0700},
 	}
 
-	// Ensure /var/log/munge exists
-	if err := os.MkdirAll("/var/log/munge", 0700); err != nil {
-		return fmt.Errorf("failed to create /var/log/munge: %w", err)
+	for _, dir := range mungeDirs {
+		if err := os.MkdirAll(dir.path, dir.mode); err != nil {
+			return fmt.Errorf("failed to create %s: %w", dir.path, err)
+		}
 	}
 
 	// Set ownership of directories to munge user if possible
-	if mungeUser, err := user.Lookup("munge"); err == nil {
+	mungeUser, err := user.Lookup("munge")
+	if err != nil {
+		m.logger.Warnf("Munge user not found: %v (will try to start munged anyway)", err)
+	} else {
 		uid, _ := strconv.Atoi(mungeUser.Uid)
 		gid, _ := strconv.Atoi(mungeUser.Gid)
-		os.Chown("/var/run/munge", uid, gid)
-		os.Chown("/var/log/munge", uid, gid)
-		os.Chown("/var/lib/munge", uid, gid)
-		os.Chmod("/var/lib/munge", 0700)
+		for _, dir := range mungeDirs {
+			os.Chown(dir.path, uid, gid)
+		}
+		// Also ensure munge.key has correct ownership
+		os.Chown(MungeKeyPath, uid, gid)
+	}
+
+	// Verify munge key exists before starting daemon
+	if _, err := os.Stat(MungeKeyPath); os.IsNotExist(err) {
+		return fmt.Errorf("munge key not found at %s - cannot start munged", MungeKeyPath)
 	}
 
 	// Start munged with --force to bypass strict security checks in containers
@@ -284,14 +301,31 @@ func (m *MungeKeyManager) StartMungeDaemon() error {
 		Setpgid: true,
 	}
 
+	// Capture stderr for debugging
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start munged: %w", err)
 	}
 
-	// Wait a moment for the socket to be created
-	time.Sleep(500 * time.Millisecond)
+	// Wait for the socket to be created (with timeout)
+	socketPath := "/var/run/munge/munge.socket.2"
+	for i := 0; i < 10; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if _, err := os.Stat(socketPath); err == nil {
+			m.logger.Infof("Munge daemon started with PID %d, socket ready", cmd.Process.Pid)
+			return nil
+		}
+	}
 
-	m.logger.Infof("Munge daemon started with PID %d", cmd.Process.Pid)
+	// Check if process is still running
+	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		stderrStr := stderr.String()
+		return fmt.Errorf("munged process died unexpectedly: %s", stderrStr)
+	}
+
+	m.logger.Infof("Munge daemon started with PID %d (socket creation pending)", cmd.Process.Pid)
 	return nil
 }
 
