@@ -1,5 +1,5 @@
 #!/bin/bash
-# ClusterOS Patch - Cumulative fix for cluster-status, munge, k3s, and SLURM
+# ClusterOS Patch - Cumulative fix for cluster-status, munge, k3s, k3s endpoint selection, and SLURM
 #
 # This patch:
 #   1. Ensures jq is installed (needed to parse the status file)
@@ -10,6 +10,7 @@
 #   6. Cleans stale K3s etcd data, SLURM config, and Raft state
 #   7. Installs patched node-agent with fixes:
 #      - K3s: kills orphaned etcd on port 2380 before starting server
+#      - K3s agent: prefer Tailscale IP for server endpoint (fixes join failures)
 #      - SLURM: passes explicit -N <nodename> to slurmd (fixes NodeName mismatch)
 #   8. Masks slurmd/slurmctld/munge systemd services (fixes DNS SRV lookup failure)
 #   9. Installs updated helper scripts (cluster-status, cluster-init, etc.)
@@ -33,7 +34,7 @@ NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo -e "${CYAN}=== ClusterOS Patch: Cumulative fix (status, munge, k3s etcd, SLURM nodename) ===${NC}"
+echo -e "${CYAN}=== ClusterOS Patch: Cumulative fix (status, munge, k3s etcd, k3s server endpoint, SLURM nodename) ===${NC}"
 echo ""
 
 # Must be root
@@ -261,8 +262,8 @@ else
     echo -e "  ${YELLOW}!${NC} Munge not yet running (will start when SLURM role activates)"
 fi
 
-# 10. Verify K3s etcd and SLURM fixes
-echo -e "${YELLOW}[10/10] Verifying K3s and SLURM fixes...${NC}"
+# 10. Verify K3s endpoint selection and SLURM fixes
+echo -e "${YELLOW}[10/10] Verifying K3s endpoint selection and SLURM fixes...${NC}"
 sleep 5
 if ss -tlnp 2>/dev/null | grep -q ':2380 '; then
     echo -e "  ${GREEN}✓${NC} Port 2380 in use (K3s etcd started — expected if this node is a server)"
