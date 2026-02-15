@@ -23,10 +23,20 @@ type K3sAgent struct {
 
 // AgentConfig contains configuration for the k3s agent
 type AgentConfig struct {
-	DataDir    string
-	ServerURL  string
-	Token      string
-	NodeIP     string
+	DataDir   string
+	ServerURL string
+	Token     string
+	NodeIP    string
+}
+
+func getNodeEndpoint(node *state.Node) string {
+	if node == nil {
+		return ""
+	}
+	if node.TailscaleIP != "" {
+		return node.TailscaleIP
+	}
+	return node.Address
 }
 
 // NewK3sAgent creates a new k3s agent role
@@ -73,7 +83,7 @@ func (ka *K3sAgent) Start(ctx context.Context, clusterState *state.ClusterState)
 	// The agent will be started when Reconfigure detects a k3s-server leader
 	// or when OnLeadershipChange is called
 	serverNode, ok := ka.clusterState.GetLeaderNode("k3s-server")
-	if !ok || serverNode.Address == "" {
+	if !ok || getNodeEndpoint(serverNode) == "" {
 		ka.Logger().Info("k3s agent role started (waiting for k3s-server to be available)")
 		ka.SetRunning(true)
 		return nil
@@ -109,8 +119,13 @@ func (ka *K3sAgent) Reconfigure(clusterState *state.ClusterState) error {
 
 	// Check if server URL changed
 	serverNode, ok := ka.clusterState.GetLeaderNode("k3s-server")
-	if ok && serverNode.Address != "" {
-		newServerURL := fmt.Sprintf("https://%s:6443", serverNode.Address)
+	if ok {
+		serverIP := getNodeEndpoint(serverNode)
+		if serverIP == "" {
+			return nil
+		}
+
+		newServerURL := fmt.Sprintf("https://%s:6443", serverIP)
 		if newServerURL != ka.config.ServerURL {
 			ka.Logger().Infof("Server URL changed to %s, restarting", newServerURL)
 			ka.config.ServerURL = newServerURL
@@ -136,7 +151,7 @@ func (ka *K3sAgent) HealthCheck() error {
 	if ka.k3sCmd == nil || ka.k3sCmd.Process == nil {
 		// Check if there's a server available - if not, waiting is expected
 		serverNode, ok := ka.clusterState.GetLeaderNode("k3s-server")
-		if !ok || serverNode.Address == "" {
+		if !ok || getNodeEndpoint(serverNode) == "" {
 			// No server available yet, this is expected - not an error
 			return nil
 		}
@@ -178,7 +193,13 @@ func (ka *K3sAgent) startK3s() error {
 		if !ok {
 			return fmt.Errorf("no k3s server found in cluster")
 		}
-		ka.config.ServerURL = fmt.Sprintf("https://%s:6443", serverNode.Address)
+
+		serverIP := getNodeEndpoint(serverNode)
+		if serverIP == "" {
+			return fmt.Errorf("k3s server found but has no reachable endpoint")
+		}
+
+		ka.config.ServerURL = fmt.Sprintf("https://%s:6443", serverIP)
 	}
 
 	// Get token from cluster state or config
