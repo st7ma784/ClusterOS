@@ -7,7 +7,8 @@
 #   - Tailscale peers
 #   - Cluster members (from node-agent status)
 #   - SLURM jobs
-#   - K3s pods
+#   - K3s pods/workloads
+#   - K3s service endpoints (IP:port)
 #   - System resources
 
 set -uo pipefail
@@ -160,6 +161,67 @@ render() {
                     *)         echo -e "  ${RED}●${NC} $ns/$name  $ready  $status" ;;
                 esac
             done
+        fi
+
+        # ── K3s Workloads ──
+        echo -e "\n${YELLOW}${BOLD} K3s Workloads${NC}"
+        local workload_output
+        workload_output=$(sudo k3s kubectl get deploy,statefulset -A --no-headers 2>/dev/null | head -20)
+        if [ -z "$workload_output" ]; then
+            echo -e "  ${DIM}(no deployments/statefulsets)${NC}"
+        else
+            echo "$workload_output" | while IFS= read -r wl_line; do
+                local ns type name ready
+                ns=$(echo "$wl_line" | awk '{print $1}')
+                type=$(echo "$wl_line" | awk '{print $2}')
+                name=$(echo "$wl_line" | awk '{print $3}')
+                ready=$(echo "$wl_line" | awk '{print $4}')
+                if [ -z "$ready" ]; then
+                    echo -e "  ${DIM}$wl_line${NC}"
+                    continue
+                fi
+                if echo "$ready" | awk -F'/' '{exit !($1==$2)}'; then
+                    echo -e "  ${GREEN}●${NC} $ns/$name  ($type)  ready=$ready"
+                else
+                    echo -e "  ${YELLOW}●${NC} $ns/$name  ($type)  ready=$ready"
+                fi
+            done
+        fi
+
+        # ── K3s Service Endpoints ──
+        echo -e "\n${YELLOW}${BOLD} K3s Service Endpoints${NC}"
+        local preferred_ip svc_lines
+        preferred_ip=$(tailscale ip -4 2>/dev/null | head -1)
+        [ -z "$preferred_ip" ] && preferred_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+
+        svc_lines=$(sudo k3s kubectl get svc -A --no-headers 2>/dev/null | \
+            awk '$1=="cattle-system" && $2~/(rancher|rancher-nodeport)/ {print $1, $2}
+                 $1=="longhorn-system" && $2~/(longhorn-frontend|longhorn-ui)/ {print $1, $2}
+                 $1=="slurm" && $2~/(slurmdbd|slurmdbd-nodeport)/ {print $1, $2}
+                 $1=="jupyterhub" && $2~/(proxy-public|hub|jupyterhub)/ {print $1, $2}
+                 $1=="galaxy" {print $1, $2}' | head -20)
+
+        if [ -z "$svc_lines" ]; then
+            echo -e "  ${DIM}(no known service endpoints found yet)${NC}"
+            echo -e "  ${DIM}Known services: rancher, longhorn, slurmdbd, jupyterhub, galaxy${NC}"
+        else
+            while read -r ns svc; do
+                [ -z "$ns" ] && continue
+                local type ports nodeports cluster_ip
+                type=$(sudo k3s kubectl -n "$ns" get svc "$svc" -o jsonpath='{.spec.type}' 2>/dev/null)
+                ports=$(sudo k3s kubectl -n "$ns" get svc "$svc" -o jsonpath='{range .spec.ports[*]}{.port}{"/"}{.protocol}{" "}{end}' 2>/dev/null)
+                nodeports=$(sudo k3s kubectl -n "$ns" get svc "$svc" -o jsonpath='{range .spec.ports[*]}{.nodePort}{" "}{end}' 2>/dev/null)
+                cluster_ip=$(sudo k3s kubectl -n "$ns" get svc "$svc" -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+
+                if [ "$type" = "NodePort" ] && [ -n "$nodeports" ] && [ -n "$preferred_ip" ]; then
+                    local endpoints
+                    endpoints=$(echo "$nodeports" | awk -v ip="$preferred_ip" '{for(i=1;i<=NF;i++) if($i!="") printf "https://%s:%s ", ip, $i}')
+                    echo -e "  ${GREEN}●${NC} $ns/$svc  [$type]  ports: ${ports:-N/A}"
+                    echo -e "     ${CYAN}→${NC} ${endpoints}"
+                else
+                    echo -e "  ${GREEN}●${NC} $ns/$svc  [$type]  ports: ${ports:-N/A}  clusterIP=${cluster_ip:-N/A}"
+                fi
+            done <<< "$svc_lines"
         fi
     else
         echo -e "  ${DIM}(K3s not available)${NC}"
