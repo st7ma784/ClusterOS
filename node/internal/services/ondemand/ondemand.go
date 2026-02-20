@@ -21,7 +21,14 @@ type OpenOnDemand struct {
 	clusterState *state.ClusterState
 	apacheCmd    *exec.Cmd
 	configPath   string
+	isLeader     bool
 }
+
+// IsLeader returns whether this node is the OnDemand leader
+func (ood *OpenOnDemand) IsLeader() bool { return ood.isLeader }
+
+// SetLeader sets the leadership status for this role
+func (ood *OpenOnDemand) SetLeader(v bool) { ood.isLeader = v }
 
 // Config contains configuration for Open OnDemand
 type Config struct {

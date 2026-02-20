@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -20,206 +22,82 @@ import (
 	"github.com/cluster-os/node/internal/networking"
 	"github.com/cluster-os/node/internal/roles"
 	"github.com/cluster-os/node/internal/services/kubernetes/k3s"
-	"github.com/cluster-os/node/internal/services/ondemand"
+	slurmauth "github.com/cluster-os/node/internal/services/slurm/auth"
 	"github.com/cluster-os/node/internal/services/slurm/controller"
 	"github.com/cluster-os/node/internal/services/slurm/worker"
 	"github.com/cluster-os/node/internal/state"
 	"github.com/sirupsen/logrus"
 )
 
-// LeaderElectorInterface defines the interface for leader election
-// Both Raft-based and Serf-based electors implement this
-type LeaderElectorInterface interface {
-	IsLeader() bool
-	IsLeaderForRole(role string) bool
-	GetLeader() (string, error)
-	WaitForLeader(timeout time.Duration) error
-	RegisterRoleLeadershipObserver(role string) <-chan bool
-	ApplySetMungeKey(mungeKey []byte, mungeKeyHash string) error
-	GetClusterState() *state.ClusterState
-	AddVoter(nodeID string, address string) error
-	RemoveServer(nodeID string) error
-	Shutdown() error
-}
+// ClusterPhase is the current phase of the cluster state machine.
+type ClusterPhase string
 
-// Daemon represents the node agent daemon
+const (
+	PhaseDiscovering  ClusterPhase = "discovering"
+	PhaseElecting     ClusterPhase = "electing"
+	PhaseProvisioning ClusterPhase = "provisioning"
+	PhaseJoining      ClusterPhase = "joining"
+	PhaseReady        ClusterPhase = "ready"
+)
+
+// Daemon represents the node agent daemon.
 type Daemon struct {
-	config            *config.Config
-	identity          *identity.Identity
-	clusterState      *state.ClusterState
-	discovery         *discovery.SerfDiscovery
-	leaderElector     *state.LeaderElector     // Raft-based (persistent)
-	serfLeaderElector *state.SerfLeaderElector // Serf-based (stateless)
-	wireguard         *networking.WireGuardManager
-	tailscale         *networking.TailscaleManager
-	roleManager       *roles.Manager
-	logger            *logrus.Logger
-	ctx               context.Context
-	cancel            context.CancelFunc
-	electionMode      string // "serf" or "raft"
+	config        *config.Config
+	identity      *identity.Identity
+	clusterState  *state.ClusterState
+	discovery     *discovery.SerfDiscovery
+	leaderElector *state.SerfLeaderElector
+	tailscale     *networking.TailscaleManager
+	roleManager   *roles.Manager
+	logger        *logrus.Logger
+	ctx           context.Context
+	cancel        context.CancelFunc
+
+	mu             sync.RWMutex
+	phase          ClusterPhase
+	isLeader       bool
+	leaderName     string
+	slurmCtrl      *controller.SLURMController // non-nil only on leader
+	failedPeerCache *peerFailCache
 }
 
-// Config contains configuration for the daemon
+// Config contains configuration for creating a daemon.
 type Config struct {
 	Config   *config.Config
 	Identity *identity.Identity
 	Logger   *logrus.Logger
 }
 
-// New creates a new daemon instance
+// New creates a new daemon instance.
 func New(cfg *Config) (*Daemon, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = logrus.New()
 	}
-
 	ctx, cancel := context.WithCancel(context.Background())
-
 	return &Daemon{
-		config:   cfg.Config,
-		identity: cfg.Identity,
-		logger:   cfg.Logger,
-		ctx:      ctx,
-		cancel:   cancel,
+		config:          cfg.Config,
+		identity:        cfg.Identity,
+		logger:          cfg.Logger,
+		ctx:             ctx,
+		cancel:          cancel,
+		phase:           PhaseDiscovering,
+		failedPeerCache: newPeerFailCache(),
 	}, nil
 }
 
-// waitForNetwork waits for at least one network interface to have a routable IP address
-func (d *Daemon) waitForNetwork() error {
-	maxWait := 90 * time.Second
-	interval := 2 * time.Second
-	start := time.Now()
-
-	d.logger.Info("Waiting for network to be available...")
-
-	for {
-		// Check if we have any usable IP addresses
-		addrs, err := d.getUsableAddresses()
-		if err == nil && len(addrs) > 0 {
-			d.logger.Infof("Network available: found %d usable address(es)", len(addrs))
-			for _, addr := range addrs {
-				d.logger.Infof("  - %s", addr)
-			}
-			return nil
-		}
-
-		elapsed := time.Since(start)
-		if elapsed >= maxWait {
-			// List all interfaces for debugging
-			d.logNetworkState()
-			return fmt.Errorf("timeout waiting for network after %v", elapsed)
-		}
-
-		remaining := maxWait - elapsed
-		d.logger.Infof("No usable network address yet, waiting... (%v remaining)", remaining.Round(time.Second))
-		time.Sleep(interval)
-	}
-}
-
-// getUsableAddresses returns a list of non-loopback, non-link-local IP addresses
-func (d *Daemon) getUsableAddresses() ([]string, error) {
-	var usable []string
-
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, iface := range ifaces {
-		// Skip loopback and down interfaces
-		if iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		if iface.Flags&net.FlagUp == 0 {
-			continue
-		}
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-
-			if ip == nil {
-				continue
-			}
-
-			// Skip loopback, link-local, and IPv6 link-local
-			if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
-				continue
-			}
-
-			// We have a usable address
-			usable = append(usable, fmt.Sprintf("%s (%s)", ip.String(), iface.Name))
-		}
-	}
-
-	return usable, nil
-}
-
-// GetClusterState returns the current cluster state
+// GetClusterState returns the current cluster state.
 func (d *Daemon) GetClusterState() *state.ClusterState {
 	return d.clusterState
 }
 
-// logNetworkState logs the current state of all network interfaces for debugging
-func (d *Daemon) logNetworkState() {
-	d.logger.Warn("Network state dump for debugging:")
-
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		d.logger.Errorf("Failed to list interfaces: %v", err)
-		return
-	}
-
-	for _, iface := range ifaces {
-		flags := ""
-		if iface.Flags&net.FlagUp != 0 {
-			flags += "UP "
-		}
-		if iface.Flags&net.FlagLoopback != 0 {
-			flags += "LOOPBACK "
-		}
-		if iface.Flags&net.FlagRunning != 0 {
-			flags += "RUNNING "
-		}
-
-		d.logger.Infof("  Interface %s: flags=[%s] mac=%s", iface.Name, flags, iface.HardwareAddr)
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			d.logger.Infof("    Address: %s", addr.String())
-		}
-	}
-}
-
-// Start starts the daemon and all its components
+// Start initialises all components and launches the phase machine.
 func (d *Daemon) Start() error {
 	d.logger.Info("Starting Cluster-OS daemon")
 
-	// Determine election mode
-	d.electionMode = d.config.Cluster.ElectionMode
-	if d.electionMode == "" {
-		d.electionMode = "serf" // Default to stateless
-	}
-	d.logger.Infof("Using election mode: %s", d.electionMode)
-
-	// Initialize cluster state
 	d.clusterState = state.NewClusterState()
 	d.clusterState.SetLocalNodeID(d.identity.NodeID)
 
-	// Use hostname for node name to avoid conflicts from shared NodeID
-	// This provides unique names per physical machine
+	// Node name: prefer hostname over generic defaults
 	nodeName := d.config.Discovery.NodeName
 	if nodeName == "" || nodeName == "cluster-node" || nodeName == "localhost" {
 		hostname, err := os.Hostname()
@@ -231,14 +109,11 @@ func (d *Daemon) Start() error {
 		d.logger.Infof("Using hostname-based node name: %s", nodeName)
 	}
 
-	// Get WireGuard public key for this node
 	wgPubKey, err := d.identity.WireGuardPublicKey()
 	if err != nil {
-		return fmt.Errorf("failed to get WireGuard public key: %w", err)
+		return fmt.Errorf("get WireGuard public key: %w", err)
 	}
-	d.logger.Infof("Local WireGuard public key: %s", wgPubKey)
 
-	// Create local node representation
 	localNode := &state.Node{
 		ID:   d.identity.NodeID,
 		Name: nodeName,
@@ -252,353 +127,803 @@ func (d *Daemon) Start() error {
 		Status:          state.StatusAlive,
 		WireGuardPubKey: wgPubKey,
 	}
-
-	// Add ourselves to cluster state
 	d.clusterState.AddNode(localNode)
 
-	// For Raft mode, initialize Raft first (before Serf)
-	if d.electionMode == "raft" {
-		if err := d.initRaftLeaderElection(); err != nil {
-			return fmt.Errorf("failed to initialize Raft leader election: %w", err)
-		}
+	// Detect Tailscale IP BEFORE Serf init so we can advertise it as our gossip address.
+	// Nodes binding Serf to 0.0.0.0 accept connections from any interface, but peers need
+	// to know which IP to contact us on; using the Tailscale IP routes through the encrypted
+	// overlay even when direct LAN port 7946 access is unavailable.
+	tsAdvertiseIP := d.detectTailscaleIP()
+	if tsAdvertiseIP != "" {
+		d.logger.Infof("Tailscale IP detected early: %s — using as Serf advertise address", tsAdvertiseIP)
 	}
 
-	// Initialize discovery layer (Serf) - always needed
-	if err := d.initDiscovery(localNode); err != nil {
-		return fmt.Errorf("failed to initialize discovery: %w", err)
+	if err := d.initDiscovery(localNode, tsAdvertiseIP); err != nil {
+		return fmt.Errorf("init discovery: %w", err)
 	}
 
-	// For Serf mode, initialize Serf-based leader election (after Serf discovery)
-	if d.electionMode == "serf" {
-		if err := d.initSerfLeaderElection(); err != nil {
-			return fmt.Errorf("failed to initialize Serf leader election: %w", err)
-		}
+	electionCfg := &state.SerfElectionConfig{
+		NodeName: d.config.Discovery.NodeName,
+		Serf:     d.discovery.GetSerf(),
+		Logger:   d.logger,
 	}
+	elector, err := state.NewSerfLeaderElector(electionCfg)
+	if err != nil {
+		return fmt.Errorf("init leader elector: %w", err)
+	}
+	d.leaderElector = elector
 
-	// Initialize networking (WireGuard) - this is critical
 	if err := d.initNetworking(); err != nil {
-		d.logger.Errorf("Failed to initialize networking (WireGuard): %v", err)
-		return fmt.Errorf("failed to initialize networking: %w", err)
+		d.logger.Warnf("Networking init failed: %v (continuing)", err)
 	}
 
-	// After networking is up, discover Tailscale peers and join them
-	// This is the primary cluster assembly mechanism
+	if err := d.setupFirewallRules(); err != nil {
+		d.logger.Warnf("Firewall setup failed: %v (continuing)", err)
+	}
+
 	if d.tailscale != nil && d.config.Tailscale.APIDiscovery {
 		go d.tailscalePeerDiscoveryLoop()
 	}
 
-	// Initialize role manager and start roles
-	if err := d.initRoles(); err != nil {
-		return fmt.Errorf("failed to initialize roles: %w", err)
-	}
+	// Role manager handles health-checking of services started by the phase machine.
+	d.roleManager = roles.NewManager(d.logger)
+	d.roleManager.StartHealthCheckLoop(30 * time.Second)
+
+	go d.runPhaseMachine()
 
 	d.logger.Info("Daemon started successfully")
 	return nil
 }
 
-// initRaftLeaderElection initializes the Raft-based leader election (persistent mode)
-func (d *Daemon) initRaftLeaderElection() error {
-	d.logger.Info("Initializing leader election (Raft - persistent mode)")
+// Run blocks until a signal is received, then shuts down.
+func (d *Daemon) Run() error {
+	d.logger.Info("Daemon running, waiting for signals")
+	d.writeStatusFile()
+	go d.statusFileLoop()
 
-	// Use node name (hostname) as the advertise address
-	// In Docker, this will be the container hostname which is resolvable
-	advertiseAddr := d.config.Discovery.NodeName
-	if advertiseAddr == "" {
-		advertiseAddr = "localhost"
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-sigCh
+	d.logger.Infof("Received signal: %s", sig)
+	return d.Shutdown()
+}
+
+// Shutdown gracefully stops all components.
+func (d *Daemon) Shutdown() error {
+	d.logger.Info("Shutting down daemon")
+	d.cancel()
+	if d.roleManager != nil {
+		d.roleManager.Shutdown()
 	}
-
-	electionCfg := &state.ElectionConfig{
-		NodeID:        d.identity.NodeID,
-		NodeAddr:      advertiseAddr,
-		DataDir:       "/var/lib/cluster-os/raft",
-		BindAddr:      "0.0.0.0",
-		BindPort:      7373,
-		BootstrapNode: d.config.IsBootstrap(),
-		Logger:        d.logger,
+	if d.discovery != nil {
+		d.discovery.Shutdown()
 	}
-
-	elector, err := state.NewLeaderElector(electionCfg, d.clusterState)
-	if err != nil {
-		return fmt.Errorf("failed to create leader elector: %w", err)
-	}
-
-	d.leaderElector = elector
-
-	// Wait for leader election
-	if err := elector.WaitForLeader(30 * time.Second); err != nil {
-		d.logger.Warnf("Leader election timeout: %v (continuing anyway)", err)
-	}
-
-	d.logger.Info("Raft leader election initialized")
+	d.logger.Info("Daemon shut down")
 	return nil
 }
 
-// initSerfLeaderElection initializes the Serf-based leader election (stateless mode)
-func (d *Daemon) initSerfLeaderElection() error {
-	d.logger.Info("Initializing leader election (Serf - stateless mode)")
+// --------------------------------------------------------------------------
+// Phase machine
+// --------------------------------------------------------------------------
 
+func (d *Daemon) setPhase(p ClusterPhase) {
+	d.mu.Lock()
+	d.phase = p
+	d.mu.Unlock()
+	d.logger.Infof("Phase → %s", p)
+	d.publishTag("phase", string(p))
+}
+
+func (d *Daemon) getPhase() ClusterPhase {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.phase
+}
+
+func (d *Daemon) runPhaseMachine() {
+	for {
+		select {
+		case <-d.ctx.Done():
+			return
+		default:
+		}
+
+		switch d.getPhase() {
+		case PhaseDiscovering:
+			d.runDiscovering()
+		case PhaseElecting:
+			d.runElecting()
+		case PhaseProvisioning:
+			if err := d.runProvisioning(); err != nil {
+				d.logger.Errorf("Provisioning failed: %v — retrying in 30s", err)
+				time.Sleep(30 * time.Second)
+				d.setPhase(PhaseElecting)
+			}
+		case PhaseJoining:
+			if err := d.runJoining(); err != nil {
+				d.logger.Errorf("Joining failed: %v — retrying in 15s", err)
+				time.Sleep(15 * time.Second)
+				d.setPhase(PhaseElecting)
+			}
+		case PhaseReady:
+			d.runReady()
+		}
+	}
+}
+
+func (d *Daemon) runDiscovering() {
+	d.logger.Info("Discovering cluster members...")
+	for {
+		select {
+		case <-d.ctx.Done():
+			return
+		default:
+		}
+		if len(d.discovery.GetAliveMembers()) >= 1 {
+			d.logger.Infof("Discovered %d alive member(s)", len(d.discovery.GetAliveMembers()))
+			d.setPhase(PhaseElecting)
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func (d *Daemon) runElecting() {
+	d.logger.Info("Electing leader...")
+	// Brief pause so gossip can stabilise before sorting member list.
+	time.Sleep(3 * time.Second)
+
+	leader := d.leaderElector.ComputeLeader()
+	isLeader := d.leaderElector.IsLeader()
+
+	d.mu.Lock()
+	d.isLeader = isLeader
+	d.leaderName = leader
+	d.mu.Unlock()
+
+	d.logger.Infof("Leader: %s (I am leader: %v)", leader, isLeader)
+	if isLeader {
+		d.setPhase(PhaseProvisioning)
+	} else {
+		d.setPhase(PhaseJoining)
+	}
+}
+
+// runProvisioning is called on the leader only.
+// It starts K3s, generates the munge key, and starts the SLURM controller,
+// then publishes everything via Serf tags so workers can join.
+func (d *Daemon) runProvisioning() error {
+	d.logger.Info("Provisioning cluster (leader role)")
+
+	// Clear any stale worker roles from a previous term.
+	d.roleManager.UnregisterRole("k3s-agent")
+	d.roleManager.UnregisterRole("slurm-worker")
+
+	nodeIP := d.getLocalIP()
+
+	// --- K3s server ---
+	d.logger.Info("Starting K3s server...")
+	k3sServer := k3s.NewK3sServerRole(nodeIP, d.logger)
+	if err := k3sServer.Start(); err != nil {
+		return fmt.Errorf("start k3s server: %w", err)
+	}
+	d.roleManager.RegisterRole("k3s-server", k3sServer)
+
+	d.logger.Info("Waiting for K3s API to be ready...")
+	if err := k3sServer.WaitForAPIReady(5 * time.Minute); err != nil {
+		return fmt.Errorf("k3s API ready: %w", err)
+	}
+
+	token, err := k3sServer.ReadToken()
+	if err != nil {
+		return fmt.Errorf("read k3s token: %w", err)
+	}
+
+	serverURL := fmt.Sprintf("https://%s:6443", nodeIP)
+
+	// Record in cluster state so ondemand can find the K3s leader.
+	d.clusterState.SetLeader("k3s-server", d.identity.NodeID)
+
+	// --- Munge key ---
+	mungeManager := slurmauth.NewMungeKeyManager(d.logger)
+	mungeKey, err := mungeManager.GenerateMungeKey()
+	if err != nil {
+		return fmt.Errorf("generate munge key: %w", err)
+	}
+
+	// --- SLURM controller ---
+	// Build initial worker list from any Serf members already alive (handles re-elections
+	// where workers might already be present before the leader finishes provisioning).
+	initialWorkers := d.buildWorkerList()
+	d.logger.Infof("Starting SLURM controller (initial workers=%d)...", len(initialWorkers))
+	slurmCtrl := controller.NewSLURMControllerRole(nodeIP, mungeKey, initialWorkers, "", d.logger)
+	if err := slurmCtrl.Start(); err != nil {
+		return fmt.Errorf("start slurm controller: %w", err)
+	}
+	d.roleManager.RegisterRole("slurm-controller", slurmCtrl)
+	d.clusterState.SetLeader("slurm-controller", d.identity.NodeID)
+
+	d.mu.Lock()
+	d.slurmCtrl = slurmCtrl
+	d.mu.Unlock()
+
+	// Watch Serf membership and update the SLURM node list as workers join/leave.
+	// slurmctld needs NodeName entries to schedule jobs — we populate them dynamically.
+	go d.watchWorkersAndReconfigureSLURM()
+
+	// Publish ALL cluster tags in a single atomic UpdateTags call alongside phase=ready.
+	// This is critical: because Serf gossip is asynchronous, workers that see phase=ready
+	// via gossip must have all other cluster tags in the SAME member-state snapshot.
+	// Publishing them separately would allow a worker to see phase=ready without munge-key
+	// if the two gossip messages arrived via different peers or were in different UDP batches.
+	if err := d.publishClusterReady(serverURL, token, mungeKey); err != nil {
+		return fmt.Errorf("publish cluster ready state: %w", err)
+	}
+
+	// Deploy Longhorn, Rancher, nginx-ingress, slurmdbd in the background.
+	go k3sServer.DeployClusterServices(mungeKey)
+
+	return nil
+}
+
+// runJoining is called on non-leader nodes.
+// It waits for the leader to be ready, then reads tags and starts services.
+func (d *Daemon) runJoining() error {
+	d.logger.Info("Joining cluster (worker role)")
+
+	// Clear any stale leader roles from a previous term.
+	d.roleManager.UnregisterRole("k3s-server")
+	d.roleManager.UnregisterRole("slurm-controller")
+
+	// Wait for leader to publish phase=ready.
+	d.logger.Info("Waiting for leader to reach ready phase...")
+	if _, err := d.waitForLeaderTag("phase", "ready", 10*time.Minute); err != nil {
+		return fmt.Errorf("wait for leader ready: %w", err)
+	}
+
+	// Force an immediate TCP push-pull with the leader so we get all tags in one shot.
+	// Without this, gossip propagation of large values (munge-key, k3s-token) may rely
+	// solely on periodic push-pull (every 15s) which could be slow or blocked on some
+	// Tailscale configurations. The direct TCP connection forces a full state exchange.
+	d.syncWithLeader()
+
+	// All cluster tags are published atomically with phase=ready.
+	// Use a 5-minute timeout per tag as insurance against slow gossip propagation.
+	k3sServerURL, err := d.waitForLeaderTag("k3s-server", "", 5*time.Minute)
+	if err != nil {
+		d.logger.Errorf("k3s-server tag not found; leader tags visible: %v", d.getLeaderTags())
+		return fmt.Errorf("read k3s-server tag: %w", err)
+	}
+	k3sToken, err := d.waitForLeaderTag("k3s-token", "", 5*time.Minute)
+	if err != nil {
+		return fmt.Errorf("read k3s-token tag: %w", err)
+	}
+	mungeKeyB64, err := d.waitForLeaderTag("munge-key", "", 5*time.Minute)
+	if err != nil {
+		d.logger.Errorf("munge-key tag not found; leader tags visible: %v", d.getLeaderTags())
+		return fmt.Errorf("read munge-key tag: %w", err)
+	}
+
+	mungeKey, err := base64.StdEncoding.DecodeString(mungeKeyB64)
+	if err != nil {
+		return fmt.Errorf("decode munge key: %w", err)
+	}
+
+	// Extract controller IP from the K3s server URL (https://<IP>:6443).
+	controllerIP := d.extractHost(k3sServerURL)
+	nodeIP := d.getLocalIP()
+
+	// --- K3s agent ---
+	d.logger.Infof("Starting K3s agent → %s", k3sServerURL)
+	k3sAgent := k3s.NewK3sAgentRole(k3sServerURL, k3sToken, nodeIP, d.logger)
+	if err := k3sAgent.Start(); err != nil {
+		return fmt.Errorf("start k3s agent: %w", err)
+	}
+	d.roleManager.RegisterRole("k3s-agent", k3sAgent)
+
+	// --- SLURM worker ---
+	d.logger.Infof("Starting SLURM worker (controller=%s)", controllerIP)
+	slurmWorker := worker.NewSLURMWorkerRole(controllerIP, mungeKey, nodeIP, d.logger)
+	if err := slurmWorker.Start(); err != nil {
+		return fmt.Errorf("start slurm worker: %w", err)
+	}
+	d.roleManager.RegisterRole("slurm-worker", slurmWorker)
+
+	d.setPhase(PhaseReady)
+	return nil
+}
+
+// runReady loops, monitoring for leadership changes.
+func (d *Daemon) runReady() {
+	d.logger.Info("Cluster ready — monitoring leadership")
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-ticker.C:
+			nowLeader := d.leaderElector.IsLeader()
+			d.mu.RLock()
+			wasLeader := d.isLeader
+			d.mu.RUnlock()
+
+			if nowLeader != wasLeader {
+				d.logger.Infof("Leadership changed: was=%v now=%v", wasLeader, nowLeader)
+				d.mu.Lock()
+				d.isLeader = nowLeader
+				d.mu.Unlock()
+
+				if nowLeader {
+					d.logger.Info("Promoted to leader — re-provisioning")
+					d.setPhase(PhaseProvisioning)
+					return
+				}
+				// Lost leadership — clear controller reference and re-join as worker.
+				d.logger.Info("Lost leadership — re-joining as worker")
+				d.mu.Lock()
+				d.slurmCtrl = nil
+				d.mu.Unlock()
+				d.setPhase(PhaseJoining)
+				return
+			}
+		}
+	}
+}
+
+// --------------------------------------------------------------------------
+// Serf tag helpers
+// --------------------------------------------------------------------------
+
+func (d *Daemon) publishTag(key, value string) {
 	if d.discovery == nil {
-		return fmt.Errorf("serf discovery must be initialized before serf leader election")
+		return
 	}
-
-	electionCfg := &state.SerfElectionConfig{
-		NodeID:       d.identity.NodeID,
-		NodeName:     d.config.Discovery.NodeName,
-		Serf:         d.discovery.GetSerf(),
-		ClusterState: d.clusterState,
-		Logger:       d.logger,
+	if err := d.discovery.UpdateTags(map[string]string{key: value}); err != nil {
+		d.logger.Warnf("publish tag %s: %v", key, err)
 	}
+}
 
-	elector, err := state.NewSerfLeaderElector(electionCfg)
-	if err != nil {
-		return fmt.Errorf("failed to create serf leader elector: %w", err)
+// publishClusterReady publishes all cluster coordination tags AND phase=ready in a single
+// atomic Serf SetTags call.  Because gossip messages carry a full member-state snapshot,
+// workers that see phase=ready will always see the k3s-server/token/munge-key in the
+// same snapshot — eliminating the race where phase=ready arrived before munge-key.
+func (d *Daemon) publishClusterReady(k3sServerURL, k3sToken string, mungeKey []byte) error {
+	if d.discovery == nil {
+		return fmt.Errorf("discovery not initialised")
 	}
-
-	d.serfLeaderElector = elector
-
-	// Register user event handler to receive state synchronization events
-	d.discovery.RegisterUserEventHandler(func(name string, payload []byte) error {
-		if name == "cluster-state" {
-			d.logger.Debug("Received cluster-state event, processing...")
-			return elector.HandleStateEvent(payload)
-		}
-		return nil
-	})
-
-	// Wait for leader election (quick for Serf)
-	if err := elector.WaitForLeader(10 * time.Second); err != nil {
-		d.logger.Warnf("Leader election timeout: %v (continuing anyway)", err)
+	mungeKeyB64 := base64.StdEncoding.EncodeToString(mungeKey)
+	// Log estimated tag payload sizes to aid debugging if SetTags ever fails with
+	// "Encoded length of tags exceeds limit of 512 bytes" (memberlist MetaMaxSize).
+	d.logger.Infof("publishClusterReady: k3s-token=%d chars, munge-key=%d chars (raw %d bytes)",
+		len(k3sToken), len(mungeKeyB64), len(mungeKey))
+	tags := map[string]string{
+		"k3s-server": k3sServerURL,
+		"k3s-token":  k3sToken,
+		"munge-key":  mungeKeyB64,
+		"phase":      string(PhaseReady),
 	}
-
-	// If we're not the leader, request state from the leader
-	if !elector.IsLeader() {
-		d.logger.Info("Not leader, requesting state from leader")
-		if err := elector.RequestState(); err != nil {
-			d.logger.Warnf("Failed to request state from leader: %v", err)
-		}
+	if err := d.discovery.UpdateTags(tags); err != nil {
+		return fmt.Errorf("serf update tags (hint: total tags must fit in %d bytes): %w", 512, err)
 	}
-
-	d.logger.Info("Serf leader election initialized")
+	d.mu.Lock()
+	d.phase = PhaseReady
+	d.mu.Unlock()
+	d.logger.Infof("Phase → %s (k3s-server=%s, munge-key published atomically)", PhaseReady, k3sServerURL)
 	return nil
 }
 
-// initDiscovery initializes the Serf discovery layer
-func (d *Daemon) initDiscovery(localNode *state.Node) error {
-	d.logger.Info("Initializing discovery layer (Serf)")
+// syncWithLeader forces an immediate TCP push-pull state exchange with the current leader.
+// This ensures that large tag values (munge-key, k3s-token) that may not fit in a UDP
+// gossip packet are fetched via TCP before we try to read them.
+func (d *Daemon) syncWithLeader() {
+	leaderName := d.leaderElector.ComputeLeader()
+	for _, m := range d.discovery.Members() {
+		if m.Name != leaderName {
+			continue
+		}
+		// serf.Member.Port is the memberlist port (same as BindPort / 7946).
+		addr := fmt.Sprintf("%s:%d", m.Addr.String(), m.Port)
+		d.logger.Infof("Forcing TCP state sync with leader %s at %s", leaderName, addr)
+		if n, err := d.discovery.Join([]string{addr}); err != nil {
+			d.logger.Debugf("Leader TCP sync: %v (synced %d)", err, n)
+		}
+		// Brief pause so the push-pull goroutine can complete before we read tags.
+		time.Sleep(3 * time.Second)
+		return
+	}
+	d.logger.Warn("syncWithLeader: leader not found in member list — skipping")
+}
 
-	// Parse encryption key if provided
+// getLeaderTags returns all tags from the leader member for diagnostics.
+func (d *Daemon) getLeaderTags() map[string]string {
+	leaderName := d.leaderElector.ComputeLeader()
+	for _, m := range d.discovery.Members() {
+		if m.Name == leaderName {
+			return m.Tags
+		}
+	}
+	return nil
+}
+
+// buildWorkerList returns the current list of alive non-leader Serf members as WorkerInfo.
+func (d *Daemon) buildWorkerList() []controller.WorkerInfo {
+	leaderName := d.leaderElector.ComputeLeader()
+	var workers []controller.WorkerInfo
+	for _, m := range d.discovery.GetAliveMembers() {
+		if m.Name == leaderName {
+			continue
+		}
+		phase := m.Tags["phase"]
+		if phase == string(PhaseDiscovering) || phase == string(PhaseElecting) {
+			continue // not yet participating
+		}
+		cpu, _ := strconv.Atoi(m.Tags["cpu"])
+		if cpu < 1 {
+			cpu = 1
+		}
+		// Use the Serf member address as NodeAddr; Name as NodeName.
+		// The node name matches what slurmd registers with (its Serf node name).
+		workers = append(workers, controller.WorkerInfo{
+			Name: m.Name,
+			Addr: m.Addr.String(),
+			CPUs: cpu,
+		})
+	}
+	return workers
+}
+
+// watchWorkersAndReconfigureSLURM polls Serf membership every 15 s and reconfigures
+// slurmctld when the worker set changes.  This ensures the SLURM node list stays in sync
+// without requiring a controller restart — slurmctld is sent SIGHUP + scontrol reconfigure.
+func (d *Daemon) watchWorkersAndReconfigureSLURM() {
+	d.logger.Info("Starting SLURM worker watcher")
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	lastHash := ""
+	for {
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		d.mu.RLock()
+		ctrl := d.slurmCtrl
+		d.mu.RUnlock()
+		if ctrl == nil {
+			return
+		}
+
+		workers := d.buildWorkerList()
+
+		// Build a simple hash of worker names to detect changes without spurious reconfigures.
+		hash := ""
+		for _, w := range workers {
+			hash += w.Name + "," + w.Addr + ";"
+		}
+		if hash == lastHash {
+			continue
+		}
+		lastHash = hash
+
+		d.logger.Infof("SLURM worker list changed — reconfiguring (%d workers)", len(workers))
+		if err := ctrl.Reconfigure(workers); err != nil {
+			d.logger.Warnf("SLURM reconfigure: %v", err)
+		}
+	}
+}
+
+// detectTailscaleIP runs 'tailscale ip -4' and returns the IP string, or "" on failure.
+// This is called early in Start() so the IP is available before Serf is initialised.
+func (d *Daemon) detectTailscaleIP() string {
+	cmd := exec.Command("tailscale", "ip", "-4")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	ip := strings.TrimSpace(string(out))
+	if net.ParseIP(ip) == nil {
+		return ""
+	}
+	return ip
+}
+
+// getLeaderTag returns the value of a tag from the current leader's Serf member.
+func (d *Daemon) getLeaderTag(key string) (string, bool) {
+	leaderName := d.leaderElector.ComputeLeader()
+	for _, m := range d.discovery.Members() {
+		if m.Name == leaderName {
+			val, ok := m.Tags[key]
+			return val, ok
+		}
+	}
+	return "", false
+}
+
+// waitForLeaderTag polls until the leader has the tag set to a non-empty value.
+// If wantValue is non-empty, it waits until the tag equals that value exactly.
+func (d *Daemon) waitForLeaderTag(key, wantValue string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case <-d.ctx.Done():
+			return "", fmt.Errorf("context cancelled")
+		default:
+		}
+		if val, ok := d.getLeaderTag(key); ok && val != "" {
+			if wantValue == "" || val == wantValue {
+				return val, nil
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return "", fmt.Errorf("timeout waiting for leader tag %q after %v", key, timeout)
+}
+
+// extractHost parses the host from a URL like "https://IP:port".
+func (d *Daemon) extractHost(rawURL string) string {
+	s := strings.TrimPrefix(rawURL, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	if idx := strings.LastIndex(s, ":"); idx != -1 {
+		return s[:idx]
+	}
+	return s
+}
+
+// getLocalIP returns the Tailscale IP if available, otherwise the first usable IP.
+func (d *Daemon) getLocalIP() string {
+	if d.tailscale != nil {
+		if ip := d.tailscale.GetLocalIP(); ip != nil {
+			return ip.String()
+		}
+	}
+	addrs, err := d.getUsableAddresses()
+	if err == nil && len(addrs) > 0 {
+		parts := strings.Fields(addrs[0])
+		if len(parts) > 0 {
+			return parts[0]
+		}
+	}
+	return ""
+}
+
+// --------------------------------------------------------------------------
+// Discovery initialisation
+// --------------------------------------------------------------------------
+
+func (d *Daemon) initDiscovery(localNode *state.Node, advertiseAddr string) error {
+	d.logger.Info("Initialising Serf discovery")
+
 	var encryptKey []byte
 	if d.config.Discovery.EncryptKey != "" {
 		var err error
 		encryptKey, err = discovery.ParseEncryptKey(d.config.Discovery.EncryptKey)
 		if err != nil {
-			return fmt.Errorf("failed to parse encryption key: %w", err)
+			return fmt.Errorf("parse encryption key: %w", err)
 		}
 	}
 
-	// Build tags including WireGuard public key
-	tags := map[string]string{
-		"wg_pubkey": localNode.WireGuardPubKey,
-	}
+	// wg_pubkey intentionally omitted: WireGuard is replaced by Tailscale and the
+	// pubkey (~55 bytes base64) needlessly consumes Serf's 512-byte MetaMaxSize budget.
+	tags := map[string]string{}
 
+	// Always bind on 0.0.0.0 so we accept gossip from both LAN and Tailscale interfaces.
+	// Tailscale nodes that block port 7946 may still reach us via LAN, and vice versa.
 	discoveryCfg := &discovery.Config{
 		NodeName:       d.config.Discovery.NodeName,
 		NodeID:         d.identity.NodeID,
-		BindAddr:       d.config.Discovery.BindAddr,
+		BindAddr:       "0.0.0.0",
 		BindPort:       d.config.Discovery.BindPort,
+		AdvertiseAddr:  advertiseAddr, // Tailscale IP when available
 		BootstrapPeers: d.config.Discovery.BootstrapPeers,
 		EncryptKey:     encryptKey,
 		ClusterAuthKey: d.config.Cluster.AuthKey,
 		Tags:           tags,
 		Logger:         d.logger,
-		RaftPort:       7373, // Raft consensus port
 	}
 
-	// Pass Raft leader elector only in raft mode
-	// In serf mode, we'll set up Serf-based leader election after
-	var leaderElector discovery.LeaderElector
-	if d.electionMode == "raft" && d.leaderElector != nil {
-		leaderElector = d.leaderElector
-	}
-
-	disc, err := discovery.New(discoveryCfg, d.clusterState, localNode, leaderElector)
+	disc, err := discovery.New(discoveryCfg, d.clusterState, localNode)
 	if err != nil {
-		return fmt.Errorf("failed to create discovery: %w", err)
+		return fmt.Errorf("create discovery: %w", err)
 	}
-
 	d.discovery = disc
-	d.logger.Infof("Discovery initialized, cluster size: %d", disc.GetClusterSize())
+	d.logger.Infof("Discovery initialised (cluster size: %d)", disc.GetClusterSize())
 	return nil
 }
 
-// initNetworking initializes networking using Tailscale
-// We use Tailscale's existing mesh instead of running our own WireGuard
+// --------------------------------------------------------------------------
+// Networking (Tailscale)
+// --------------------------------------------------------------------------
+
 func (d *Daemon) initNetworking() error {
-	d.logger.Info("Initializing networking (using Tailscale)")
+	d.logger.Info("Initialising networking (Tailscale)")
 
-	// Check if Tailscale is available
 	if !networking.IsTailscaleAvailable() {
-		d.logger.Warn("Tailscale not detected - cluster networking may be limited")
-		d.logger.Info("Ensure Tailscale is installed and connected: tailscale up")
-		// Don't fail - node can still work on local network
+		d.logger.Warn("Tailscale not detected — cluster networking may be limited")
 		return nil
 	}
 
-	tsCfg := &networking.TailscaleConfig{
-		Logger: d.logger,
-	}
-
-	ts, err := networking.NewTailscaleManager(tsCfg)
+	ts, err := networking.NewTailscaleManager(&networking.TailscaleConfig{Logger: d.logger})
 	if err != nil {
-		d.logger.Warnf("Failed to initialize Tailscale manager: %v", err)
-		d.logger.Info("Continuing without Tailscale - using local network only")
+		d.logger.Warnf("Tailscale manager init failed: %v (continuing without Tailscale)", err)
 		return nil
 	}
-
 	d.tailscale = ts
 
-	// Update cluster state with our Tailscale IP (stored in TailscaleIP field)
 	d.clusterState.UpdateNodeTailscaleIP(d.identity.NodeID, ts.GetLocalIP().String())
 
-	// Update node name to use Tailscale IP for better identification
 	tailscaleIP := ts.GetLocalIP().String()
 	if tailscaleIP != "" && tailscaleIP != "<nil>" {
-		// Update the node name to use Tailscale IP
 		oldName := d.config.Discovery.NodeName
 		d.config.Discovery.NodeName = tailscaleIP
 		d.logger.Infof("Updated node name from %s to Tailscale IP: %s", oldName, tailscaleIP)
-		
-		// Update local node in cluster state
 		if localNode, found := d.clusterState.GetNode(d.identity.NodeID); found {
 			localNode.Name = tailscaleIP
-			d.clusterState.AddNode(localNode) // This will update the existing node
+			d.clusterState.AddNode(localNode)
 		}
 	}
 
-	// Update Serf tags with our Tailscale IP
 	if d.discovery != nil {
 		if err := d.updateSerfTailscaleIP(ts.GetLocalIP()); err != nil {
 			d.logger.Warnf("Failed to update Serf tags with Tailscale IP: %v", err)
 		}
 	}
 
-	d.logger.Infof("Tailscale networking initialized, local IP: %s", ts.GetLocalIP())
-
-	// Set unique hostname based on Tailscale IP to avoid SLURM conflicts
 	if err := d.setUniqueHostname(ts.GetLocalIP()); err != nil {
-		d.logger.Warnf("Failed to set unique hostname: %v (continuing with default)", err)
+		d.logger.Warnf("Failed to set unique hostname: %v (continuing)", err)
 	}
 
+	d.logger.Infof("Tailscale networking initialised, local IP: %s", ts.GetLocalIP())
 	return nil
 }
 
-// updateSerfTailscaleIP updates the Serf tags with the current Tailscale IP
 func (d *Daemon) updateSerfTailscaleIP(ip net.IP) error {
 	if d.discovery == nil {
 		return nil
 	}
-
-	// Get existing tags and add/update the Tailscale IP (using wgip tag for compatibility)
-	tags := map[string]string{
-		"wgip": ip.String(),
-	}
-
-	return d.discovery.UpdateTags(tags)
+	return d.discovery.UpdateTags(map[string]string{"wgip": ip.String()})
 }
 
-// setUniqueHostname sets a unique hostname based on the Tailscale IP
-// This prevents duplicate hostname issues in SLURM and other cluster services
 func (d *Daemon) setUniqueHostname(tsIP net.IP) error {
 	if tsIP == nil {
-		return fmt.Errorf("no Tailscale IP available")
+		return fmt.Errorf("no Tailscale IP")
 	}
-
-	// Convert IP to hostname format: node-X-Y (last two octets)
-	// e.g., 100.64.5.123 -> node-5-123
 	ip4 := tsIP.To4()
 	if ip4 == nil {
 		return fmt.Errorf("not an IPv4 address: %s", tsIP)
 	}
-
 	newHostname := fmt.Sprintf("node-%d-%d", ip4[2], ip4[3])
 
-	// Get current hostname
-	currentHostname, err := os.Hostname()
-	if err != nil {
-		currentHostname = "unknown"
-	}
-
-	// Skip if hostname is already unique (not the default)
+	currentHostname, _ := os.Hostname()
 	if currentHostname == newHostname {
-		d.logger.Infof("Hostname already set to %s", newHostname)
+		d.logger.Infof("Hostname already %s", newHostname)
 		return nil
 	}
+	d.logger.Infof("Setting hostname: %s → %s (Tailscale IP %s)", currentHostname, newHostname, tsIP)
 
-	d.logger.Infof("Setting unique hostname: %s -> %s (based on Tailscale IP %s)", currentHostname, newHostname, tsIP)
+	os.WriteFile("/etc/hostname", []byte(newHostname+"\n"), 0644)
 
-	// Update /etc/hostname
-	if err := os.WriteFile("/etc/hostname", []byte(newHostname+"\n"), 0644); err != nil {
-		d.logger.Warnf("Failed to write /etc/hostname: %v", err)
-	}
-
-	// Update hostname using hostnamectl (if available)
 	cmd := exec.Command("hostnamectl", "set-hostname", newHostname)
 	if err := cmd.Run(); err != nil {
-		// Fallback: use hostname command
 		cmd = exec.Command("hostname", newHostname)
 		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to set hostname: %w", err)
+			return fmt.Errorf("set hostname: %w", err)
 		}
 	}
 
-	// Update /etc/hosts to include the new hostname
 	d.updateHostsFile(newHostname, tsIP)
-
-	// Update the discovery node name so SLURM and Serf use the new hostname
 	d.config.Discovery.NodeName = newHostname
-
 	d.logger.Infof("Hostname set to %s", newHostname)
 	return nil
 }
 
-// tailscalePeerDiscoveryLoop periodically discovers Tailscale peers and joins them via Serf.
-// This is the primary mechanism for automatic cluster assembly.
-func (d *Daemon) tailscalePeerDiscoveryLoop() {
-	// Initial attempt immediately
-	d.discoverAndJoinTailscalePeers()
+// --------------------------------------------------------------------------
+// Tailscale failed-peer cache
+// --------------------------------------------------------------------------
 
-	// Then retry periodically — peers may come online at different times
+// peerFailCache prevents hammering unreachable Tailscale peers.
+// Peers that fail a Serf join attempt are suppressed for failedPeerTTL before
+// being retried, avoiding repeated 10-second TCP timeouts every discovery tick.
+type peerFailCache struct {
+	mu    sync.Mutex
+	peers map[string]time.Time
+}
+
+const failedPeerTTL = 5 * time.Minute
+
+// peerProbeTimeout is the TCP dial timeout used to pre-check whether a
+// Tailscale peer has port 7946 open before handing it to Serf's Join.
+// A short value (2 s) prevents the 10-second memberlist TCP timeout from
+// stalling the discovery loop when peers are Tailscale-online but not
+// running node-agent (phones, laptops, powered-off nodes, etc.).
+const peerProbeTimeout = 2 * time.Second
+
+func newPeerFailCache() *peerFailCache {
+	return &peerFailCache{peers: make(map[string]time.Time)}
+}
+
+func (c *peerFailCache) shouldSkip(addr string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t, ok := c.peers[addr]
+	if !ok {
+		return false
+	}
+	if time.Since(t) > failedPeerTTL {
+		delete(c.peers, addr)
+		return false
+	}
+	return true
+}
+
+func (c *peerFailCache) markFailed(addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.peers[addr] = time.Now()
+}
+
+// probePeers dials each address in parallel with peerProbeTimeout.
+// Only addresses where the TCP handshake succeeds are returned.
+// Unreachable addresses are immediately recorded as failed in the cache so
+// subsequent discovery ticks skip them for failedPeerTTL.
+func (d *Daemon) probePeers(addrs []string) []string {
+	if len(addrs) == 0 {
+		return nil
+	}
+	type result struct {
+		addr string
+		ok   bool
+	}
+	ch := make(chan result, len(addrs))
+	for _, addr := range addrs {
+		go func(a string) {
+			conn, err := net.DialTimeout("tcp", a, peerProbeTimeout)
+			if err == nil {
+				conn.Close()
+				ch <- result{a, true}
+			} else {
+				ch <- result{a, false}
+			}
+		}(addr)
+	}
+	var reachable []string
+	for range addrs {
+		r := <-ch
+		if r.ok {
+			reachable = append(reachable, r.addr)
+		} else {
+			d.failedPeerCache.markFailed(r.addr)
+			d.logger.Debugf("Tailscale peer %s unreachable — skipping and caching for %v", r.addr, failedPeerTTL)
+		}
+	}
+	return reachable
+}
+
+func (d *Daemon) tailscalePeerDiscoveryLoop() {
+	d.discoverAndJoinTailscalePeers()
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ticker.C:
-			if d.discovery.GetClusterSize() <= 1 {
-				// Still alone — keep trying
-				d.discoverAndJoinTailscalePeers()
-			} else {
-				// We've joined a cluster. Slow down to maintenance cadence
-				// to pick up any new nodes that appear later.
-				d.discoverAndJoinTailscalePeers()
-			}
+			d.discoverAndJoinTailscalePeers()
 		case <-d.ctx.Done():
 			return
 		}
 	}
 }
 
-// discoverAndJoinTailscalePeers uses `tailscale status --json` to find other
-// machines on the Tailnet, then tries to join them on the Serf gossip port.
 func (d *Daemon) discoverAndJoinTailscalePeers() {
 	cmd := exec.Command("tailscale", "status", "--json")
 	output, err := cmd.Output()
 	if err != nil {
-		d.logger.Debugf("Failed to get tailscale status: %v", err)
+		d.logger.Debugf("tailscale status: %v", err)
 		return
 	}
 
-	// Parse the JSON output
 	var tsStatus struct {
 		Self *struct {
 			TailscaleIPs []string `json:"TailscaleIPs"`
@@ -607,59 +932,45 @@ func (d *Daemon) discoverAndJoinTailscalePeers() {
 			HostName     string   `json:"HostName"`
 			TailscaleIPs []string `json:"TailscaleIPs"`
 			Online       bool     `json:"Online"`
-			Tags         []string `json:"Tags,omitempty"` // e.g. ["tag:clusteros"]
-			OS           string   `json:"OS"`
 		} `json:"Peer"`
 	}
-
 	if err := json.Unmarshal(output, &tsStatus); err != nil {
-		d.logger.Debugf("Failed to parse tailscale status: %v", err)
+		d.logger.Debugf("parse tailscale status: %v", err)
 		return
 	}
 
-	// Get our own Tailscale IP to skip self
 	var selfIP string
 	if tsStatus.Self != nil && len(tsStatus.Self.TailscaleIPs) > 0 {
 		selfIP = tsStatus.Self.TailscaleIPs[0]
 	}
 
-	// Collect IPs of online peers to try joining
-	var peersToJoin []string
 	serfPort := d.config.Discovery.BindPort
 	if serfPort == 0 {
 		serfPort = 7946
 	}
 
-	// Build set of already-known members to avoid redundant joins
 	knownAddrs := make(map[string]bool)
 	for _, m := range d.discovery.Members() {
 		knownAddrs[m.Addr.String()] = true
 	}
 
+	var peersToJoin []string
 	for _, peer := range tsStatus.Peer {
-		if !peer.Online {
+		if !peer.Online || len(peer.TailscaleIPs) == 0 {
 			continue
 		}
-		if len(peer.TailscaleIPs) == 0 {
-			continue
-		}
-
 		peerIP := peer.TailscaleIPs[0]
-
-		// Skip self
-		if peerIP == selfIP {
+		if peerIP == selfIP || knownAddrs[peerIP] {
 			continue
 		}
-
-		// Skip already-known members
-		if knownAddrs[peerIP] {
-			continue
-		}
-
-		// Try all peers on the Tailnet — if they're running ClusterOS,
-		// they'll have Serf listening on the gossip port.
-		// If they're not ClusterOS nodes, the connection will simply fail silently.
 		peerAddr := fmt.Sprintf("%s:%d", peerIP, serfPort)
+		// Skip peers that recently failed — avoids a 10-second TCP timeout
+		// on every discovery tick for devices that are Tailscale-online but
+		// not running node-agent (e.g., phones, laptops, offline nodes).
+		if d.failedPeerCache.shouldSkip(peerAddr) {
+			d.logger.Debugf("Tailscale peer %s recently failed — skipping for %v", peerAddr, failedPeerTTL)
+			continue
+		}
 		peersToJoin = append(peersToJoin, peerAddr)
 	}
 
@@ -667,182 +978,60 @@ func (d *Daemon) discoverAndJoinTailscalePeers() {
 		return
 	}
 
-	d.logger.Infof("Tailscale discovery: attempting to join %d peer(s): %v", len(peersToJoin), peersToJoin)
+	// Probe in parallel before handing to Serf so unreachable peers don't
+	// cause sequential 10-second TCP timeouts inside memberlist's Join.
+	peersToJoin = d.probePeers(peersToJoin)
+	if len(peersToJoin) == 0 {
+		return
+	}
+
+	d.logger.Infof("Tailscale discovery: joining %d peer(s): %v", len(peersToJoin), peersToJoin)
 	n, err := d.discovery.Join(peersToJoin)
 	if err != nil {
 		d.logger.Debugf("Tailscale peer join: %v (joined %d)", err, n)
+		// Mark peers that did not end up in the Serf member list as failed
+		// so we don't retry them on every 15-second tick.
+		current := make(map[string]bool)
+		for _, m := range d.discovery.Members() {
+			current[m.Addr.String()] = true
+		}
+		for _, peerAddr := range peersToJoin {
+			host, _, _ := net.SplitHostPort(peerAddr)
+			if !current[host] {
+				d.failedPeerCache.markFailed(peerAddr)
+				d.logger.Debugf("Peer %s cached as failed for %v", peerAddr, failedPeerTTL)
+			}
+		}
 	}
 	if n > 0 {
-		d.logger.Infof("Tailscale discovery: successfully joined %d new peer(s)", n)
+		d.logger.Infof("Tailscale discovery: joined %d new peer(s)", n)
 	}
 }
 
-// updateHostsFile adds the new hostname to /etc/hosts
 func (d *Daemon) updateHostsFile(hostname string, ip net.IP) {
 	hostsEntry := fmt.Sprintf("%s\t%s\n", ip.String(), hostname)
-
-	// Read existing hosts file
 	content, err := os.ReadFile("/etc/hosts")
 	if err != nil {
-		d.logger.Warnf("Failed to read /etc/hosts: %v", err)
 		return
 	}
-
-	// Check if hostname already exists in hosts file
 	if strings.Contains(string(content), hostname) {
-		d.logger.Debugf("Hostname %s already in /etc/hosts", hostname)
 		return
 	}
-
-	// Append new entry
 	f, err := os.OpenFile("/etc/hosts", os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		d.logger.Warnf("Failed to open /etc/hosts for writing: %v", err)
 		return
 	}
 	defer f.Close()
-
-	if _, err := f.WriteString(hostsEntry); err != nil {
-		d.logger.Warnf("Failed to update /etc/hosts: %v", err)
-	} else {
-		d.logger.Infof("Added %s to /etc/hosts", hostname)
-	}
+	f.WriteString(hostsEntry)
 }
 
-// initRoles initializes the role manager and starts configured roles
-func (d *Daemon) initRoles() error {
-	d.logger.Info("Initializing role manager")
+// --------------------------------------------------------------------------
+// Status file
+// --------------------------------------------------------------------------
 
-	// Create role registry
-	registry := roles.NewRegistry(d.logger)
-
-	// Register available roles
-	registry.Register("slurm-controller", controller.NewSLURMController)
-	registry.Register("slurm-worker", worker.NewSLURMWorker)
-	registry.Register("k3s-server", k3s.NewK3sServer)
-	registry.Register("k3s-agent", k3s.NewK3sAgent)
-	registry.Register("ondemand", ondemand.NewOpenOnDemand)
-
-	// Determine which leader elector to use for manager
-	var managerLeaderElector roles.LeaderElectorManager
-	var roleLeaderElector roles.LeaderElector
-	if d.electionMode == "serf" && d.serfLeaderElector != nil {
-		managerLeaderElector = d.serfLeaderElector
-		roleLeaderElector = d.serfLeaderElector
-		d.logger.Info("Using Serf-based leader election for roles")
-	} else if d.leaderElector != nil {
-		managerLeaderElector = d.leaderElector
-		roleLeaderElector = d.leaderElector
-		d.logger.Info("Using Raft-based leader election for roles")
-	}
-
-	// Create role manager
-	managerCfg := &roles.ManagerConfig{
-		Registry:      registry,
-		ClusterState:  d.clusterState,
-		LeaderElector: managerLeaderElector,
-		Logger:        d.logger,
-	}
-
-	manager, err := roles.NewManager(managerCfg)
-	if err != nil {
-		return fmt.Errorf("failed to create role manager: %w", err)
-	}
-
-	d.roleManager = manager
-
-	// Start configured roles
-	for _, roleName := range d.config.Roles.Enabled {
-		d.logger.Infof("Starting role: %s", roleName)
-
-		roleConfig := &roles.RoleConfig{
-			Name:          roleName,
-			Enabled:       true,
-			Config:        make(map[string]interface{}),
-			LeaderElector: roleLeaderElector, // Pass the correct LeaderElector
-		}
-
-		// Add Tailscale IP for k3s roles
-		if d.tailscale != nil && (roleName == "k3s-server" || roleName == "k3s-agent") {
-			roleConfig.Config["node_ip"] = d.tailscale.GetLocalIP().String()
-		}
-
-		if err := manager.StartRole(roleName, roleConfig); err != nil {
-			d.logger.Errorf("Failed to start role %s: %v", roleName, err)
-			// Continue with other roles
-		}
-	}
-
-	// Start health check loop
-	manager.StartHealthCheckLoop(30 * time.Second)
-
-	// Start reconfigure loop
-	manager.StartReconfigureLoop(60 * time.Second)
-
-	d.logger.Info("Role manager initialized")
-	return nil
-}
-
-// Run runs the daemon until interrupted
-func (d *Daemon) Run() error {
-	d.logger.Info("Daemon running, waiting for signals")
-
-	// Write initial status file and start periodic updates
-	d.writeStatusFile()
-	go d.statusFileLoop()
-
-	// Set up signal handling
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	// Wait for signal
-	sig := <-sigCh
-	d.logger.Infof("Received signal: %s", sig)
-
-	return d.Shutdown()
-}
-
-// Shutdown gracefully shuts down the daemon
-func (d *Daemon) Shutdown() error {
-	d.logger.Info("Shutting down daemon")
-
-	// Cancel context
-	d.cancel()
-
-	// Shutdown role manager
-	if d.roleManager != nil {
-		if err := d.roleManager.Shutdown(); err != nil {
-			d.logger.Errorf("Failed to shutdown role manager: %v", err)
-		}
-	}
-
-	// Shutdown discovery
-	if d.discovery != nil {
-		if err := d.discovery.Shutdown(); err != nil {
-			d.logger.Errorf("Failed to shutdown discovery: %v", err)
-		}
-	}
-
-	// Shutdown leader elector (based on mode)
-	if d.electionMode == "serf" && d.serfLeaderElector != nil {
-		if err := d.serfLeaderElector.Shutdown(); err != nil {
-			d.logger.Errorf("Failed to shutdown Serf leader elector: %v", err)
-		}
-	} else if d.leaderElector != nil {
-		if err := d.leaderElector.Shutdown(); err != nil {
-			d.logger.Errorf("Failed to shutdown Raft leader elector: %v", err)
-		}
-	}
-
-	d.logger.Info("Daemon shut down successfully")
-	return nil
-}
-
-// statusFileLoop periodically writes cluster status to a file readable by cluster-status
 func (d *Daemon) statusFileLoop() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ticker.C:
@@ -853,370 +1042,311 @@ func (d *Daemon) statusFileLoop() {
 	}
 }
 
-// writeStatusFile writes cluster membership info to /run/clusteros/status.json
-// This is read by the cluster-status shell script instead of calling `serf members`
 func (d *Daemon) writeStatusFile() {
 	statusDir := "/run/clusteros"
 	statusFile := statusDir + "/status.json"
-
-	// Ensure directory exists
 	if err := os.MkdirAll(statusDir, 0755); err != nil {
-		d.logger.Warnf("Failed to create status dir: %v", err)
 		return
 	}
 
-	// Build member list from discovery
 	type memberInfo struct {
-		Name    string `json:"name"`
-		Addr    string `json:"addr"`
-		Status  string `json:"status"`
-		NodeID  string `json:"node_id"`
+		Name   string `json:"name"`
+		Addr   string `json:"addr"`
+		Status string `json:"status"`
+		NodeID string `json:"node_id"`
+		Phase  string `json:"phase,omitempty"`
 	}
 
-	members := []memberInfo{}
+	var members []memberInfo
 	aliveCount := 0
-
 	if d.discovery != nil {
 		for _, m := range d.discovery.Members() {
-			status := "alive"
+			status := "unknown"
 			switch m.Status {
-			case 1: // StatusAlive
+			case 1:
 				status = "alive"
 				aliveCount++
-			case 2: // StatusLeaving
+			case 2:
 				status = "leaving"
-			case 3: // StatusLeft
+			case 3:
 				status = "left"
-			case 4: // StatusFailed
+			case 4:
 				status = "failed"
-			default:
-				status = "unknown"
 			}
 			members = append(members, memberInfo{
 				Name:   m.Name,
 				Addr:   m.Addr.String(),
 				Status: status,
 				NodeID: m.Tags["node_id"],
+				Phase:  m.Tags["phase"],
 			})
 		}
 	}
 
-	// Build JSON manually to avoid encoding/json import (keep it simple)
-	// Actually let's use encoding/json for correctness
 	type statusData struct {
-		Joined       bool         `json:"joined"`
-		MemberCount  int          `json:"member_count"`
-		Members      []memberInfo `json:"members"`
-		LeaderMode   string       `json:"leader_mode"`
-		IsLeader     bool         `json:"is_leader"`
-		Leader       string       `json:"leader"`
-		UpdatedAt    string       `json:"updated_at"`
+		Phase       string       `json:"phase"`
+		IsLeader    bool         `json:"is_leader"`
+		Leader      string       `json:"leader"`
+		Joined      bool         `json:"joined"`
+		MemberCount int          `json:"member_count"`
+		Members     []memberInfo `json:"members"`
+		UpdatedAt   string       `json:"updated_at"`
 	}
 
+	d.mu.RLock()
 	sd := statusData{
+		Phase:       string(d.phase),
+		IsLeader:    d.isLeader,
+		Leader:      d.leaderName,
 		Joined:      aliveCount > 0,
 		MemberCount: aliveCount,
 		Members:     members,
-		LeaderMode:  d.electionMode,
 		UpdatedAt:   time.Now().Format(time.RFC3339),
 	}
+	d.mu.RUnlock()
 
-	// Check leader status
-	if d.electionMode == "serf" && d.serfLeaderElector != nil {
-		sd.IsLeader = d.serfLeaderElector.IsLeader()
-		if leader, err := d.serfLeaderElector.GetLeader(); err == nil {
-			sd.Leader = leader
-		}
-	} else if d.electionMode == "raft" && d.leaderElector != nil {
-		sd.IsLeader = d.leaderElector.IsLeader()
+	// Refresh leader from elector in case it changed.
+	if d.leaderElector != nil {
 		if leader, err := d.leaderElector.GetLeader(); err == nil {
 			sd.Leader = leader
 		}
+		sd.IsLeader = d.leaderElector.IsLeader()
 	}
 
 	jsonData, err := json.MarshalIndent(sd, "", "  ")
 	if err != nil {
-		d.logger.Warnf("Failed to marshal status: %v", err)
 		return
 	}
-
-	// Write atomically via temp file
 	tmpFile := statusFile + ".tmp"
 	if err := os.WriteFile(tmpFile, jsonData, 0644); err != nil {
-		d.logger.Warnf("Failed to write status file: %v", err)
 		return
 	}
-	if err := os.Rename(tmpFile, statusFile); err != nil {
-		d.logger.Warnf("Failed to rename status file: %v", err)
-	}
+	os.Rename(tmpFile, statusFile)
 }
 
-// setupFirewallRules configures firewall rules to allow essential services
-// This ensures SSH and other critical services work properly
-func (d *Daemon) setupFirewallRules() error {
-	d.logger.Info("Setting up firewall rules for essential services")
+// --------------------------------------------------------------------------
+// Firewall
+// --------------------------------------------------------------------------
 
-	rules := []struct {
-		port    string
-		proto   string
-		comment string
-	}{
+func (d *Daemon) setupFirewallRules() error {
+	d.logger.Info("Setting up firewall rules")
+	rules := []struct{ port, proto, comment string }{
 		{"22", "tcp", "SSH"},
 		{"7946", "tcp", "Serf TCP"},
 		{"7946", "udp", "Serf UDP"},
 		{"6443", "tcp", "K3s API"},
-		{"6817", "tcp", "SLURM"},
+		{"6817", "tcp", "SLURM slurmctld"},
+		{"6818", "tcp", "SLURM slurmd"},
+		{"6819", "tcp", "SLURM slurmdbd"},
+		{"10250", "tcp", "Kubelet API"},
+		{"2379:2380", "tcp", "etcd"},
+		{"30000:32767", "tcp", "K8s NodePort"},
+		{"30000:32767", "udp", "K8s NodePort"},
 	}
-
 	for _, rule := range rules {
-		// Try using ufw if available
 		cmd := exec.Command("ufw", "allow", fmt.Sprintf("%s/%s", rule.port, rule.proto))
-		if out, err := cmd.CombinedOutput(); err != nil {
-			d.logger.Warnf("ufw allow %s/%s failed: %v (%s), trying iptables", rule.port, rule.proto, err, string(out))
-
-			// Fallback to iptables
-			ipt := exec.Command("iptables", "-A", "INPUT", "-p", rule.proto, "--dport", rule.port, "-j", "ACCEPT")
-			if out, err := ipt.CombinedOutput(); err != nil {
-				d.logger.Warnf("iptables rule for %s failed: %v (%s)", rule.comment, err, string(out))
-				// Don't return error - continue with other rules
-			}
+		if _, err := cmd.CombinedOutput(); err != nil {
+			ipt := exec.Command("iptables", "-A", "INPUT", "-p", rule.proto,
+				"--dport", rule.port, "-j", "ACCEPT")
+			ipt.CombinedOutput()
 		}
 	}
 
-	d.logger.Info("Firewall rules configured")
+	// Trust the Tailscale interface — traffic arriving on tailscale0/ts0 has already
+	// been authenticated by Tailscale, so we don't need per-port rules for overlay traffic.
+	for _, iface := range []string{"tailscale0", "ts0"} {
+		exec.Command("ufw", "allow", "in", "on", iface).CombinedOutput()
+	}
+	// iptables CGNAT range fallback for kernels where interface-based rules don't apply.
+	cmd := exec.Command("iptables", "-C", "INPUT", "-s", "100.64.0.0/10", "-j", "ACCEPT")
+	if cmd.Run() != nil {
+		exec.Command("iptables", "-I", "INPUT", "-s", "100.64.0.0/10", "-j", "ACCEPT").Run()
+	}
+
+	d.logger.Info("Firewall rules set (including Tailscale interface trust)")
 	return nil
 }
 
-// ServiceStatus represents the status of a service
+// --------------------------------------------------------------------------
+// Network helpers
+// --------------------------------------------------------------------------
+
+func (d *Daemon) waitForNetwork() error {
+	maxWait := 90 * time.Second
+	interval := 2 * time.Second
+	start := time.Now()
+	d.logger.Info("Waiting for network...")
+	for {
+		addrs, err := d.getUsableAddresses()
+		if err == nil && len(addrs) > 0 {
+			d.logger.Infof("Network available: %d usable address(es)", len(addrs))
+			return nil
+		}
+		elapsed := time.Since(start)
+		if elapsed >= maxWait {
+			d.logNetworkState()
+			return fmt.Errorf("timeout waiting for network after %v", elapsed)
+		}
+		d.logger.Infof("No usable address yet (%v remaining)", (maxWait - elapsed).Round(time.Second))
+		time.Sleep(interval)
+	}
+}
+
+func (d *Daemon) getUsableAddresses() ([]string, error) {
+	var usable []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+				continue
+			}
+			usable = append(usable, fmt.Sprintf("%s (%s)", ip.String(), iface.Name))
+		}
+	}
+	return usable, nil
+}
+
+func (d *Daemon) logNetworkState() {
+	d.logger.Warn("Network state dump:")
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		flags := ""
+		if iface.Flags&net.FlagUp != 0 {
+			flags += "UP "
+		}
+		if iface.Flags&net.FlagLoopback != 0 {
+			flags += "LOOPBACK "
+		}
+		d.logger.Infof("  %s: [%s]", iface.Name, flags)
+	}
+}
+
+// --------------------------------------------------------------------------
+// Status / diagnostics
+// --------------------------------------------------------------------------
+
+// ServiceStatus represents the status of a system service.
 type ServiceStatus struct {
 	Name    string
-	Status  string // "running", "stopped", "error", "unknown"
+	Status  string
 	Message string
 }
 
-// GetComprehensiveStatus returns comprehensive status of all services and components
-func (d *Daemon) GetComprehensiveStatus() map[string]interface{} {
-	status := make(map[string]interface{})
-
-	// Node information
-	status["node"] = map[string]interface{}{
-		"id":         d.identity.NodeID,
-		"name":       d.config.Discovery.NodeName,
-		"cluster":    d.config.Cluster.Name,
-		"region":     d.config.Cluster.Region,
-		"datacenter": d.config.Cluster.Datacenter,
-	}
-
-	// Networking status
-	networkStatus := map[string]interface{}{
-		"type": "tailscale",
-	}
-
-	// Check Tailscale status
-	if d.tailscale != nil {
-		tsIP := d.tailscale.GetLocalIP()
-		if tsIP != nil {
-			networkStatus["tailscale_ip"] = tsIP.String()
-			networkStatus["connected"] = true
-		} else {
-			networkStatus["connected"] = false
-			networkStatus["message"] = "Tailscale IP not available"
-		}
-	} else {
-		networkStatus["connected"] = false
-		networkStatus["message"] = "Tailscale manager not initialized"
-	}
-
-	status["networking"] = networkStatus
-
-	// Discovery status
-	discoveryStatus := map[string]interface{}{
-		"serf": map[string]interface{}{
-			"running": d.discovery != nil,
-		},
-	}
-
-	// Cluster membership - simplified for now
-	discoveryStatus["members"] = 0
-	discoveryStatus["member_list"] = []string{}
-
-	status["discovery"] = discoveryStatus
-
-	// Leader election status
-	leaderStatus := map[string]interface{}{
-		"mode": d.electionMode,
-	}
-
-	if d.electionMode == "raft" && d.leaderElector != nil {
-		leaderStatus["is_leader"] = d.leaderElector.IsLeader()
-		if leader, err := d.leaderElector.GetLeader(); err == nil {
-			leaderStatus["leader"] = leader
-		}
-		leaderStatus["cluster_state"] = d.leaderElector.GetClusterState()
-	} else if d.electionMode == "serf" && d.serfLeaderElector != nil {
-		leaderStatus["is_leader"] = d.serfLeaderElector.IsLeader()
-		if leader, err := d.serfLeaderElector.GetLeader(); err == nil {
-			leaderStatus["leader"] = leader
-		}
-	}
-
-	status["leadership"] = leaderStatus
-
-	// Role statuses
-	roleStatuses := []map[string]interface{}{}
-	if d.roleManager != nil {
-		allStatuses := d.roleManager.GetAllStatuses()
-		for _, rs := range allStatuses {
-			roleStatuses = append(roleStatuses, map[string]interface{}{
-				"name":     rs.Name,
-				"running":  rs.Running,
-				"healthy":  rs.Healthy,
-				"is_leader": rs.IsLeader,
-				"error":    rs.Error,
-			})
-		}
-	}
-	status["roles"] = roleStatuses
-
-	// System services status (check via systemctl)
-	systemServices := []ServiceStatus{}
-
-	// Check SLURM services
-	slurmServices := []string{"slurmctld", "slurmd"}
-	for _, svc := range slurmServices {
-		status := d.checkSystemdService(svc)
-		systemServices = append(systemServices, status)
-	}
-
-	// Check K3s services
-	k3sServices := []string{"k3s", "k3s-agent"}
-	for _, svc := range k3sServices {
-		status := d.checkSystemdService(svc)
-		systemServices = append(systemServices, status)
-	}
-
-	// Check other services
-	otherServices := []string{"apache2", "ttyd", "filebrowser"}
-	for _, svc := range otherServices {
-		status := d.checkSystemdService(svc)
-		systemServices = append(systemServices, status)
-	}
-
-	status["system_services"] = systemServices
-
-	// Resource usage
-	status["resources"] = d.getResourceUsage()
-
-	return status
-}
-
-// checkSystemdService checks the status of a systemd service
 func (d *Daemon) checkSystemdService(serviceName string) ServiceStatus {
 	cmd := exec.Command("systemctl", "is-active", serviceName)
 	output, err := cmd.Output()
-
-	status := ServiceStatus{Name: serviceName}
-
+	ss := ServiceStatus{Name: serviceName}
 	if err != nil {
-		status.Status = "error"
-		status.Message = fmt.Sprintf("Failed to check: %v", err)
-		return status
+		ss.Status = "error"
+		ss.Message = fmt.Sprintf("check failed: %v", err)
+		return ss
 	}
-
-	activeStatus := strings.TrimSpace(string(output))
-	switch activeStatus {
+	switch strings.TrimSpace(string(output)) {
 	case "active":
-		status.Status = "running"
-		status.Message = "Service is active"
+		ss.Status = "running"
 	case "inactive":
-		status.Status = "stopped"
-		status.Message = "Service is inactive"
+		ss.Status = "stopped"
 	case "failed":
-		status.Status = "error"
-		status.Message = "Service has failed"
+		ss.Status = "error"
 	default:
-		status.Status = "unknown"
-		status.Message = fmt.Sprintf("Unknown status: %s", activeStatus)
+		ss.Status = "unknown"
 	}
-
-	return status
+	return ss
 }
 
-// getResourceUsage returns basic resource usage information
 func (d *Daemon) getResourceUsage() map[string]interface{} {
-	resources := map[string]interface{}{
-		"cpu_cores": runtime.NumCPU(),
-	}
-
-	// Get memory info
+	res := map[string]interface{}{"cpu_cores": runtime.NumCPU()}
 	if memInfo, err := d.getMemoryInfo(); err == nil {
-		resources["memory"] = memInfo
+		res["memory"] = memInfo
 	}
-
-	// Get disk usage for root filesystem
 	if diskInfo, err := d.getDiskUsage("/"); err == nil {
-		resources["disk"] = diskInfo
+		res["disk"] = diskInfo
 	}
-
-	return resources
+	return res
 }
 
-// getMemoryInfo reads /proc/meminfo and returns memory usage
 func (d *Daemon) getMemoryInfo() (map[string]interface{}, error) {
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
 		return nil, err
 	}
-
-	memInfo := make(map[string]interface{})
-	lines := strings.Split(string(data), "\n")
-
-	for _, line := range lines {
+	info := make(map[string]interface{})
+	for _, line := range strings.Split(string(data), "\n") {
 		if strings.Contains(line, "MemTotal") {
-			if val, err := d.parseMemValue(line); err == nil {
-				memInfo["total_kb"] = val
+			if v, err := d.parseMemValue(line); err == nil {
+				info["total_kb"] = v
 			}
 		} else if strings.Contains(line, "MemAvailable") {
-			if val, err := d.parseMemValue(line); err == nil {
-				memInfo["available_kb"] = val
+			if v, err := d.parseMemValue(line); err == nil {
+				info["available_kb"] = v
 			}
 		}
 	}
-
-	return memInfo, nil
+	return info, nil
 }
 
-// parseMemValue extracts the numeric value from a /proc/meminfo line
 func (d *Daemon) parseMemValue(line string) (int64, error) {
 	parts := strings.Fields(line)
 	if len(parts) < 2 {
-		return 0, fmt.Errorf("invalid line format")
+		return 0, fmt.Errorf("invalid line")
 	}
-
-	// Remove "kB" suffix if present
-	valueStr := strings.TrimSuffix(parts[1], "kB")
-	return strconv.ParseInt(valueStr, 10, 64)
+	return strconv.ParseInt(strings.TrimSuffix(parts[1], "kB"), 10, 64)
 }
 
-// getDiskUsage gets disk usage information for a mount point
 func (d *Daemon) getDiskUsage(path string) (map[string]interface{}, error) {
 	var stat syscall.Statfs_t
-	err := syscall.Statfs(path, &stat)
-	if err != nil {
+	if err := syscall.Statfs(path, &stat); err != nil {
 		return nil, err
 	}
-
-	// Calculate usage
 	total := stat.Blocks * uint64(stat.Bsize)
-	available := stat.Bavail * uint64(stat.Bsize)
-	used := total - available
-
-	diskInfo := map[string]interface{}{
+	avail := stat.Bavail * uint64(stat.Bsize)
+	used := total - avail
+	return map[string]interface{}{
 		"total_bytes":     total,
-		"available_bytes": available,
+		"available_bytes": avail,
 		"used_bytes":      used,
 		"used_percent":    float64(used) / float64(total) * 100,
+	}, nil
+}
+
+// GetComprehensiveStatus returns a map suitable for the status API.
+func (d *Daemon) GetComprehensiveStatus() map[string]interface{} {
+	status := map[string]interface{}{
+		"node": map[string]interface{}{
+			"id":      d.identity.NodeID,
+			"name":    d.config.Discovery.NodeName,
+			"cluster": d.config.Cluster.Name,
+		},
 	}
 
-	return diskInfo, nil
+	d.mu.RLock()
+	status["phase"] = string(d.phase)
+	status["is_leader"] = d.isLeader
+	status["leader"] = d.leaderName
+	d.mu.RUnlock()
+
+	netStatus := map[string]interface{}{"type": "tailscale"}
+	if d.tailscale != nil {
+		if ip := d.tailscale.GetLocalIP(); ip != nil {
+			netStatus["tailscale_ip"] = ip.String()
+			netStatus["connected"] = true
+		}
+	}
+	status["networking"] = netStatus
+	status["resources"] = d.getResourceUsage()
+	return status
 }

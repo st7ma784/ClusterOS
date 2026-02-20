@@ -49,24 +49,41 @@ else
     echo -e "  wireguard:   ${YELLOW}○ not configured${NC}"
 fi
 
-# K3s status
-if systemctl is-active --quiet k3s 2>/dev/null; then
+# K3s status (node-agent manages k3s directly, systemd services are disabled)
+if pgrep -f 'k3s server' &>/dev/null; then
     NODES=$(sudo k3s kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "0")
-    echo -e "  k3s:         ${GREEN}● $NODES nodes${NC}"
-elif systemctl is-active --quiet k3s-agent 2>/dev/null; then
+    echo -e "  k3s:         ${GREEN}● server ($NODES nodes)${NC}"
+elif pgrep -f 'k3s agent' &>/dev/null; then
     echo -e "  k3s-agent:   ${GREEN}● running${NC}"
 else
-    echo -e "  k3s:         ${YELLOW}○ disabled${NC}"
+    echo -e "  k3s:         ${YELLOW}○ waiting (node-agent managed)${NC}"
 fi
 
 # SLURM status (node-agent manages slurmd/slurmctld directly, systemd services are masked)
 if pgrep -x slurmctld &>/dev/null; then
     NODES=$(sinfo -h -o "%D" 2>/dev/null || echo "?")
     echo -e "  slurm:       ${GREEN}● controller ($NODES nodes)${NC}"
+    # Show squeue availability
+    if command -v squeue &>/dev/null && squeue --version &>/dev/null 2>&1; then
+        JOBS=$(squeue -h 2>/dev/null | wc -l || echo "?")
+        echo -e "  squeue:      ${GREEN}● available ($JOBS jobs)${NC}"
+    else
+        echo -e "  squeue:      ${RED}○ not reachable${NC}"
+    fi
 elif pgrep -x slurmd &>/dev/null; then
     echo -e "  slurmd:      ${GREEN}● running${NC}"
+    if command -v squeue &>/dev/null && squeue &>/dev/null 2>&1; then
+        echo -e "  squeue:      ${GREEN}● available${NC}"
+    else
+        echo -e "  squeue:      ${YELLOW}○ waiting for controller${NC}"
+    fi
 else
     echo -e "  slurm:       ${YELLOW}○ waiting (node-agent managed)${NC}"
+fi
+
+# nginx-ingress status
+if pgrep -f 'nginx-ingress' &>/dev/null || sudo k3s kubectl -n ingress-nginx get deploy ingress-nginx-controller --no-headers 2>/dev/null | grep -q '1/1'; then
+    echo -e "  ingress:     ${GREEN}● nginx (ports 30080/30443)${NC}"
 fi
 
 # Tailscale status

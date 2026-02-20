@@ -134,10 +134,32 @@ render() {
             node_info=$(sinfo -h -o "  %P %a %D/%F" 2>/dev/null)
             [ -n "$node_info" ] && echo -e "\n  ${DIM}Partition  Avail  Nodes(A/I/O/T)${NC}" && echo "$node_info"
         else
-            echo -e "  ${DIM}(squeue not reachable)${NC}"
+            # Diagnose why squeue is not reachable
+            echo -e "  ${RED}squeue not reachable${NC}"
+            if [ ! -f /etc/slurm/slurm.conf ]; then
+                echo -e "  ${DIM}  Cause: /etc/slurm/slurm.conf missing${NC}"
+                echo -e "  ${DIM}  Fix:   Wait for controller to elect and distribute config${NC}"
+            elif ! pgrep -x munged &>/dev/null; then
+                echo -e "  ${DIM}  Cause: munge daemon not running (auth failure)${NC}"
+                echo -e "  ${DIM}  Fix:   node-agent will restart munge on next health check${NC}"
+            else
+                local ctrl_host
+                ctrl_host=$(grep -oP 'SlurmctldHost=\K\S+' /etc/slurm/slurm.conf 2>/dev/null)
+                if [ -n "$ctrl_host" ]; then
+                    echo -e "  ${DIM}  Controller: $ctrl_host:6817${NC}"
+                    if timeout 2 bash -c "echo >/dev/tcp/$ctrl_host/6817" 2>/dev/null; then
+                        echo -e "  ${DIM}  Port 6817 reachable — slurmctld may be starting${NC}"
+                    else
+                        echo -e "  ${DIM}  Port 6817 NOT reachable — controller may be down${NC}"
+                    fi
+                fi
+            fi
         fi
     else
         echo -e "  ${DIM}(SLURM not running — waiting for node-agent)${NC}"
+        if [ -f /etc/slurm/slurm.conf ]; then
+            echo -e "  ${DIM}  slurm.conf exists — slurmd should start on next health check${NC}"
+        fi
     fi
 
     # ── K3s Pods ──
@@ -195,15 +217,16 @@ render() {
         [ -z "$preferred_ip" ] && preferred_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
 
         svc_lines=$(sudo k3s kubectl get svc -A --no-headers 2>/dev/null | \
-            awk '$1=="cattle-system" && $2~/(rancher|rancher-nodeport)/ {print $1, $2}
-                 $1=="longhorn-system" && $2~/(longhorn-frontend|longhorn-ui)/ {print $1, $2}
+            awk '$1=="ingress-nginx" && $2~/(ingress-nginx-controller)/ {print $1, $2}
+                 $1=="cattle-system" && $2~/(rancher-nodeport)/ {print $1, $2}
+                 $1=="longhorn-system" && $2~/(longhorn-frontend-nodeport|longhorn-frontend)/ {print $1, $2}
                  $1=="slurm" && $2~/(slurmdbd|slurmdbd-nodeport)/ {print $1, $2}
                  $1=="jupyterhub" && $2~/(proxy-public|hub|jupyterhub)/ {print $1, $2}
                  $1=="galaxy" {print $1, $2}' | head -20)
 
         if [ -z "$svc_lines" ]; then
             echo -e "  ${DIM}(no known service endpoints found yet)${NC}"
-            echo -e "  ${DIM}Known services: rancher, longhorn, slurmdbd, jupyterhub, galaxy${NC}"
+            echo -e "  ${DIM}Known services: ingress-nginx, rancher, longhorn, slurmdbd, jupyterhub${NC}"
         else
             while read -r ns svc; do
                 [ -z "$ns" ] && continue
@@ -215,13 +238,34 @@ render() {
 
                 if [ "$type" = "NodePort" ] && [ -n "$nodeports" ] && [ -n "$preferred_ip" ]; then
                     local endpoints
-                    endpoints=$(echo "$nodeports" | awk -v ip="$preferred_ip" '{for(i=1;i<=NF;i++) if($i!="") printf "https://%s:%s ", ip, $i}')
+                    # Use http:// for port 80-based services, https:// for TLS
+                    endpoints=$(echo "$nodeports" | awk -v ip="$preferred_ip" '{
+                        for(i=1;i<=NF;i++) {
+                            if($i!="" && $i+0>0) {
+                                if($i=="30080" || $i=="30900") printf "http://%s:%s ", ip, $i
+                                else printf "https://%s:%s ", ip, $i
+                            }
+                        }
+                    }')
                     echo -e "  ${GREEN}●${NC} $ns/$svc  [$type]  ports: ${ports:-N/A}"
                     echo -e "     ${CYAN}→${NC} ${endpoints}"
                 else
-                    echo -e "  ${GREEN}●${NC} $ns/$svc  [$type]  ports: ${ports:-N/A}  clusterIP=${cluster_ip:-N/A}"
+                    echo -e "  ${YELLOW}●${NC} $ns/$svc  [$type]  ports: ${ports:-N/A}  clusterIP=${cluster_ip:-N/A}"
+                    if [ "$type" = "ClusterIP" ] && [ -n "$preferred_ip" ]; then
+                        echo -e "     ${DIM}(internal only — no external access)${NC}"
+                    fi
                 fi
             done <<< "$svc_lines"
+        fi
+
+        # Show quick-reference access URLs
+        if [ -n "$preferred_ip" ]; then
+            echo -e "\n${YELLOW}${BOLD} Quick Access${NC}"
+            echo -e "  ${DIM}Ingress (HTTP):  http://$preferred_ip:30080${NC}"
+            echo -e "  ${DIM}Ingress (HTTPS): https://$preferred_ip:30443${NC}"
+            echo -e "  ${DIM}Rancher:         https://$preferred_ip:30444${NC}"
+            echo -e "  ${DIM}Longhorn UI:     http://$preferred_ip:30900${NC}"
+            echo -e "  ${DIM}K8s API:         https://$preferred_ip:6443${NC}"
         fi
     else
         echo -e "  ${DIM}(K3s not available)${NC}"

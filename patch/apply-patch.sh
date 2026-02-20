@@ -1,301 +1,403 @@
 #!/bin/bash
-# ClusterOS Patch - Cumulative fix for cluster-status, munge, k3s, k3s endpoint selection, and SLURM
+# ClusterOS Patch — Phase-Machine Architecture
 #
-# This patch:
-#   1. Ensures jq is installed (needed to parse the status file)
-#   2. Fixes config key mismatch (bootstrap_nodes → bootstrap_peers)
-#   3. Regenerates unique node identity (cloned images share the same one)
-#   4. Creates missing munge directories for SLURM auth
-#   5. Kills stale K3s/etcd processes holding port 2380
-#   6. Cleans stale K3s etcd data, SLURM config, and Raft state
-#   7. Installs patched node-agent with fixes:
-#      - K3s: kills orphaned etcd on port 2380 before starting server
-#      - K3s agent: prefer Tailscale IP for server endpoint (fixes join failures)
-#      - SLURM: passes explicit -N <nodename> to slurmd (fixes NodeName mismatch)
-#   8. Masks slurmd/slurmctld/munge systemd services (fixes DNS SRV lookup failure)
-#   9. Installs updated helper scripts (cluster-status, cluster-init, etc.)
-#  10. Restarts node-agent and verifies
+# Installs the rewritten node-agent (Serf-tag state machine) and unified
+# cluster CLI.  Safe to re-run; idempotent on all steps.
 #
-# Usage:
-#   On each node:  sudo bash apply-patch.sh
-#   Or from a management host:
-#     for ip in 100.105.26.8 100.105.X.Y; do
-#       scp -r patch/ clusteros@$ip:~/patch/
-#       ssh clusteros@$ip 'sudo bash ~/patch/apply-patch.sh'
-#     done
+# What changed:
+#   OLD: Raft + Serf-event dual state paths caused 45 s+ retry storms before
+#        workers received munge keys or K3s tokens.  Leader callbacks fired
+#        before dependencies were ready (K3s agents joining before token existed).
+#   NEW: Serf member tags are the single KV store.  A 5-phase state machine
+#        (DISCOVERING → ELECTING → PROVISIONING|JOINING → READY) sequences
+#        startup explicitly.  Workers block until leader publishes phase=ready.
+#
+# Usage (on each node):
+#   sudo bash apply-patch.sh
+#
+# Automated (from a dev machine with Tailscale):
+#   make deploy NODES="100.x.x.1 100.x.x.2 100.x.x.3"
+#   make deploy          # auto-detects online Tailscale peers
+#
+# Rollout order:
+#   Any order is fine.  The phase machine converges regardless of which node
+#   patches first.  Patch all nodes within a few minutes to avoid the old and
+#   new daemons talking to each other.
 
-set -e
+set -eo pipefail
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-echo -e "${CYAN}=== ClusterOS Patch: Cumulative fix (status, munge, k3s etcd, k3s server endpoint, SLURM nodename) ===${NC}"
-echo ""
+ok()  { echo -e "  ${GREEN}✓${NC} $*"; }
+warn(){ echo -e "  ${YELLOW}!${NC} $*"; }
+err(){ echo -e "  ${RED}✗${NC} $*"; }
+step(){ echo -e "\n${CYAN}${BOLD}[$1] $2${NC}"; }
 
-# Must be root
+echo -e "${CYAN}${BOLD}"
+echo "  ╔══════════════════════════════════════════════════╗"
+echo "  ║  ClusterOS — Phase-Machine Rollout Patch        ║"
+echo "  ╚══════════════════════════════════════════════════╝"
+echo -e "${NC}"
+
+# ── Root check ─────────────────────────────────────────────────────────────────
 if [ "$(id -u)" -ne 0 ]; then
-    echo -e "${RED}Error: Must run as root (sudo)${NC}"
+    err "Must run as root: sudo bash apply-patch.sh"
     exit 1
 fi
 
-# 1. Ensure dependencies are installed
-echo -e "${YELLOW}[1/10] Ensuring dependencies are installed...${NC}"
-PKGS_TO_INSTALL=""
-command -v jq &>/dev/null || PKGS_TO_INSTALL="$PKGS_TO_INSTALL jq"
-# PMIx library required by SLURM's MpiDefault=pmix (slurmd fails to load mpi/pmix without it)
-dpkg -s libpmix-dev &>/dev/null 2>&1 || PKGS_TO_INSTALL="$PKGS_TO_INSTALL libpmix-dev"
-# MPI packages for cluster-test MPI tests
-command -v mpicc &>/dev/null || PKGS_TO_INSTALL="$PKGS_TO_INSTALL openmpi-bin libopenmpi-dev"
-dpkg -s python3-mpi4py &>/dev/null 2>&1 || PKGS_TO_INSTALL="$PKGS_TO_INSTALL python3-mpi4py"
-dpkg -s build-essential &>/dev/null 2>&1 || PKGS_TO_INSTALL="$PKGS_TO_INSTALL build-essential"
+# ── 1. Dependencies ────────────────────────────────────────────────────────────
+step "1/10" "Ensuring dependencies"
 
-if [ -n "$PKGS_TO_INSTALL" ]; then
-    apt-get update -qq && apt-get install -y -qq $PKGS_TO_INSTALL
-    echo -e "  ${GREEN}✓${NC} Installed:$PKGS_TO_INSTALL"
+PKGS=""
+command -v jq      &>/dev/null || PKGS="$PKGS jq"
+command -v mpicc   &>/dev/null || PKGS="$PKGS openmpi-bin libopenmpi-dev"
+dpkg -s libpmix-dev      &>/dev/null 2>&1 || PKGS="$PKGS libpmix-dev"
+dpkg -s python3-mpi4py   &>/dev/null 2>&1 || PKGS="$PKGS python3-mpi4py"
+dpkg -s build-essential  &>/dev/null 2>&1 || PKGS="$PKGS build-essential"
+# SLURM daemons — node-agent manages these directly, but the binaries must be present.
+# slurmctld: controller daemon (leader only)   slurmd: compute daemon (workers)
+# munge: authentication — munged MUST run before slurmctld/slurmd can start
+command -v slurmctld &>/dev/null || PKGS="$PKGS slurmctld"
+command -v slurmd    &>/dev/null || PKGS="$PKGS slurmd"
+command -v munged    &>/dev/null || PKGS="$PKGS munge"
+# SLURM client tools — squeue, sbatch, sinfo, scancel (needed on ALL nodes, not just controller)
+command -v squeue  &>/dev/null || PKGS="$PKGS slurm-client"
+# Longhorn distributed storage requirements:
+dpkg -s open-iscsi       &>/dev/null 2>&1 || PKGS="$PKGS open-iscsi"
+dpkg -s nfs-common       &>/dev/null 2>&1 || PKGS="$PKGS nfs-common"
+dpkg -s multipath-tools  &>/dev/null 2>&1 || PKGS="$PKGS multipath-tools"
+
+if [ -n "$PKGS" ]; then
+    apt-get update -qq
+    # shellcheck disable=SC2086
+    apt-get install -y -qq $PKGS
+    ok "Installed:$PKGS"
 else
-    echo -e "  ${GREEN}✓${NC} All dependencies present (jq, libpmix-dev, openmpi, build-essential)"
+    ok "All dependencies present"
 fi
 
-# 2. Fix config key mismatch (bootstrap_nodes → bootstrap_peers)
-echo -e "${YELLOW}[2/10] Fixing config keys...${NC}"
-if [ -f /etc/clusteros/node.yaml ]; then
-    if grep -q 'bootstrap_nodes:' /etc/clusteros/node.yaml; then
-        sed -i 's/bootstrap_nodes:/bootstrap_peers:/' /etc/clusteros/node.yaml
-        echo -e "  ${GREEN}✓${NC} Fixed bootstrap_nodes → bootstrap_peers in config"
-    else
-        echo -e "  ${GREEN}✓${NC} Config keys already correct"
+# Enable and start iscsid (required by Longhorn for iSCSI volume attachment).
+if systemctl list-unit-files iscsid.service &>/dev/null; then
+    systemctl enable --now iscsid 2>/dev/null || true
+    ok "iscsid enabled (Longhorn iSCSI support)"
+fi
+
+# Enable multipath (Longhorn recommends blacklisting its devices in multipath).
+if [ -f /etc/multipath.conf ]; then
+    if ! grep -q 'longhorn' /etc/multipath.conf 2>/dev/null; then
+        cat >> /etc/multipath.conf <<'MPEOF'
+blacklist {
+    devnode "^sd[a-z0-9]+"
+}
+MPEOF
+        ok "multipath.conf updated for Longhorn"
     fi
+else
+    cat > /etc/multipath.conf <<'MPEOF'
+defaults {
+    user_friendly_names yes
+}
+blacklist {
+    devnode "^sd[a-z0-9]+"
+}
+MPEOF
+    ok "multipath.conf created"
 fi
+systemctl enable --now multipathd 2>/dev/null || true
 
-# 3. Regenerate node identity (all nodes from same image share the same identity!)
-echo -e "${YELLOW}[3/10] Regenerating unique node identity...${NC}"
+# ── 2. Unique node identity ────────────────────────────────────────────────────
+step "2/10" "Unique node identity"
+
 IDENTITY_FILE="/var/lib/cluster-os/identity.json"
 if [ -f "$IDENTITY_FILE" ]; then
-    OLD_ID=$(grep -o '"node_id":"[^"]*"' "$IDENTITY_FILE" 2>/dev/null | cut -d'"' -f4 || echo "unknown")
+    OLD_ID=$(python3 -c "import json,sys; d=json.load(open('$IDENTITY_FILE')); print(d.get('node_id','?')[:16])" 2>/dev/null || echo "?")
     rm -f "$IDENTITY_FILE"
-    echo -e "  ${GREEN}✓${NC} Removed shared identity (was: ${OLD_ID:0:16}...)"
-fi
-echo -e "  ${CYAN}→${NC} New identity will be generated on next start"
-
-# Fix duplicate machine-id (causes DHCP to assign same IP to multiple nodes)
-CURRENT_MACHINEID=$(cat /etc/machine-id 2>/dev/null)
-# Check if machine-id looks like it was cloned (all nodes would have the same one)
-if [ -n "$CURRENT_MACHINEID" ]; then
-    # Regenerate machine-id to get a unique one
-    rm -f /etc/machine-id
-    systemd-machine-id-setup 2>/dev/null || dbus-uuidgen --ensure=/etc/machine-id 2>/dev/null
-    NEW_MACHINEID=$(cat /etc/machine-id 2>/dev/null)
-    if [ "$CURRENT_MACHINEID" != "$NEW_MACHINEID" ]; then
-        echo -e "  ${GREEN}✓${NC} Regenerated machine-id (was cloned from image)"
-        echo -e "  ${YELLOW}!${NC} DHCP lease will renew with new unique ID — may get new LAN IP"
-    else
-        echo -e "  ${GREEN}✓${NC} machine-id unchanged"
-    fi
+    ok "Removed shared identity (was ${OLD_ID}…) — new identity on next start"
 fi
 
-# 4. Fix munge directories (required for SLURM authentication)
-echo -e "${YELLOW}[4/10] Fixing munge directories...${NC}"
-mkdir -p /etc/munge /var/lib/munge /var/run/munge /var/log/munge
-chmod 700 /etc/munge /var/lib/munge
-chmod 755 /var/run/munge
-chmod 700 /var/log/munge
-if id munge &>/dev/null; then
-    chown -R munge:munge /etc/munge /var/lib/munge /var/run/munge /var/log/munge 2>/dev/null || true
-    echo -e "  ${GREEN}✓${NC} Munge directories created with correct ownership"
+CURRENT_MID=$(cat /etc/machine-id 2>/dev/null || true)
+rm -f /etc/machine-id
+systemd-machine-id-setup 2>/dev/null || dbus-uuidgen --ensure=/etc/machine-id 2>/dev/null || true
+NEW_MID=$(cat /etc/machine-id 2>/dev/null || true)
+if [ "$CURRENT_MID" != "$NEW_MID" ]; then
+    ok "Regenerated machine-id (cloned image detected)"
+    warn "DHCP may assign a new LAN IP after reboot"
 else
-    echo -e "  ${YELLOW}!${NC} Munge user not found - run: apt-get install -y munge"
+    ok "machine-id unchanged"
 fi
 
-# Kill any stuck munge daemon
-pkill -9 munged 2>/dev/null || true
-rm -f /var/run/munge/munge.socket.2 2>/dev/null || true
+# ── 3. Config fixups ───────────────────────────────────────────────────────────
+step "3/10" "Config fixups"
 
-# 5. Kill stale K3s/etcd processes holding port 2380
-echo -e "${YELLOW}[5/10] Killing stale K3s/etcd processes on port 2380...${NC}"
-if ss -tlnp 2>/dev/null | grep -q ':2380 '; then
-    echo -e "  ${CYAN}→${NC} Port 2380 is in use, cleaning up..."
-    if [ -x /usr/local/bin/k3s-killall.sh ]; then
-        /usr/local/bin/k3s-killall.sh 2>/dev/null || true
-        echo -e "  ${GREEN}✓${NC} Ran k3s-killall.sh"
-    else
-        pkill -9 -f 'k3s server' 2>/dev/null || true
-        pkill -9 -f 'etcd' 2>/dev/null || true
-        echo -e "  ${GREEN}✓${NC} Killed stale K3s/etcd processes"
+NODE_YAML="/etc/clusteros/node.yaml"
+if [ -f "$NODE_YAML" ]; then
+    # bootstrap_nodes → bootstrap_peers (old key name)
+    if grep -q 'bootstrap_nodes:' "$NODE_YAML"; then
+        sed -i 's/bootstrap_nodes:/bootstrap_peers:/' "$NODE_YAML"
+        ok "Fixed config key: bootstrap_nodes → bootstrap_peers"
     fi
-    sleep 2
+    # Remove election_mode — daemon now always uses the Serf phase machine
+    if grep -q 'election_mode:' "$NODE_YAML"; then
+        sed -i '/election_mode:/d' "$NODE_YAML"
+        ok "Removed election_mode (daemon always uses Serf phase machine now)"
+    fi
+    # Inject cluster auth key if provided alongside this script
+    if [ -f "$SCRIPT_DIR/cluster.key" ]; then
+        CLUSTER_KEY=$(tr -d '[:space:]' < "$SCRIPT_DIR/cluster.key")
+        sed -i "s|auth_key:.*|auth_key: \"$CLUSTER_KEY\"|" "$NODE_YAML"
+        ok "Cluster auth key updated"
+    fi
+    ok "Config at $NODE_YAML looks good"
 else
-    echo -e "  ${GREEN}✓${NC} Port 2380 is free"
+    warn "No config at $NODE_YAML — node-agent will use defaults"
 fi
 
-# 6. Stop node-agent and clean stale cluster state
-echo -e "${YELLOW}[6/11] Stopping services and cleaning stale state...${NC}"
-systemctl stop node-agent 2>/dev/null || true
-systemctl stop k3s 2>/dev/null || true
-systemctl stop k3s-agent 2>/dev/null || true
-systemctl stop slurmd 2>/dev/null || true
-systemctl stop slurmctld 2>/dev/null || true
-systemctl stop munge 2>/dev/null || true
+# ── 4. Stop all services ───────────────────────────────────────────────────────
+step "4/10" "Stopping services"
+
+for svc in node-agent k3s k3s-agent slurmd slurmctld munge; do
+    systemctl stop "$svc" 2>/dev/null || true
+done
 sleep 1
-echo -e "  ${GREEN}✓${NC} Services stopped"
 
-# 6b. Mask SLURM systemd services (fixes DNS SRV lookup failure)
-# "disable" only removes WantedBy symlinks; "mask" symlinks to /dev/null and prevents
-# ALL activation. Without this, slurmd.service starts before slurm.conf exists and
-# falls back to configless mode → DNS SRV lookup → failure.
-# The node-agent manages slurmd/slurmctld/munged directly via exec.Command.
-echo -e "${YELLOW}[6b/11] Masking SLURM systemd services...${NC}"
-systemctl disable slurmd.service 2>/dev/null || true
-systemctl mask slurmd.service 2>/dev/null || true
-systemctl disable slurmctld.service 2>/dev/null || true
-systemctl mask slurmctld.service 2>/dev/null || true
-systemctl disable munge.service 2>/dev/null || true
-systemctl mask munge.service 2>/dev/null || true
-echo -e "  ${GREEN}✓${NC} Masked slurmd.service, slurmctld.service, munge.service"
-echo -e "  ${CYAN}→${NC} node-agent will manage these daemons directly"
+# Kill anything still holding cluster ports
+pkill -9 -f 'k3s server'  2>/dev/null || true
+pkill -9 -f 'k3s agent'   2>/dev/null || true
+pkill -9 munged            2>/dev/null || true
+pkill -9 slurmctld         2>/dev/null || true
+pkill -9 slurmd            2>/dev/null || true
+sleep 1
+ok "All services stopped"
 
-# Wipe stale K3s etcd data (cloned from image — has wrong member IPs)
-if [ -d /var/lib/rancher/k3s/server/db ]; then
-    rm -rf /var/lib/rancher/k3s/server/db
-    echo -e "  ${GREEN}✓${NC} Removed stale K3s etcd database (will reinitialize)"
-fi
-# Also wipe stale K3s agent state that references old node names
-if [ -d /var/lib/rancher/k3s/agent ]; then
-    rm -rf /var/lib/rancher/k3s/agent
-    echo -e "  ${GREEN}✓${NC} Removed stale K3s agent state"
-fi
+# Mask SLURM + munge systemd units — node-agent manages them directly via exec.
+# Without masking, systemd races node-agent and starts slurmd before slurm.conf exists.
+for svc in slurmd slurmctld munge; do
+    systemctl disable "$svc".service 2>/dev/null || true
+    systemctl mask    "$svc".service 2>/dev/null || true
+done
+ok "Masked slurmd / slurmctld / munge (node-agent manages these directly)"
 
-# Remove stale SLURM config (will be regenerated with correct NodeNames)
-if [ -f /etc/slurm/slurm.conf ]; then
-    rm -f /etc/slurm/slurm.conf
-    echo -e "  ${GREEN}✓${NC} Removed stale slurm.conf (will be regenerated)"
-fi
+# ── 5. Wipe stale state ────────────────────────────────────────────────────────
+step "5/10" "Wiping stale cluster state"
 
-# Clean Raft state (stale from cloned image)
+# Raft state — no longer used, always delete
 if [ -d /var/lib/cluster-os/raft ]; then
     rm -rf /var/lib/cluster-os/raft
-    echo -e "  ${GREEN}✓${NC} Removed stale Raft state"
+    ok "Removed stale Raft data"
 fi
-sleep 1
-echo -e "  ${GREEN}✓${NC} Stale state cleaned"
 
-# 7. Replace files
-echo -e "${YELLOW}[7/10] Installing patched files...${NC}"
+# K3s etcd — cloned images share the same member IPs; wipe so it reinitialises
+if [ -d /var/lib/rancher/k3s/server/db ]; then
+    rm -rf /var/lib/rancher/k3s/server/db
+    ok "Removed stale K3s etcd database"
+fi
+if [ -d /var/lib/rancher/k3s/agent ]; then
+    rm -rf /var/lib/rancher/k3s/agent
+    ok "Removed stale K3s agent state"
+fi
 
-# Backup originals
-mkdir -p /usr/local/bin/.clusteros-backup
-for f in node-agent cluster-status cluster-init; do
-    if [ -f "/usr/local/bin/$f" ]; then
-        cp "/usr/local/bin/$f" "/usr/local/bin/.clusteros-backup/$f.bak"
+# K3s IP-marker file used by the new server.go to detect node IP changes
+rm -f /var/lib/rancher/k3s/.cluster-os-ip 2>/dev/null || true
+
+# Stale slurm.conf — will be regenerated with the correct controller IP
+rm -f /etc/slurm/slurm.conf 2>/dev/null || true
+ok "Removed stale slurm.conf"
+
+# Serf status file — stale phase/leader values would confuse the new daemon
+rm -f /run/clusteros/status.json 2>/dev/null || true
+
+# Munge socket left behind by a crashed munged
+rm -f /var/run/munge/munge.socket.2 2>/dev/null || true
+
+# Stale Rancher Helm release (re-deployed by node-agent with correct auth config)
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+export KUBECONFIG
+if command -v helm &>/dev/null && [ -f "$KUBECONFIG" ]; then
+    if helm list -n cattle-system --kubeconfig "$KUBECONFIG" 2>/dev/null | grep -q rancher; then
+        helm uninstall rancher -n cattle-system --kubeconfig "$KUBECONFIG" 2>/dev/null || true
+        k3s kubectl delete ingress rancher -n cattle-system 2>/dev/null || true
+        ok "Removed stale Rancher Helm release (will re-deploy with correct config)"
     fi
-done
-echo -e "  ${GREEN}✓${NC} Backed up originals to /usr/local/bin/.clusteros-backup/"
-
-# Install new node-agent binary
-install -m 755 "$SCRIPT_DIR/node-agent" /usr/local/bin/node-agent
-echo -e "  ${GREEN}✓${NC} node-agent binary updated"
-
-# Install updated scripts
-install -m 755 "$SCRIPT_DIR/cluster-status" /usr/local/bin/cluster-status
-echo -e "  ${GREEN}✓${NC} cluster-status updated"
-
-install -m 755 "$SCRIPT_DIR/cluster-init" /usr/local/bin/cluster-init
-echo -e "  ${GREEN}✓${NC} cluster-init updated"
-
-if [ -f "$SCRIPT_DIR/cluster-test" ]; then
-    install -m 755 "$SCRIPT_DIR/cluster-test" /usr/local/bin/cluster-test
-    echo -e "  ${GREEN}✓${NC} cluster-test installed"
 fi
 
-if [ -f "$SCRIPT_DIR/cluster-dashboard" ]; then
-    install -m 755 "$SCRIPT_DIR/cluster-dashboard" /usr/local/bin/cluster-dashboard
-    echo -e "  ${GREEN}✓${NC} cluster-dashboard installed"
+ok "Stale state cleared"
+
+# ── 6. Munge directories ───────────────────────────────────────────────────────
+step "6/10" "Munge directories"
+
+mkdir -p /etc/munge /var/lib/munge /var/run/munge /var/log/munge
+chmod 700 /etc/munge /var/lib/munge /var/log/munge
+chmod 755 /var/run/munge
+if id munge &>/dev/null; then
+    chown -R munge:munge /etc/munge /var/lib/munge /var/run/munge /var/log/munge 2>/dev/null || true
+    ok "Munge directories ready (owned by munge:munge)"
+else
+    warn "munge user not found — install: apt-get install -y munge"
 fi
 
-if [ -f "$SCRIPT_DIR/cluster-setup-services" ]; then
-    install -m 755 "$SCRIPT_DIR/cluster-setup-services" /usr/local/bin/cluster-setup-services
-    echo -e "  ${GREEN}✓${NC} cluster-setup-services installed"
-fi
+# ── 7. Firewall ────────────────────────────────────────────────────────────────
+step "7/10" "Firewall rules"
 
-# Create status directory
+open_port() {
+    local port="$1" proto="${2:-tcp}"
+    if command -v ufw &>/dev/null; then
+        ufw allow "${port}/${proto}" &>/dev/null 2>&1 || true
+    fi
+    iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || \
+        iptables -A INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+}
+
+open_port 22    tcp   # SSH
+open_port 7946  tcp   # Serf gossip
+open_port 7946  udp
+open_port 6443  tcp   # K3s API
+open_port 6817  tcp   # slurmctld
+open_port 6818  tcp   # slurmd
+open_port 6819  tcp   # slurmdbd
+open_port 10250 tcp   # Kubelet
+open_port "2379:2380" tcp   # etcd
+open_port "30000:32767" tcp  # K8s NodePort range
+open_port "30000:32767" udp
+
+# Trust the Tailscale interface entirely — all traffic arriving on tailscale0
+# has already been authenticated and encrypted by Tailscale.  This covers
+# Serf gossip, K3s API, SLURM (6817/6818/6819), and K8s NodePorts without
+# needing per-port ufw rules for the overlay network.
+if command -v ufw &>/dev/null; then
+    ufw allow in on tailscale0 comment 'Tailscale overlay — all trusted' &>/dev/null 2>&1 || true
+    ufw allow in on ts0 comment 'Tailscale overlay (ts0 interface)' &>/dev/null 2>&1 || true
+fi
+# Also allow the Tailscale CGNAT range (100.64.0.0/10) in iptables for
+# kernels where the tailscale0 interface rule doesn't match.
+iptables -C INPUT -s 100.64.0.0/10 -j ACCEPT 2>/dev/null || \
+    iptables -I INPUT -s 100.64.0.0/10 -j ACCEPT 2>/dev/null || true
+
+ok "Firewall rules applied (including Tailscale interface trust)"
+
+# ── 8. Install files ───────────────────────────────────────────────────────────
+step "8/10" "Installing files"
+
 mkdir -p /run/clusteros
 chmod 755 /run/clusteros
 
-# Inject cluster auth key if provided
-if [ -f "$SCRIPT_DIR/cluster.key" ]; then
-    CLUSTER_KEY=$(cat "$SCRIPT_DIR/cluster.key" | tr -d '[:space:]')
-    sed -i "s|auth_key:.*|auth_key: \"$CLUSTER_KEY\"|" /etc/clusteros/node.yaml
-    echo -e "  ${GREEN}✓${NC} Cluster auth key updated"
-fi
+# Backup old binary
+mkdir -p /usr/local/bin/.clusteros-backup
+for f in node-agent cluster cluster-status cluster-test cluster-dashboard; do
+    [ -f "/usr/local/bin/$f" ] && cp "/usr/local/bin/$f" "/usr/local/bin/.clusteros-backup/${f}.bak" 2>/dev/null || true
+done
+ok "Backed up previous binaries"
 
-# 8. Restart node-agent
-echo -e "${YELLOW}[8/10] Restarting node-agent...${NC}"
-systemctl start node-agent
-sleep 3
+# node-agent binary — pick arch-specific if present, fall back to plain
+BINARY="$SCRIPT_DIR/node-agent"
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)         [ -f "$SCRIPT_DIR/node-agent-amd64" ] && BINARY="$SCRIPT_DIR/node-agent-amd64" ;;
+    aarch64|arm64)  [ -f "$SCRIPT_DIR/node-agent-arm64" ] && BINARY="$SCRIPT_DIR/node-agent-arm64" ;;
+esac
 
-if systemctl is-active --quiet node-agent; then
-    echo -e "  ${GREEN}✓${NC} node-agent running"
+if [ -f "$BINARY" ]; then
+    install -m 755 "$BINARY" /usr/local/bin/node-agent
+    ok "node-agent installed ($(uname -m))"
 else
-    echo -e "  ${RED}✗${NC} node-agent failed to start - check: journalctl -u node-agent -n 50"
+    err "No node-agent binary found in $SCRIPT_DIR — run 'make patch' first"
     exit 1
 fi
 
-# Verify status file appears
-sleep 2
-if [ -f /run/clusteros/status.json ]; then
-    MEMBERS=$(jq -r '.member_count' /run/clusteros/status.json 2>/dev/null)
-    echo -e "  ${GREEN}✓${NC} Status file created ($MEMBERS members)"
-else
-    echo -e "  ${YELLOW}!${NC} Status file not yet created (may take up to 10s)"
+# Unified cluster CLI
+if [ -f "$SCRIPT_DIR/cluster" ]; then
+    install -m 755 "$SCRIPT_DIR/cluster" /usr/local/bin/cluster
+    ok "cluster CLI installed  →  'cluster help' to get started"
 fi
 
-# 9. Verify munge is running
-echo -e "${YELLOW}[9/10] Verifying munge...${NC}"
-sleep 3
-if pgrep -x munged &>/dev/null; then
-    echo -e "  ${GREEN}✓${NC} Munge daemon running"
+# Legacy scripts (kept for backwards compat, superseded by 'cluster')
+for script in cluster-status cluster-test cluster-dashboard cluster-init cluster-setup-services; do
+    if [ -f "$SCRIPT_DIR/$script" ]; then
+        install -m 755 "$SCRIPT_DIR/$script" "/usr/local/bin/$script"
+    fi
+done
+ok "Legacy helper scripts installed"
+
+# ── 9. Start and verify ────────────────────────────────────────────────────────
+step "9/10" "Starting node-agent and verifying"
+
+systemctl start node-agent
+sleep 4
+
+if ! systemctl is-active --quiet node-agent; then
+    err "node-agent failed to start"
+    echo ""
+    journalctl -u node-agent -n 30 --no-pager
+    exit 1
+fi
+ok "node-agent is running"
+
+# Wait up to 15 s for the status file to appear
+for i in $(seq 1 15); do
+    [ -f /run/clusteros/status.json ] && break
+    sleep 1
+done
+
+if [ -f /run/clusteros/status.json ] && command -v jq &>/dev/null; then
+    PHASE=$(jq -r '.phase // "unknown"' /run/clusteros/status.json)
+    ok "Status file created  (phase=$PHASE)"
 else
-    echo -e "  ${YELLOW}!${NC} Munge not yet running (will start when SLURM role activates)"
+    warn "Status file not yet written — node-agent may still be starting"
 fi
 
-# 10. Verify K3s endpoint selection and SLURM fixes
-echo -e "${YELLOW}[10/10] Verifying K3s endpoint selection and SLURM fixes...${NC}"
-sleep 5
-if ss -tlnp 2>/dev/null | grep -q ':2380 '; then
-    echo -e "  ${GREEN}✓${NC} Port 2380 in use (K3s etcd started — expected if this node is a server)"
-else
-    echo -e "  ${GREEN}✓${NC} Port 2380 free (K3s will bind it when elected as server)"
-fi
+# ── Summary ────────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${GREEN}${BOLD}Patch applied successfully on $(hostname)!${NC}"
+echo ""
+echo -e "${CYAN}What happens next (automatic):${NC}"
+echo "  ~0 s   New node-agent starts, Serf joins Tailscale peers"
+echo "  ~5 s   Cluster membership gossip stabilises, leader elected"
+echo "         (leader = node with lexicographically lowest hostname)"
+echo "  ~10 s  Leader: starts K3s server, generates munge key,"
+echo "         publishes k3s-server / k3s-token / munge-key Serf tags"
+echo "  ~4 min Leader: K3s API ready, slurmctld started, phase=ready published"
+echo "  <30 s  Workers: read tags, start K3s agent + slurmd automatically"
+echo "  +5 min Leader: Longhorn, nginx-ingress, Rancher, slurmdbd deployed"
+echo ""
+echo -e "${CYAN}Monitor progress:${NC}"
+echo "  journalctl -fu node-agent          # live daemon log"
+echo "  watch -n2 'cluster status'         # cluster state every 2 s"
+echo "  cluster dash                        # live dashboard"
+echo ""
+echo -e "${CYAN}Once phase=ready:${NC}"
+echo "  cluster test all                    # SLURM + K3s + MPI integration tests"
+echo "  cluster ui                          # print all web UI URLs"
+echo ""
+echo -e "${YELLOW}Rollout note:${NC}"
+echo "  Patch remaining nodes within a few minutes so old and new daemons"
+echo "  do not talk to each other for long.  The phase machine handles"
+echo "  any join order gracefully once all nodes run the same version."
 
-if pgrep -x slurmd &>/dev/null; then
-    echo -e "  ${GREEN}✓${NC} slurmd is running"
-elif [ -f /etc/slurm/slurm.conf ]; then
-    echo -e "  ${YELLOW}!${NC} slurm.conf exists but slurmd not yet running (will start on next health check)"
-else
-    echo -e "  ${YELLOW}!${NC} Waiting for controller to generate slurm.conf (normal on fresh start)"
-fi
+# ── 10. Reboot ─────────────────────────────────────────────────────────────────
+step "10/10" "Scheduling reboot"
 
+# A reboot ensures:
+#   • iscsid / multipathd kernel modules are fully loaded (required by Longhorn)
+#   • machine-id change is picked up by DHCP / Tailscale
+#   • any stale K3s / Serf file locks are cleared
+#   • node-agent starts fresh with the new binary under systemd supervision
 echo ""
-echo -e "${GREEN}Patch applied successfully!${NC}"
+echo -e "${CYAN}${BOLD}This node will reboot in 10 seconds.${NC}"
+echo "  Interrupt with Ctrl-C if you need to stay online, then reboot manually."
 echo ""
-echo -e "${YELLOW}What happens next:${NC}"
-echo "  1. node-agent generates a new unique identity (immediate)"
-echo "  2. Tailscale peer discovery finds other nodes (~15 seconds)"
-echo "  3. Serf cluster assembles, leader elected (~30 seconds)"
-echo "  4. Leader generates slurm.conf and starts slurmctld"
-echo "  5. Workers receive config and start slurmd with explicit -N <nodename>"
-echo "  6. K3s server starts on leader with fresh etcd (stale processes killed first)"
+
+# Give the operator a brief window to cancel.
+REBOOT_DELAY=10
+for i in $(seq "$REBOOT_DELAY" -1 1); do
+    printf "\r  Rebooting in %2d s ...  (Ctrl-C to cancel)" "$i"
+    sleep 1
+done
 echo ""
-echo -e "${YELLOW}Fixes included:${NC}"
-echo "  - K3s: kills orphaned etcd processes on port 2380 before starting"
-echo "  - SLURM: slurmd receives explicit -N <nodename> matching slurm.conf"
-echo "  - SLURM: masked slurmd/slurmctld/munge systemd services (fixes DNS SRV error)"
-echo "  - Munge: directories created with correct ownership"
-echo "  - Identity: regenerated to avoid cloned-image conflicts"
-echo ""
-echo "Monitor: journalctl -fu node-agent"
-echo "Check:   cluster-status"
+ok "Rebooting now"
+systemctl reboot

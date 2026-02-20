@@ -30,36 +30,41 @@ all: deps fmt node test
 help:
 	@echo "Cluster-OS Build System"
 	@echo ""
+	@echo "Rollout Targets:"
+	@echo "  make patch        - Build binary + stage patch/ folder (run before deploy)"
+	@echo "  make patch-cross  - Cross-compile for amd64 + arm64"
+	@echo "  make deploy       - SCP patch/ to nodes and run apply-patch.sh"
+	@echo "                      NODES='IP1 IP2 ...'  (auto-detected via tailscale if omitted)"
+	@echo "                      SSH_USER=clusteros   (default)"
+	@echo "  make deploy-status- Quick phase/leader/member check across all nodes"
+	@echo ""
 	@echo "Build Targets:"
-	@echo "  make node         - Build node-agent binary"
+	@echo "  make node         - Build node-agent binary (local arch)"
 	@echo "  make image        - Build OS image with Packer (requires Packer & QEMU)"
 	@echo "  make usb          - Create USB installer image"
-	@echo "  make release      - Create release artifacts"
+	@echo "  make release      - Create release artifacts (amd64 + arm64)"
 	@echo ""
-	@echo "Test Targets (Docker - Limited):"
+	@echo "Test Targets (Docker):"
 	@echo "  make test         - Run unit tests"
 	@echo "  make test-cluster - Start Docker multi-node test cluster"
 	@echo "  make test-slurm   - Test SLURM integration only"
 	@echo "  make test-k3s     - Test K3s integration only"
-	@echo "  make test-full    - Run full integration test suite (SLURM + K3s)"
+	@echo "  make test-full    - Full integration suite (SLURM + K3s)"
 	@echo ""
-	@echo "Test Targets (QEMU VMs - Full systemd support):"
+	@echo "Test Targets (QEMU VMs):"
 	@echo "  make test-vm      - Start QEMU VM cluster (3 nodes)"
 	@echo "  make test-vm-5    - Start QEMU VM cluster (5 nodes)"
 	@echo "  make vm-status    - Show VM cluster status"
 	@echo "  make vm-stop      - Stop VM cluster"
 	@echo "  make vm-clean     - Stop and remove all VM data"
 	@echo ""
-	@echo "Development Targets:"
+	@echo "Development:"
 	@echo "  make fmt          - Format Go code"
 	@echo "  make lint         - Lint Go code"
 	@echo "  make deps         - Download Go dependencies"
 	@echo "  make clean        - Clean build artifacts"
-	@echo "  make help         - Show this help message"
 	@echo ""
-	@echo "Version: $(VERSION)"
-	@echo "Commit: $(COMMIT)"
-	@echo "Build Time: $(BUILD_TIME)"
+	@echo "Version: $(VERSION)  Commit: $(COMMIT)  Built: $(BUILD_TIME)"
 
 deps:
 	@echo "Downloading dependencies..."
@@ -218,6 +223,63 @@ usb: image
 	@echo "Write to USB with:"
 	@echo "  sudo dd if=dist/cluster-os-usb.img of=/dev/sdX bs=4M status=progress"
 	@echo ""
+
+# patch — build binary for the local arch and stage the complete patch folder.
+# Run this before 'make deploy'.
+patch: node
+	@echo "Staging patch folder..."
+	@cp bin/$(BINARY_NAME) patch/$(BINARY_NAME)
+	@chmod +x patch/cluster patch/apply-patch.sh
+	@echo ""
+	@echo "Patch staged:"
+	@ls -lh patch/
+	@echo ""
+	@echo "Deploy with:  make deploy NODES='100.x.x.1 100.x.x.2'"
+	@echo "Or manually:  scp -r patch/ clusteros@<ip>:~/patch/ && ssh clusteros@<ip> 'sudo bash ~/patch/apply-patch.sh'"
+
+# patch-cross — cross-compile for amd64 and arm64 then pick the right one.
+patch-cross:
+	@echo "Cross-compiling node-agent for amd64 and arm64..."
+	@mkdir -p bin
+	cd $(NODE_DIR) && GOOS=linux GOARCH=amd64 $(GO) build $(LDFLAGS) -o ../bin/$(BINARY_NAME)-amd64 ./cmd/node-agent
+	cd $(NODE_DIR) && GOOS=linux GOARCH=arm64 $(GO) build $(LDFLAGS) -o ../bin/$(BINARY_NAME)-arm64 ./cmd/node-agent
+	@echo "Binaries: bin/$(BINARY_NAME)-amd64  bin/$(BINARY_NAME)-arm64"
+	@echo "Copy the right one to patch/node-agent before running make deploy."
+
+# deploy — scp the patch folder to each node and run apply-patch.sh.
+# Usage:  make deploy NODES="100.x.x.1 100.x.x.2 100.x.x.3"
+#   or:   make deploy  (reads Tailscale peer IPs automatically)
+NODES ?= $(shell tailscale status --json 2>/dev/null | \
+	python3 -c "import sys,json; peers=json.load(sys.stdin).get('Peer',{}); \
+	[print(p['TailscaleIPs'][0]) for p in peers.values() if p.get('Online') and p.get('TailscaleIPs')]" 2>/dev/null)
+SSH_USER ?= clusteros
+
+deploy: patch
+	@if [ -z "$(NODES)" ]; then \
+		echo "Error: No nodes specified. Use: make deploy NODES='IP1 IP2 IP3'"; \
+		echo "Or ensure tailscale is running so peers are auto-detected."; \
+		exit 1; \
+	fi
+	@echo "Deploying to: $(NODES)"
+	@for node in $(NODES); do \
+		echo ""; \
+		echo "==> $$node"; \
+		scp -r -o StrictHostKeyChecking=no patch/ $(SSH_USER)@$$node:~/patch/ && \
+		ssh -o StrictHostKeyChecking=no $(SSH_USER)@$$node 'sudo bash ~/patch/apply-patch.sh' || \
+		echo "WARNING: deploy to $$node failed"; \
+	done
+	@echo ""
+	@echo "Deploy complete. Check: make deploy-status"
+
+# deploy-status — quick status check across all nodes after deploy.
+deploy-status:
+	@if [ -z "$(NODES)" ]; then echo "No nodes (set NODES=...)"; exit 1; fi
+	@for node in $(NODES); do \
+		printf "%-20s " "$$node:"; \
+		ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 $(SSH_USER)@$$node \
+			"cluster status 2>/dev/null | grep -E 'Phase|Members|Leader' | tr '\n' ' '" 2>/dev/null || \
+		echo "(unreachable)"; \
+	done
 
 release: clean node test
 	@echo "Creating release artifacts..."

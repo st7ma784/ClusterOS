@@ -1,0 +1,556 @@
+#!/bin/bash
+# ClusterOS unified cluster management tool
+# Usage: cluster <command> [options]
+#
+# Commands:
+#   status          Snapshot of node and cluster state
+#   dash [--interval N] [--once]   Live dashboard (refreshes every N seconds, default 5)
+#   test [all|slurm|k3s|mpi|quick] Integration tests
+#   logs [service]  Tail logs (node-agent|k3s|slurm|munge)
+#   ui              Print all web UI URLs
+#   help            This help text
+
+set -uo pipefail
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+STATUS_FILE="/run/clusteros/status.json"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+status_field() {
+    local field="$1" default="${2:-N/A}"
+    if [ -f "$STATUS_FILE" ] && command -v jq &>/dev/null; then
+        local val
+        val=$(jq -r ".$field // empty" "$STATUS_FILE" 2>/dev/null)
+        echo "${val:-$default}"
+    else
+        echo "$default"
+    fi
+}
+
+svc_icon() {
+    local svc="$1"
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        echo -e "${GREEN}●${NC}"
+    elif pgrep -f "$svc" &>/dev/null; then
+        echo -e "${GREEN}●${NC} (process)"
+    else
+        echo -e "${RED}○${NC}"
+    fi
+}
+
+phase_colour() {
+    local phase="${1:-unknown}"
+    case "$phase" in
+        ready)        echo -e "${GREEN}${phase}${NC}" ;;
+        provisioning) echo -e "${YELLOW}${phase}${NC}" ;;
+        joining)      echo -e "${YELLOW}${phase}${NC}" ;;
+        *)            echo -e "${DIM}${phase}${NC}" ;;
+    esac
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster status
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    echo -e "${CYAN}${BOLD}═══ ClusterOS Status ═══${NC}"
+    echo ""
+
+    # This node
+    echo -e "${YELLOW}${BOLD} This Node${NC}"
+    echo    "  Hostname:     $(hostname 2>/dev/null || echo N/A)"
+    echo    "  Local IP:     $(hostname -I 2>/dev/null | awk '{print $1}' || echo N/A)"
+    local ts_ip
+    ts_ip=$(tailscale ip -4 2>/dev/null || echo N/A)
+    echo    "  Tailscale IP: $ts_ip"
+    echo    "  Uptime:       $(uptime -p 2>/dev/null || uptime)"
+    echo ""
+
+    # Cluster phase
+    local phase leader is_leader members
+    phase=$(status_field "phase" "unknown")
+    leader=$(status_field "leader" "unknown")
+    is_leader=$(status_field "is_leader" "false")
+    members=$(status_field "member_count" "0")
+
+    echo -e "${YELLOW}${BOLD} Cluster State${NC}"
+    echo -e "  Phase:        $(phase_colour "$phase")"
+    echo    "  Members:      $members"
+    echo    "  Leader:       $leader"
+    if [ "$is_leader" = "true" ]; then
+        echo -e "  Role:         ${GREEN}LEADER${NC}"
+    else
+        echo -e "  Role:         worker"
+    fi
+    echo ""
+
+    # Services
+    echo -e "${YELLOW}${BOLD} Services${NC}"
+    echo -e "  node-agent:   $(svc_icon node-agent)"
+
+    if pgrep -f 'k3s server' &>/dev/null; then
+        local k3s_nodes
+        k3s_nodes=$(k3s kubectl get nodes --no-headers 2>/dev/null | wc -l || echo "?")
+        echo -e "  k3s server:   ${GREEN}● $k3s_nodes node(s)${NC}"
+    elif pgrep -f 'k3s agent' &>/dev/null; then
+        echo -e "  k3s agent:    ${GREEN}●${NC}"
+    else
+        echo -e "  k3s:          ${YELLOW}○ not running${NC}"
+    fi
+
+    if pgrep -x slurmctld &>/dev/null; then
+        local jobs
+        jobs=$(squeue --noheader 2>/dev/null | wc -l || echo "?")
+        echo -e "  slurmctld:    ${GREEN}● ($jobs jobs)${NC}"
+    else
+        echo -e "  slurmctld:    ${YELLOW}○ not running${NC}"
+    fi
+
+    if pgrep -x slurmd &>/dev/null; then
+        echo -e "  slurmd:       ${GREEN}●${NC}"
+    else
+        echo -e "  slurmd:       ${YELLOW}○ not running${NC}"
+    fi
+
+    if pgrep -x munged &>/dev/null; then
+        echo -e "  munged:       ${GREEN}●${NC}"
+    else
+        echo -e "  munged:       ${YELLOW}○ not running${NC}"
+    fi
+    echo ""
+
+    # Cluster members list
+    if [ -f "$STATUS_FILE" ] && command -v jq &>/dev/null; then
+        echo -e "${YELLOW}${BOLD} Cluster Members${NC}"
+        jq -r '.members[]? | "  \(.name)\t\(.addr)\t\(.status)\t\(.phase // "?")"' \
+            "$STATUS_FILE" 2>/dev/null | column -t -s $'\t' || true
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster dash
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_dash() {
+    local interval=5 once=false
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --interval|-i) interval="$2"; shift 2 ;;
+            --once)        once=true; shift ;;
+            *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    render_dash() {
+        local cols
+        cols=$(tput cols 2>/dev/null || echo 80)
+        local line
+        line=$(printf '─%.0s' $(seq 1 "$cols"))
+
+        clear
+        echo -e "${CYAN}${BOLD}  ClusterOS Dashboard${NC}  ${DIM}$(date '+%Y-%m-%d %H:%M:%S')  refresh:${interval}s  Ctrl-C to exit${NC}"
+        echo -e "${CYAN}${line}${NC}"
+
+        # ── Cluster State ──
+        local phase leader is_leader members
+        phase=$(status_field "phase" "unknown")
+        leader=$(status_field "leader" "unknown")
+        is_leader=$(status_field "is_leader" "false")
+        members=$(status_field "member_count" "0")
+
+        echo -e "\n${YELLOW}${BOLD} Cluster State${NC}"
+        local role_label="worker"
+        [ "$is_leader" = "true" ] && role_label="${GREEN}LEADER${NC}"
+        echo -e "  Phase: $(phase_colour "$phase")   Members: ${members}   Leader: ${leader}   Role: ${role_label}"
+
+        # ── This Node ──
+        echo -e "\n${YELLOW}${BOLD} This Node${NC}"
+        echo    "  $(hostname)  |  $(hostname -I 2>/dev/null | awk '{print $1}' || echo N/A)  |  Tailscale: $(tailscale ip -4 2>/dev/null || echo N/A)  |  $(uptime -p 2>/dev/null || echo '')"
+
+        # ── Cluster Members ──
+        echo -e "\n${YELLOW}${BOLD} Members${NC}"
+        if [ -f "$STATUS_FILE" ] && command -v jq &>/dev/null; then
+            jq -r '.members[]? | "  \(.status)  \(.name)\t\(.addr)\tphase:\(.phase // "?")"' \
+                "$STATUS_FILE" 2>/dev/null | \
+                sed "s/^  alive/  ${GREEN}●${NC}/;s/^  failed/  ${RED}○${NC}/;s/^  leaving/  ${YELLOW}○${NC}/" | \
+                column -t -s $'\t' || true
+        else
+            echo "  (status file not available)"
+        fi
+
+        # ── Tailscale Peers ──
+        echo -e "\n${YELLOW}${BOLD} Tailscale Peers${NC}"
+        if command -v tailscale &>/dev/null; then
+            tailscale status 2>/dev/null | grep -v '^#\|offers\|^$' | head -10 | \
+                awk '{printf "  %-18s %-20s %s\n", $1, $2, $NF}' || true
+        else
+            echo "  (tailscale not available)"
+        fi
+
+        # ── SLURM ──
+        echo -e "\n${YELLOW}${BOLD} SLURM${NC}"
+        if pgrep -x slurmctld &>/dev/null || pgrep -x slurmd &>/dev/null; then
+            local squeue_out squeue_err
+            squeue_out=$(squeue --format="  %-10i %-10u %-10j %-8T %-8r" 2>/tmp/.cluster_squeue_err | head -6)
+            squeue_err=$(cat /tmp/.cluster_squeue_err 2>/dev/null | head -1 | sed 's/squeue: error: //')
+            if [ -n "$squeue_err" ]; then
+                echo -e "  ${YELLOW}squeue: ${squeue_err}${NC}"
+                pgrep -x munged &>/dev/null || echo -e "  ${RED}munged not running — munge auth will fail${NC}"
+            else
+                echo "${squeue_out:-(no jobs)}"
+            fi
+            echo ""
+            sinfo --format="  %-12P %-6D %-10T %-10C" 2>/dev/null | head -5 || true
+        else
+            echo -e "  ${YELLOW}○ SLURM not running${NC}"
+        fi
+
+        # ── K3s Workloads ──
+        echo -e "\n${YELLOW}${BOLD} K3s${NC}"
+        if pgrep -f 'k3s server' &>/dev/null; then
+            k3s kubectl get nodes --no-headers 2>/dev/null | \
+                awk '{printf "  %-20s %-10s %s\n", $1, $2, $5}' | head -6 || true
+            echo ""
+            k3s kubectl get pods -A --no-headers 2>/dev/null | \
+                awk '{printf "  %-20s %-30s %-10s\n", $1, $2, $4}' | head -8 || true
+        elif pgrep -f 'k3s agent' &>/dev/null; then
+            echo -e "  ${GREEN}● k3s agent connected${NC}"
+        else
+            echo -e "  ${YELLOW}○ k3s not running${NC}"
+        fi
+
+        # ── Web UIs ──
+        echo -e "\n${YELLOW}${BOLD} Web UIs${NC}"
+        local local_ip
+        local_ip=$(tailscale ip -4 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo localhost)
+        echo "  Rancher:       https://${local_ip}:30444"
+        echo "  Longhorn:      http://${local_ip}:30900"
+        echo "  SLURM REST:    http://${local_ip}:30819"
+        echo "  Ingress HTTP:  http://${local_ip}:30080"
+        echo "  Ingress HTTPS: https://${local_ip}:30443"
+
+        # ── System Resources ──
+        echo -e "\n${YELLOW}${BOLD} System Resources${NC}"
+        local load mem_total mem_avail mem_used_pct disk_used_pct
+        load=$(uptime | awk -F'load average:' '{print $2}' | xargs)
+        mem_total=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+        mem_avail=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+        if [ "$mem_total" -gt 0 ] 2>/dev/null; then
+            mem_used_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
+        else
+            mem_used_pct="?"
+        fi
+        disk_used_pct=$(df -h / 2>/dev/null | awk 'NR==2{print $5}' | tr -d '%' || echo "?")
+        echo "  Load: ${load}   RAM used: ${mem_used_pct}%   Disk /: ${disk_used_pct}%"
+    }
+
+    if [ "$once" = "true" ]; then
+        render_dash
+    else
+        while true; do
+            render_dash
+            sleep "$interval"
+        done
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster test
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_test() {
+    local mode="${1:-all}"
+
+    PASS=0; FAIL=0; SKIP=0
+
+    pass() { echo -e "  ${GREEN}✓ PASS${NC}: $1"; ((PASS++)); }
+    fail() { echo -e "  ${RED}✗ FAIL${NC}: $1"; ((FAIL++)); }
+    skip() { echo -e "  ${YELLOW}○ SKIP${NC}: $1"; ((SKIP++)); }
+    header() { echo -e "\n${CYAN}=== $1 ===${NC}"; }
+
+    # Prerequisites
+    check_prereqs() {
+        header "Prerequisites"
+        systemctl is-active --quiet node-agent 2>/dev/null \
+            && pass "node-agent running" || fail "node-agent not running"
+
+        tailscale ip -4 &>/dev/null \
+            && pass "Tailscale connected ($(tailscale ip -4))" || fail "Tailscale not connected"
+
+        local members
+        members=$(status_field "member_count" "0")
+        [ "$members" -gt 0 ] 2>/dev/null \
+            && pass "Cluster joined ($members members)" || fail "Not joined (members=$members)"
+
+        local phase
+        phase=$(status_field "phase" "unknown")
+        [ "$phase" = "ready" ] \
+            && pass "Cluster phase: ready" || fail "Cluster phase: $phase (want: ready)"
+    }
+
+    # SLURM tests
+    test_slurm() {
+        header "SLURM"
+        command -v sinfo &>/dev/null  || { skip "sinfo not available"; return; }
+        command -v sbatch &>/dev/null || { skip "sbatch not available"; return; }
+
+        pgrep -x slurmctld &>/dev/null || pgrep -x slurmd &>/dev/null \
+            && pass "SLURM daemon running" || fail "No SLURM daemon running"
+
+        sinfo &>/dev/null \
+            && pass "sinfo responds" || fail "sinfo failed"
+
+        # Simple job
+        local tmpdir
+        tmpdir=$(mktemp -d)
+        cat >"$tmpdir/test.sh" <<'EOF'
+#!/bin/bash
+#SBATCH --job-name=cluster-test
+#SBATCH --output=/tmp/cluster-test-%j.out
+#SBATCH --time=00:01:00
+#SBATCH --ntasks=1
+echo "SLURM test OK on $(hostname)"
+EOF
+        local jobid
+        jobid=$(sbatch "$tmpdir/test.sh" 2>/dev/null | awk '{print $NF}')
+        if [ -n "$jobid" ] && [ "$jobid" -gt 0 ] 2>/dev/null; then
+            pass "Job submitted (id=$jobid)"
+            # Wait for completion (max 60s)
+            local waited=0
+            while [ $waited -lt 60 ]; do
+                local state
+                state=$(squeue -j "$jobid" --noheader 2>/dev/null | awk '{print $5}')
+                [ -z "$state" ] && break
+                sleep 3; ((waited+=3))
+            done
+            if grep -q "SLURM test OK" "/tmp/cluster-test-${jobid}.out" 2>/dev/null; then
+                pass "Job output correct"
+            else
+                fail "Job output missing or wrong"
+            fi
+            scancel "$jobid" 2>/dev/null || true
+        else
+            fail "Job submission failed"
+        fi
+        rm -rf "$tmpdir"
+    }
+
+    # MPI tests
+    test_mpi() {
+        header "MPI"
+        command -v mpirun &>/dev/null || { skip "mpirun not available"; return; }
+
+        # Quick mpi hello
+        local tmpdir
+        tmpdir=$(mktemp -d)
+        cat >"$tmpdir/hello.c" <<'EOF'
+#include <mpi.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    printf("MPI rank %d of %d on %s\n", rank, size, getenv("HOSTNAME") ? getenv("HOSTNAME") : "?");
+    MPI_Finalize();
+    return 0;
+}
+EOF
+        if mpicc "$tmpdir/hello.c" -o "$tmpdir/hello" 2>/dev/null; then
+            pass "MPI compile"
+            local out
+            out=$(mpirun -np 2 "$tmpdir/hello" 2>/dev/null)
+            echo "$out" | grep -q "MPI rank" \
+                && pass "MPI run (2 ranks)" || fail "MPI run failed"
+        else
+            fail "MPI compile failed"
+        fi
+        rm -rf "$tmpdir"
+    }
+
+    # K3s tests
+    test_k3s() {
+        header "K3s / Kubernetes"
+        command -v kubectl &>/dev/null || command -v k3s &>/dev/null \
+            || { skip "kubectl/k3s not available"; return; }
+
+        local kctl="kubectl"
+        command -v kubectl &>/dev/null || kctl="k3s kubectl"
+
+        $kctl cluster-info &>/dev/null \
+            && pass "kubectl cluster-info" || fail "kubectl cluster-info failed"
+
+        $kctl get nodes &>/dev/null \
+            && pass "kubectl get nodes" || fail "kubectl get nodes failed"
+
+        # Test pod scheduling
+        local pod_name="cluster-test-$(date +%s)"
+        $kctl run "$pod_name" \
+            --image=busybox --restart=Never \
+            --command -- sh -c "echo K3s OK" &>/dev/null
+
+        local waited=0
+        while [ $waited -lt 60 ]; do
+            local phase
+            phase=$($kctl get pod "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null)
+            [ "$phase" = "Succeeded" ] && break
+            sleep 3; ((waited+=3))
+        done
+
+        local logs
+        logs=$($kctl logs "$pod_name" 2>/dev/null)
+        echo "$logs" | grep -q "K3s OK" \
+            && pass "Pod scheduling and execution" || fail "Pod test failed"
+
+        $kctl delete pod "$pod_name" --grace-period=0 2>/dev/null || true
+    }
+
+    # Quick smoke test
+    test_quick() {
+        header "Quick Smoke Tests"
+        local phase leader members
+        phase=$(status_field "phase" "unknown")
+        leader=$(status_field "leader" "unknown")
+        members=$(status_field "member_count" "0")
+
+        [ "$phase" = "ready" ]   && pass "Phase=ready"  || fail "Phase=$phase"
+        [ "$members" -gt 0 ] 2>/dev/null && pass "$members member(s)" || fail "No cluster members"
+        [ "$leader" != "unknown" ] && pass "Leader: $leader" || fail "No leader elected"
+        pgrep -x munged &>/dev/null && pass "munged running" || fail "munged not running"
+    }
+
+    # Run selected tests
+    check_prereqs
+
+    case "$mode" in
+        all)   test_quick; test_slurm; test_mpi; test_k3s ;;
+        slurm) test_slurm ;;
+        mpi)   test_mpi ;;
+        k3s)   test_k3s ;;
+        quick) test_quick ;;
+        *)     echo "Unknown test mode: $mode"; echo "Use: all|slurm|k3s|mpi|quick"; exit 1 ;;
+    esac
+
+    echo ""
+    echo -e "${CYAN}Results:${NC}  ${GREEN}PASS: $PASS${NC}  ${RED}FAIL: $FAIL${NC}  ${YELLOW}SKIP: $SKIP${NC}"
+    [ "$FAIL" -eq 0 ]
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster logs
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_logs() {
+    local svc="${1:-node-agent}"
+    case "$svc" in
+        node-agent|agent)
+            journalctl -u node-agent -f --no-hostname 2>/dev/null || \
+                tail -f /var/log/cluster-os/node-agent.log 2>/dev/null || \
+                echo "No logs found for node-agent"
+            ;;
+        k3s|k3s-server)
+            tail -f /var/log/k3s.log 2>/dev/null || \
+                journalctl -u k3s -f --no-hostname 2>/dev/null || \
+                echo "No k3s logs found"
+            ;;
+        slurm|slurmctld)
+            tail -f /var/log/slurm/slurmctld.log 2>/dev/null || echo "No slurmctld log"
+            ;;
+        slurmd)
+            tail -f /var/log/slurm/slurmd.log 2>/dev/null || echo "No slurmd log"
+            ;;
+        munge|munged)
+            tail -f /var/log/munge/munged.log 2>/dev/null || echo "No munge log"
+            ;;
+        *)
+            echo "Unknown service: $svc"
+            echo "Available: node-agent, k3s, slurm, slurmd, munge"
+            exit 1
+            ;;
+    esac
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster ui
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_ui() {
+    local ip
+    ip=$(tailscale ip -4 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo localhost)
+
+    echo -e "${CYAN}${BOLD}═══ ClusterOS Web UIs ═══${NC}"
+    echo ""
+    echo -e "${YELLOW}Kubernetes / Cluster Management${NC}"
+    echo    "  Rancher:       https://${ip}:30444"
+    echo ""
+    echo -e "${YELLOW}Storage${NC}"
+    echo    "  Longhorn:      http://${ip}:30900"
+    echo ""
+    echo -e "${YELLOW}HPC / SLURM${NC}"
+    echo    "  SLURM REST:    http://${ip}:30819"
+    echo ""
+    echo -e "${YELLOW}Ingress${NC}"
+    echo    "  HTTP:          http://${ip}:30080"
+    echo    "  HTTPS:         https://${ip}:30443"
+    echo ""
+    echo -e "${DIM}Note: services become available a few minutes after cluster reaches 'ready' phase.${NC}"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster help
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+    echo -e "${CYAN}${BOLD}cluster — ClusterOS management tool${NC}"
+    echo ""
+    echo "Usage: cluster <command> [options]"
+    echo ""
+    echo -e "${YELLOW}Commands:${NC}"
+    echo "  status                   Snapshot of node, cluster, and service state"
+    echo "  dash [--interval N]      Live dashboard (default refresh: 5s)"
+    echo "        [--once]           Print one snapshot and exit"
+    echo "  test [all|slurm|k3s|mpi|quick]"
+    echo "                           Run integration tests (default: all)"
+    echo "  logs [service]           Tail logs: node-agent|k3s|slurm|slurmd|munge"
+    echo "  ui                       Print all web UI URLs"
+    echo "  help                     This help text"
+    echo ""
+    echo -e "${YELLOW}Quick status:${NC}"
+    # Inline quick status
+    local phase leader members
+    phase=$(status_field "phase" "unknown")
+    leader=$(status_field "leader" "unknown")
+    members=$(status_field "member_count" "0")
+    echo -e "  Phase: $(phase_colour "$phase")   Members: ${members}   Leader: ${leader}"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Dispatch
+# ──────────────────────────────────────────────────────────────────────────────
+
+CMD="${1:-help}"
+shift || true
+
+case "$CMD" in
+    status)  cmd_status ;;
+    dash)    cmd_dash "$@" ;;
+    test)    cmd_test "$@" ;;
+    logs)    cmd_logs "$@" ;;
+    ui)      cmd_ui ;;
+    help|-h|--help) cmd_help ;;
+    *)
+        echo -e "${RED}Unknown command: $CMD${NC}"
+        echo "Run: cluster help"
+        exit 1
+        ;;
+esac

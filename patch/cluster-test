@@ -80,7 +80,8 @@ test_slurm() {
         pass "sinfo: cluster reachable ($NODES node(s))"
     else
         fail "sinfo: cannot reach SLURM controller"
-        echo -e "    ${YELLOW}Hint: Check 'systemctl status slurmctld' on the controller node${NC}"
+        echo -e "    ${YELLOW}Hint: Check 'journalctl -u node-agent -n 50' on the controller node${NC}"
+        echo -e "    ${YELLOW}      SLURM is managed by node-agent, not systemd${NC}"
         return
     fi
 
@@ -275,13 +276,13 @@ test_k3s() {
     if sudo k3s kubectl cluster-info &>/dev/null 2>&1; then
         pass "K3s API server reachable"
     else
-        # Maybe we're an agent, not a server
-        if systemctl is-active --quiet k3s-agent 2>/dev/null; then
+        # Maybe we're an agent, not a server (node-agent manages k3s, not systemd)
+        if pgrep -f 'k3s agent' &>/dev/null; then
             skip "This is a K3s agent node (no local API)"
             return
         fi
         fail "K3s API server not reachable"
-        echo -e "    ${YELLOW}Hint: Check 'systemctl status k3s'${NC}"
+        echo -e "    ${YELLOW}Hint: Check 'journalctl -u node-agent -n 50' for k3s errors${NC}"
         return
     fi
 
@@ -394,7 +395,7 @@ summary() {
         echo -e "${RED}Some tests failed.${NC} Check the output above for details."
         echo "Useful debug commands:"
         echo "  journalctl -u node-agent -n 50"
-        echo "  journalctl -u slurmctld -n 50"
+        echo "  pgrep -a slurmctld; pgrep -a slurmd"
         echo "  sudo k3s kubectl get pods -A"
         exit 1
     else

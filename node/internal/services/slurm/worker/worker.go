@@ -5,342 +5,155 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/cluster-os/node/internal/roles"
 	"github.com/cluster-os/node/internal/services/slurm/auth"
-	"github.com/cluster-os/node/internal/state"
 	"github.com/sirupsen/logrus"
 )
 
-// SLURMWorker implements the SLURM worker role
+// SLURMWorker manages the slurmd daemon on worker nodes.
+// All required data (controllerIP, mungeKey, nodeIP) are passed at construction
+// by the phase machine — no cluster-state lookups, no retry loops.
 type SLURMWorker struct {
 	*roles.BaseRole
-	config          *Config
-	clusterState    *state.ClusterState
+	controllerIP    string
+	mungeKey        []byte
+	nodeIP          string
 	slurmdCmd       *exec.Cmd
 	mungeKeyManager *auth.MungeKeyManager
-	configPath      string
-	spoolPath       string
 }
 
-// Config contains configuration for the SLURM worker
-type Config struct {
-	ConfigPath    string
-	SpoolPath     string
-	SlurmConfPath string
-}
-
-// NewSLURMWorker creates a new SLURM worker role
-func NewSLURMWorker(roleConfig *roles.RoleConfig, logger *logrus.Logger) (roles.Role, error) {
-	config := &Config{
-		ConfigPath:    "/etc/slurm",
-		SpoolPath:     "/var/lib/slurm/slurmd",
-		SlurmConfPath: "/etc/slurm/slurm.conf",
-	}
-
-	// Override from role config
-	if val, ok := roleConfig.Config["config_path"].(string); ok {
-		config.ConfigPath = val
-	}
-	if val, ok := roleConfig.Config["spool_path"].(string); ok {
-		config.SpoolPath = val
-	}
-
+// NewSLURMWorkerRole creates a worker with explicit connection parameters.
+func NewSLURMWorkerRole(controllerIP string, mungeKey []byte, nodeIP string, logger *logrus.Logger) *SLURMWorker {
 	return &SLURMWorker{
 		BaseRole:        roles.NewBaseRole("slurm-worker", logger),
-		config:          config,
-		configPath:      config.ConfigPath,
-		spoolPath:       config.SpoolPath,
+		controllerIP:    controllerIP,
+		mungeKey:        mungeKey,
+		nodeIP:          nodeIP,
 		mungeKeyManager: auth.NewMungeKeyManager(logger),
-	}, nil
+	}
 }
 
-// Start starts the SLURM worker role
-func (sw *SLURMWorker) Start(ctx context.Context, clusterState *state.ClusterState) error {
-	sw.Logger().Info("Starting SLURM worker role")
-	sw.clusterState = clusterState
+// Start sets up munge, writes a client-only slurm.conf, and starts slurmd.
+// slurmd uses --conf-server to fetch its full config from slurmctld, so
+// NodeName/partition entries do not need to be in the local file.
+// Called once by the phase machine after munge key is received from leader.
+func (sw *SLURMWorker) Start() error {
+	sw.Logger().Infof("Starting SLURM worker (controller=%s)", sw.controllerIP)
 
-	// Create necessary directories
-	if err := sw.createDirectories(); err != nil {
-		return fmt.Errorf("failed to create directories: %w", err)
+	for _, dir := range []string{
+		"/etc/slurm",
+		"/var/lib/slurm/slurmd",
+		"/var/log/slurm",
+	} {
+		os.MkdirAll(dir, 0755)
 	}
 
-	// Start slurmd
+	if err := sw.mungeKeyManager.WriteMungeKey(sw.mungeKey); err != nil {
+		return fmt.Errorf("write munge key: %w", err)
+	}
+
+	if err := sw.mungeKeyManager.StartMungeDaemon(); err != nil {
+		return fmt.Errorf("start munge: %w", err)
+	}
+
+	// Write a minimal slurm.conf for CLIENT tools (squeue, sbatch, sinfo) only.
+	// slurmd itself fetches its full config from the controller via --conf-server.
+	if err := sw.writeClientConfig(); err != nil {
+		return fmt.Errorf("write slurm client config: %w", err)
+	}
+
 	if err := sw.startSlurmd(); err != nil {
-		return fmt.Errorf("failed to start slurmd: %w", err)
+		return fmt.Errorf("start slurmd: %w", err)
 	}
 
 	sw.SetRunning(true)
-	sw.Logger().Info("SLURM worker role started")
 	return nil
 }
 
-// Stop stops the SLURM worker role
+// Stop stops slurmd
 func (sw *SLURMWorker) Stop(ctx context.Context) error {
-	sw.Logger().Info("Stopping SLURM worker role")
-
-	// Stop slurmd
-	if err := sw.stopSlurmd(); err != nil {
-		sw.Logger().Warnf("Error stopping slurmd: %v", err)
-	}
-
-	sw.SetRunning(false)
-	return nil
+	sw.Logger().Info("Stopping SLURM worker")
+	return sw.stopSlurmd()
 }
 
-// Reconfigure updates the configuration
-func (sw *SLURMWorker) Reconfigure(clusterState *state.ClusterState) error {
-	sw.Logger().Info("Reconfiguring SLURM worker")
-	sw.clusterState = clusterState
-
-	// If slurmd wasn't started (config was missing at startup), try now
-	if sw.slurmdCmd == nil || sw.slurmdCmd.Process == nil {
-		slurmConfPath := filepath.Join(sw.configPath, "slurm.conf")
-		if _, err := os.Stat(slurmConfPath); err == nil {
-			sw.Logger().Info("slurm.conf now available, starting slurmd")
-			if err := sw.startSlurmd(); err != nil {
-				sw.Logger().Warnf("Failed to start slurmd on reconfigure: %v", err)
-			}
-		}
-		return nil
-	}
-
-	// Reload slurmd configuration
-	sw.Logger().Info("Reloading slurmd configuration")
-	if err := sw.slurmdCmd.Process.Signal(syscall.SIGHUP); err != nil {
-		sw.Logger().Warnf("Failed to send SIGHUP to slurmd: %v", err)
-	}
-
-	return nil
-}
-
-// HealthCheck checks if slurmd is running
+// HealthCheck verifies slurmd is alive, restarting if needed
 func (sw *SLURMWorker) HealthCheck() error {
-	if !sw.IsRunning() {
-		return fmt.Errorf("SLURM worker role is not running")
-	}
-
 	if sw.slurmdCmd == nil || sw.slurmdCmd.Process == nil {
-		return fmt.Errorf("slurmd process is not running")
+		sw.Logger().Warn("slurmd not running — attempting restart")
+		return sw.startSlurmd()
 	}
-
-	// Check if process is still alive
 	if err := sw.slurmdCmd.Process.Signal(syscall.Signal(0)); err != nil {
-		return fmt.Errorf("slurmd process health check failed: %w", err)
+		sw.Logger().Warnf("slurmd process died: %v — restarting", err)
+		sw.slurmdCmd.Wait()
+		sw.slurmdCmd = nil
+		return sw.startSlurmd()
 	}
-
 	return nil
 }
 
-// IsLeaderRequired returns false - workers don't need leadership
-func (sw *SLURMWorker) IsLeaderRequired() bool {
-	return false
+// writeClientConfig writes a minimal /etc/slurm/slurm.conf sufficient for SLURM client
+// tools (squeue, sbatch, sinfo, scancel) to locate and authenticate with slurmctld.
+// slurmd fetches its full running config via --conf-server, so no NodeName/partition
+// entries are needed here — they live only on the controller.
+func (sw *SLURMWorker) writeClientConfig() error {
+	conf := fmt.Sprintf(`# SLURM client config — auto-generated by Cluster-OS (worker node)
+# slurmd uses --conf-server to fetch the authoritative config from slurmctld.
+# This file is only used by client commands: squeue, sbatch, sinfo, etc.
+ClusterName=cluster-os
+SlurmctldHost=%s
+SlurmctldPort=6817
+AuthType=auth/munge
+CryptoType=crypto/munge
+AccountingStorageType=accounting_storage/none
+`, sw.controllerIP)
+
+	return os.WriteFile("/etc/slurm/slurm.conf", []byte(conf), 0644)
 }
 
-// OnLeadershipChange is not used for workers
-func (sw *SLURMWorker) OnLeadershipChange(isLeader bool) error {
-	return nil
-}
-
-// createDirectories creates necessary directories
-func (sw *SLURMWorker) createDirectories() error {
-	dirs := []string{
-		sw.configPath,
-		sw.spoolPath,
-		"/var/log/slurm",
-	}
-
-	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("failed to create directory %s: %w", dir, err)
-		}
-	}
-
-	return nil
-}
-
-// startSlurmd starts the slurmd daemon
 func (sw *SLURMWorker) startSlurmd() error {
-	sw.Logger().Info("Starting slurmd daemon")
+	// Use --conf-server so slurmd fetches the authoritative config from slurmctld.
+	// This avoids the NodeName=localhost problem: slurmd registers itself with its
+	// actual hostname/IP, which must match a NodeName entry in the controller's config
+	// (populated by the leader's Serf watcher).
+	confServer := fmt.Sprintf("%s:6817", sw.controllerIP)
+	args := []string{"-D", "--conf-server", confServer}
 
-	// Wait for slurm.conf to exist (generated by controller and distributed via configless mode)
-	slurmConfPath := filepath.Join(sw.configPath, "slurm.conf")
-
-	// Wait up to 2 minutes for the controller to generate slurm.conf
-	// If enable_configless is set, slurmd can get config from slurmctld,
-	// but we still need a minimal conf pointing to the controller
-	if _, err := os.Stat(slurmConfPath); os.IsNotExist(err) {
-		sw.Logger().Info("Waiting for slurm.conf from controller...")
-		for i := 0; i < 24; i++ {
-			time.Sleep(5 * time.Second)
-			if _, err := os.Stat(slurmConfPath); err == nil {
-				sw.Logger().Info("slurm.conf found, proceeding")
-				break
-			}
-			if i == 23 {
-				sw.Logger().Warn("slurm.conf still missing after 2 minutes — controller may not be elected yet")
-				sw.Logger().Info("slurmd will be started by Reconfigure() when config becomes available")
-				return nil // Don't fail — Reconfigure will retry
-			}
-		}
+	// -N overrides the node name slurmd registers as. Use the Tailscale/LAN IP so it
+	// matches the NodeAddr the controller sees in Serf member addresses.
+	nodeName := sw.nodeIP
+	if nodeName == "" {
+		nodeName, _ = os.Hostname()
 	}
+	args = append(args, "-N", nodeName)
 
-	// Setup munge
-	if err := sw.setupMunge(); err != nil {
-		return fmt.Errorf("failed to setup munge: %w", err)
-	}
-
-	// Determine our NodeName as it appears in slurm.conf
-	// The controller uses node.Name from cluster state (typically the Tailscale IP),
-	// but the system hostname may differ (e.g., node-X-Y). We must pass -N explicitly
-	// so slurmd doesn't try to match against the hostname.
-	var nodeNameArgs []string
-	if sw.clusterState != nil {
-		if localNode := sw.clusterState.GetLocalNode(); localNode != nil && localNode.Name != "" {
-			sw.Logger().Infof("Using explicit NodeName for slurmd: %s", localNode.Name)
-			nodeNameArgs = append(nodeNameArgs, "-N", localNode.Name)
-		}
-	}
-
-	// Start slurmd
-	args := []string{
-		"-D", // Foreground mode
-		"-f", slurmConfPath,
-	}
-	args = append(args, nodeNameArgs...)
 	cmd := exec.Command("slurmd", args...)
-
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start slurmd: %w", err)
+		return fmt.Errorf("start slurmd: %w", err)
 	}
-
 	sw.slurmdCmd = cmd
-	sw.Logger().Info("slurmd started successfully")
-
+	sw.Logger().Infof("slurmd started (PID %d, conf-server=%s, node=%s)", cmd.Process.Pid, confServer, nodeName)
 	return nil
 }
 
-// stopSlurmd stops the slurmd daemon
 func (sw *SLURMWorker) stopSlurmd() error {
 	if sw.slurmdCmd == nil || sw.slurmdCmd.Process == nil {
 		return nil
 	}
-
-	sw.Logger().Info("Stopping slurmd daemon")
-
-	// Send terminate signal
-	if err := sw.slurmdCmd.Process.Signal(os.Interrupt); err != nil {
-		sw.Logger().Warnf("Failed to send interrupt signal: %v", err)
-		// Try kill
-		if err := sw.slurmdCmd.Process.Kill(); err != nil {
-			return fmt.Errorf("failed to kill slurmd: %w", err)
-		}
+	sw.slurmdCmd.Process.Signal(os.Interrupt)
+	done := make(chan error, 1)
+	go func() { done <- sw.slurmdCmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		sw.slurmdCmd.Process.Kill()
+		<-done
 	}
-
-	// Wait for process to exit
-	if err := sw.slurmdCmd.Wait(); err != nil {
-		sw.Logger().Warnf("slurmd exit error: %v", err)
-	}
-
 	sw.slurmdCmd = nil
-	sw.Logger().Info("slurmd stopped")
-
-	return nil
-}
-
-// setupMunge ensures munge is running and configured using Raft consensus
-func (sw *SLURMWorker) setupMunge() error {
-	sw.Logger().Info("Setting up munge authentication via Raft")
-
-	// Check if key already exists on disk
-	if _, err := os.Stat(auth.MungeKeyPath); err == nil {
-		sw.Logger().Info("Munge key found on disk, verifying against Raft state")
-
-		// Verify the key matches what's in Raft
-		if err := sw.verifyMungeKeyAgainstRaft(); err != nil {
-			sw.Logger().Warnf("Munge key verification failed: %v, will fetch from Raft", err)
-			// Continue to fetch from Raft
-		} else {
-			// Key is valid, just start munge
-			return sw.mungeKeyManager.StartMungeDaemon()
-		}
-	}
-
-	// Key doesn't exist on disk or verification failed - fetch from Raft
-	sw.Logger().Info("Fetching munge key from Raft consensus state")
-
-	// Retry logic for fetching munge key from Raft
-	maxRetries := 20 // Increased retries since we need to wait for leader to generate
-	retryDelay := 3 * time.Second
-
-	for i := 0; i < maxRetries; i++ {
-		// Check if cluster has munge key
-		if !sw.clusterState.HasMungeKey() {
-			sw.Logger().Warnf("Attempt %d/%d: Cluster doesn't have munge key yet, waiting for controller to generate", i+1, maxRetries)
-			if i < maxRetries-1 {
-				time.Sleep(retryDelay)
-				continue
-			}
-			return fmt.Errorf("failed to get munge key after %d attempts: cluster has no munge key", maxRetries)
-		}
-
-		// Fetch from Raft
-		key, hash, err := sw.mungeKeyManager.FetchFromRaft(sw.clusterState)
-		if err != nil {
-			sw.Logger().Warnf("Attempt %d/%d: Failed to fetch munge key from Raft: %v", i+1, maxRetries, err)
-			if i < maxRetries-1 {
-				time.Sleep(retryDelay)
-				continue
-			}
-			return fmt.Errorf("failed to fetch munge key after %d attempts: %w", maxRetries, err)
-		}
-
-		sw.Logger().Infof("Fetched munge key from Raft (hash: %s)", hash[:16]+"...")
-
-		// Write to disk
-		if err := sw.mungeKeyManager.WriteMungeKey(key); err != nil {
-			return fmt.Errorf("failed to write munge key to disk: %w", err)
-		}
-
-		sw.Logger().Info("Munge key fetched from Raft and written to disk successfully")
-
-		// Start munge daemon
-		return sw.mungeKeyManager.StartMungeDaemon()
-	}
-
-	return fmt.Errorf("failed to setup munge after %d retries", maxRetries)
-}
-
-// verifyMungeKeyAgainstRaft verifies the existing munge key against Raft state
-func (sw *SLURMWorker) verifyMungeKeyAgainstRaft() error {
-	// Check if cluster has munge key
-	if !sw.clusterState.HasMungeKey() {
-		return fmt.Errorf("cluster does not have munge key in Raft state")
-	}
-
-	// Get expected hash from Raft
-	_, expectedHash, err := sw.clusterState.GetMungeKey()
-	if err != nil {
-		return fmt.Errorf("failed to get munge key from Raft: %w", err)
-	}
-
-	// Read the existing key from disk
-	key, err := sw.mungeKeyManager.ReadMungeKey()
-	if err != nil {
-		return fmt.Errorf("failed to read munge key from disk: %w", err)
-	}
-
-	// Verify the hash
-	if !sw.mungeKeyManager.VerifyMungeKey(key, expectedHash) {
-		return fmt.Errorf("munge key hash verification failed")
-	}
-
-	sw.Logger().Info("Munge key verified successfully against Raft state")
+	sw.SetRunning(false)
 	return nil
 }
