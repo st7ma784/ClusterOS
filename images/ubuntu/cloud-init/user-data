@@ -12,7 +12,7 @@ users:
 # Enable password auth for SSH
 ssh_pwauth: true
 
-# Set hostname
+# Set hostname (overwritten by node-agent setUniqueHostname on first run)
 hostname: cluster-node
 
 # Grow root partition to fill disk
@@ -20,13 +20,10 @@ growpart:
   mode: auto
   devices: ['/']
 
-# Resize filesystem
 resize_rootfs: true
 
-# Set timezone
 timezone: UTC
 
-# Package management
 package_update: true
 package_upgrade: true
 
@@ -42,11 +39,9 @@ packages:
   - wireguard
   - wireguard-tools
 
-# Write files
 write_files:
   - path: /etc/sysctl.d/99-clusteros.conf
     content: |
-      # ClusterOS Network Configuration
       net.ipv4.ip_forward = 1
       net.ipv6.conf.all.forwarding = 1
       net.bridge.bridge-nf-call-iptables = 1
@@ -56,11 +51,116 @@ write_files:
     content: |
       br_netfilter
 
-# Run commands at first boot
+  # WiFi: connect to the cluster LAN automatically.
+  # This is the primary uplink for nodes without ethernet.
+  # netplan applies this on every boot; the node gets internet access
+  # before cloud-init's runcmd phase so Tailscale can authenticate.
+  - path: /etc/netplan/60-clusteros-wifi.yaml
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        wifis:
+          wlan0:
+            dhcp4: true
+            optional: true
+            access-points:
+              "MANDER84":
+                password: "M4nd3rsM0b"
+
+  # Tailscale first-boot auth script.
+  # Reads /etc/clusteros/tailscale.env (written by cluster-make-usb or make deploy).
+  # Runs once via runcmd; subsequent boots skip if already connected.
+  - path: /usr/local/bin/clusteros-tailscale-init
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # First-boot Tailscale setup for ClusterOS nodes.
+      set -euo pipefail
+      log() { echo "[tailscale-init] $*" | tee -a /var/log/clusteros-init.log; }
+
+      TS_ENV="/etc/clusteros/tailscale.env"
+
+      # Install Tailscale if not present
+      if ! command -v tailscale >/dev/null 2>&1; then
+          log "Installing Tailscale..."
+          curl -fsSL https://tailscale.com/install.sh | sh
+      fi
+
+      systemctl enable --now tailscaled 2>/dev/null || true
+      sleep 3
+
+      # Already connected?
+      if tailscale status --json 2>/dev/null | grep -q '"BackendState":"Running"'; then
+          log "Tailscale already connected ($(tailscale ip -4 2>/dev/null))"
+          exit 0
+      fi
+
+      if [[ ! -f "$TS_ENV" ]]; then
+          log "No $TS_ENV — skipping auto-auth (run 'sudo tailscale up --authkey=...' manually)"
+          exit 0
+      fi
+
+      # Source credentials
+      TAILSCALE_AUTHKEY=$(grep -v '^#' "$TS_ENV" | grep '^TAILSCALE_AUTHKEY=' | cut -d= -f2- | tr -d ' \r' || true)
+      TAILSCALE_OAUTH_CLIENT_ID=$(grep -v '^#' "$TS_ENV" | grep '^TAILSCALE_OAUTH_CLIENT_ID=' | cut -d= -f2- | tr -d ' \r' || true)
+      TAILSCALE_OAUTH_CLIENT_SECRET=$(grep -v '^#' "$TS_ENV" | grep '^TAILSCALE_OAUTH_CLIENT_SECRET=' | cut -d= -f2- | tr -d ' \r' || true)
+
+      AUTH_KEY=""
+
+      # OAuth path: generate a fresh single-use key (preferred — no expiry on the credentials)
+      if [[ -n "${TAILSCALE_OAUTH_CLIENT_ID:-}" && -n "${TAILSCALE_OAUTH_CLIENT_SECRET:-}" ]]; then
+          log "Requesting Tailscale auth key via OAuth..."
+          TOKEN=$(curl -fsSL --connect-timeout 10 -X POST https://api.tailscale.com/api/v2/oauth/token \
+              -d "client_id=${TAILSCALE_OAUTH_CLIENT_ID}&client_secret=${TAILSCALE_OAUTH_CLIENT_SECRET}" \
+              | jq -r '.access_token // empty')
+          if [[ -n "$TOKEN" ]]; then
+              AUTH_KEY=$(curl -fsSL --connect-timeout 10 -X POST https://api.tailscale.com/api/v2/tailnet/-/keys \
+                  -H "Authorization: Bearer $TOKEN" \
+                  -H "Content-Type: application/json" \
+                  -d '{"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":false,"preauthorized":true}}},"expirySeconds":300}' \
+                  | jq -r '.key // empty')
+              [[ -n "$AUTH_KEY" ]] && log "OAuth auth key obtained"
+          fi
+      fi
+
+      # Pre-configured key fallback
+      if [[ -z "$AUTH_KEY" && -n "${TAILSCALE_AUTHKEY:-}" ]]; then
+          AUTH_KEY="$TAILSCALE_AUTHKEY"
+          log "Using pre-configured auth key"
+      fi
+
+      if [[ -z "$AUTH_KEY" ]]; then
+          log "No valid Tailscale credentials in $TS_ENV — manual auth required"
+          exit 1
+      fi
+
+      log "Authenticating with Tailscale..."
+      tailscale up --authkey="$AUTH_KEY" --accept-routes --accept-dns=false --reset
+      sleep 3
+      log "Connected: $(tailscale ip -4 2>/dev/null || echo pending)"
+
 runcmd:
+  # Apply netplan WiFi config immediately (doesn't require reboot)
+  - netplan apply
   - sysctl --system
   - systemctl enable ssh
   - systemctl start ssh
+  # Tailscale: install and auth using credentials from the patch bundle.
+  # The patch bundle (written by cluster-make-usb) places tailscale.env before
+  # this runs; if no bundle is present, the script exits cleanly.
+  - |
+    if [ -f /root/patch/tailscale.env ]; then
+      mkdir -p /etc/clusteros
+      cp /root/patch/tailscale.env /etc/clusteros/tailscale.env
+      chmod 600 /etc/clusteros/tailscale.env
+    fi
+  - /usr/local/bin/clusteros-tailscale-init || true
+  # Apply the cluster patch bundle if present (placed there by cluster-make-usb).
+  # This installs node-agent, joins the cluster, and sets up all services.
+  - |
+    if [ -f /root/patch/apply-patch.sh ]; then
+      bash /root/patch/apply-patch.sh >> /var/log/clusteros-join.log 2>&1
+    fi
 
-# Final message
 final_message: "ClusterOS cloud-init complete after $UPTIME seconds"

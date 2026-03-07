@@ -1,0 +1,36 @@
+[Unit]
+Description=ClusterOS USB Installer Builder
+Documentation=man:cluster-make-usb(1)
+# Run after the network and node-agent are up so live certs are readable.
+After=network-online.target node-agent.service
+Wants=network-online.target
+# Not a permanent service — run on demand with:
+#   sudo systemctl start clusteros-make-usb
+# or with a device:
+#   sudo DEVICE=/dev/sdb systemctl start clusteros-make-usb
+ConditionFileIsExecutable=/usr/local/bin/cluster-make-usb
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+User=root
+# Pass DEVICE and OUTPUT as environment variables before starting:
+#   sudo DEVICE=/dev/sdb systemctl start clusteros-make-usb
+#   sudo OUTPUT=/tmp/my-bundle.tar.gz systemctl start clusteros-make-usb
+EnvironmentFile=-/etc/cluster-os/make-usb.env
+# Wrap in bash so conditional arg expansion works correctly:
+#   DEVICE set   →  cluster-make-usb --device /dev/sdX
+#   OUTPUT set   →  cluster-make-usb --output /path/to/file.tar.gz
+#   neither set  →  cluster-make-usb (writes tarball to /tmp/clusteros-patch-DATE.tar.gz)
+ExecStart=/bin/bash -c '\
+    ARGS=""; \
+    [ -n "${DEVICE:-}" ] && ARGS="$ARGS --device $DEVICE"; \
+    [ -n "${OUTPUT:-}" ] && ARGS="$ARGS --output $OUTPUT"; \
+    exec /usr/local/bin/cluster-make-usb $ARGS'
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=600
+
+[Install]
+# Not enabled by default — trigger manually via systemctl start
+WantedBy=multi-user.target

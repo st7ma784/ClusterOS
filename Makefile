@@ -41,8 +41,14 @@ help:
 	@echo "Build Targets:"
 	@echo "  make node         - Build node-agent binary (local arch)"
 	@echo "  make image        - Build OS image with Packer (requires Packer & QEMU)"
-	@echo "  make usb          - Create USB installer image"
+	@echo "  make usb          - Create USB installer image (requires Packer build)"
+	@echo "  make usb-local    - Create USB installer image on the local machine"
 	@echo "  make release      - Create release artifacts (amd64 + arm64)"
+	@echo ""
+	@echo "On-node USB builder (after 'make deploy'):"
+	@echo "  sudo cluster-make-usb --output /tmp/patch.tar.gz  # any node: patch bundle"
+	@echo "  sudo cluster-make-usb --device /dev/sdb           # leader: bootable USB"
+	@echo "  sudo systemctl start clusteros-make-usb           # via systemd"
 	@echo ""
 	@echo "Test Targets (Docker):"
 	@echo "  make test         - Run unit tests"
@@ -228,10 +234,84 @@ usb: image
 # Run this before 'make deploy'.
 patch: node
 	@echo "Staging patch folder..."
+	@mkdir -p patch
 	@cp bin/$(BINARY_NAME) patch/$(BINARY_NAME)
+	@printf '%s\n' "version=$(VERSION)" "commit=$(COMMIT)" "built=$(BUILD_TIME)" > patch/VERSION
+	@echo "Binary version: $(VERSION) ($(COMMIT))"
+	@echo "Generating fresh munge key (32 bytes) for patch/munge.key..."
+	@head -c 32 /dev/urandom > patch/munge.key || openssl rand -out patch/munge.key 32
+	@chmod 600 patch/munge.key
+	@if [ ! -f patch/k3s-ca.crt ] || [ ! -f patch/k3s-ca.key ]; then \
+		echo "Generating k3s cluster CA certificate (shared across all nodes)..."; \
+		openssl genrsa -out patch/k3s-ca.key 2048 2>/dev/null && \
+		openssl req -new -x509 -days 3650 \
+			-key patch/k3s-ca.key \
+			-out patch/k3s-ca.crt \
+			-subj "/O=cluster-os/CN=k3s-server-ca" 2>/dev/null && \
+		chmod 600 patch/k3s-ca.key && \
+		echo "  k3s CA generated: patch/k3s-ca.crt (reused on subsequent make patch runs)"; \
+	else \
+		echo "k3s CA cert already present (patch/k3s-ca.crt) — reusing existing CA"; \
+	fi
+	@if [ ! -f patch/pause-3.6.tar ]; then \
+		echo "Pre-bundling pause image for airgap deploy (both registry.k8s.io and rancher aliases)..."; \
+		if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then \
+			docker pull registry.k8s.io/pause:3.6 2>/dev/null && \
+			docker tag  registry.k8s.io/pause:3.6 rancher/mirrored-pause:3.6 2>/dev/null && \
+			docker save registry.k8s.io/pause:3.6 rancher/mirrored-pause:3.6 \
+				-o patch/pause-3.6.tar 2>/dev/null && \
+			echo "  pause image bundled (both tags): patch/pause-3.6.tar" || \
+			echo "  WARNING: docker pull failed — nodes will fall back to runtime pull"; \
+		elif command -v skopeo &>/dev/null; then \
+			skopeo copy docker://registry.k8s.io/pause:3.6 \
+				docker-archive:patch/pause-3.6.tar:registry.k8s.io/pause:3.6 2>/dev/null && \
+			echo "  pause image bundled via skopeo: patch/pause-3.6.tar" || \
+			echo "  WARNING: skopeo copy failed — nodes will fall back to runtime pull"; \
+		else \
+			echo "  WARNING: no docker/skopeo on dev machine — nodes will pull pause image at boot"; \
+			echo "           Install docker or skopeo to enable fully-airgap pause image"; \
+		fi; \
+	else \
+		echo "Pause image already bundled (patch/pause-3.6.tar) — reusing"; \
+	fi
 	@chmod +x patch/cluster patch/apply-patch.sh
+	@# --- Copy optional scripts (warn if missing, do not silently skip) ---
+	@for src in scripts/clear-stale-redirects.sh scripts/cluster-make-usb.sh scripts/create-usb-installer.sh; do \
+		if [ -f "$$src" ]; then \
+			cp -f "$$src" patch/ && chmod +x "patch/$$(basename $$src)"; \
+		else \
+			echo "WARNING: $$src not found — it will be absent from the bundle"; \
+		fi; \
+	done
+	@mkdir -p patch/systemd
+	@for src in systemd/clear-stale-redirects.service systemd/clusteros-make-usb.service node/systemd/node-agent.service; do \
+		if [ -f "$$src" ]; then \
+			cp -f "$$src" patch/systemd/; \
+		else \
+			echo "WARNING: $$src not found — skipping"; \
+		fi; \
+	done
+	@# --- Verify required bundle files are present before declaring success ---
 	@echo ""
-	@echo "Patch staged:"
+	@echo "Verifying bundle..."
+	@_MISSING=""; \
+	for f in patch/node-agent patch/apply-patch.sh patch/cluster patch/cluster-make-usb.sh \
+	          patch/munge.key patch/k3s-ca.crt patch/k3s-ca.key; do \
+		if [ ! -f "$$f" ]; then \
+			echo "  MISSING: $$f"; \
+			_MISSING="$$_MISSING $$f"; \
+		else \
+			echo "  OK:      $$f  ($$(du -sh $$f | cut -f1))"; \
+		fi; \
+	done; \
+	if [ -n "$$_MISSING" ]; then \
+		echo ""; \
+		echo "FATAL: required bundle files missing:$$_MISSING"; \
+		echo "Fix the above and re-run 'make patch'."; \
+		exit 1; \
+	fi
+	@echo ""
+	@echo "Patch staged (full listing):"
 	@ls -lh patch/
 	@echo ""
 	@echo "Deploy with:  make deploy NODES='100.x.x.1 100.x.x.2'"
@@ -249,34 +329,126 @@ patch-cross:
 # deploy — scp the patch folder to each node and run apply-patch.sh.
 # Usage:  make deploy NODES="100.x.x.1 100.x.x.2 100.x.x.3"
 #   or:   make deploy  (reads Tailscale peer IPs automatically)
-NODES ?= $(shell tailscale status --json 2>/dev/null | \
-	python3 -c "import sys,json; peers=json.load(sys.stdin).get('Peer',{}); \
-	[print(p['TailscaleIPs'][0]) for p in peers.values() if p.get('Online') and p.get('TailscaleIPs')]" 2>/dev/null)
+#
+# Authentication (in order of preference):
+#   SSH_KEY=~/.ssh/id_rsa     — key-based auth (default; tries ~/.ssh/id_rsa and cluster_key)
+#   SSH_PASS=clusteros        — password auth via sshpass (default password from cloud-init)
+#   Set SSH_KEY="" to disable key auth and fall back to SSH_PASS only.
+# NODES: explicit list, or auto-discovered from active Tailscale peers.
+# Auto-discovery probes every online peer with SSH (clusteros:clusteros);
+# peers that don't accept those credentials are silently skipped — this
+# filters out the non-ClusterOS machines on the same Tailscale network.
+NODES    ?=
 SSH_USER ?= clusteros
+SSH_PASS ?= clusteros
+SSH_KEY  ?= $(HOME)/.ssh/cluster_key
+
+# Internal: build ssh/scp command prefix (sshpass + key or just key).
+_SSH_AUTH := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=no $(if $(SSH_KEY),-i $(SSH_KEY))
+_SCP_AUTH := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') scp -o StrictHostKeyChecking=no -o ConnectTimeout=5 $(if $(SSH_KEY),-i $(SSH_KEY))
 
 deploy: patch
-	@if [ -z "$(NODES)" ]; then \
-		echo "Error: No nodes specified. Use: make deploy NODES='IP1 IP2 IP3'"; \
-		echo "Or ensure tailscale is running so peers are auto-detected."; \
+	@echo "Deploying $(VERSION) ($(COMMIT))"
+	@echo "SSH user: $(SSH_USER)  key: $(SSH_KEY)  pass: $(if $(SSH_PASS),set,unset)"
+	@# Build candidate list: use explicit NODES, or every online Tailscale peer.
+	@if [ -n "$(NODES)" ]; then \
+		CANDIDATES="$(NODES)"; \
+		echo "Using explicit node list: $$CANDIDATES"; \
+	elif command -v tailscale >/dev/null 2>&1; then \
+		CANDIDATES=$$(tailscale status --json 2>/dev/null | \
+			python3 -c "import sys,json; peers=json.load(sys.stdin).get('Peer',{}); \
+			[print(p['TailscaleIPs'][0]) for p in peers.values() \
+			 if p.get('Online') and p.get('TailscaleIPs')]" 2>/dev/null); \
+		if [ -z "$$CANDIDATES" ]; then \
+			echo "ERROR: Tailscale found no online peers."; \
+			echo "  Is Tailscale running?  Try: tailscale status"; \
+			echo "  Or pass nodes explicitly: make deploy NODES='IP1 IP2'"; \
+			exit 1; \
+		fi; \
+		echo "Tailscale peers to probe: $$(echo $$CANDIDATES | tr '\n' ' ')"; \
+	else \
+		echo "ERROR: NODES not set and tailscale not found."; \
+		echo "  Install Tailscale or pass nodes explicitly: make deploy NODES='IP1 IP2'"; \
 		exit 1; \
-	fi
-	@echo "Deploying to: $(NODES)"
-	@for node in $(NODES); do \
+	fi; \
+	_FAILED=""; _OK=""; _SKIPPED=""; \
+	for node in $$CANDIDATES; do \
 		echo ""; \
 		echo "==> $$node"; \
-		scp -r -o StrictHostKeyChecking=no patch/ $(SSH_USER)@$$node:~/patch/ && \
-		ssh -o StrictHostKeyChecking=no $(SSH_USER)@$$node 'sudo bash ~/patch/apply-patch.sh' || \
-		echo "WARNING: deploy to $$node failed"; \
-	done
-	@echo ""
-	@echo "Deploy complete. Check: make deploy-status"
+		echo "    [probe] Testing SSH access ($(SSH_USER):$(SSH_PASS))..."; \
+		if ! $(_SSH_AUTH) $(SSH_USER)@$$node 'echo ssh-ok' 2>/dev/null | grep -q ssh-ok; then \
+			echo "    skipped — SSH not available with $(SSH_USER):$(SSH_PASS) (not a ClusterOS node, or node is down)"; \
+			_SKIPPED="$$_SKIPPED $$node"; \
+			continue; \
+		fi; \
+		echo "    [1/3] Stopping old node-agent"; \
+		$(_SSH_AUTH) $(SSH_USER)@$$node \
+			'sudo systemctl stop node-agent 2>/dev/null; \
+			 sudo pkill -KILL -f /usr/local/bin/node-agent 2>/dev/null; \
+			 sudo pkill -KILL -f /tmp/node-agent 2>/dev/null; \
+			 true' 2>/dev/null || true; \
+		echo "    [2/3] Uploading patch bundle"; \
+		$(_SSH_AUTH) $(SSH_USER)@$$node 'rm -rf ~/patch' 2>/dev/null || true; \
+		if ! $(_SCP_AUTH) -r patch $(SSH_USER)@$$node:~/; then \
+			echo "  !! FAILED: SCP to $$node"; \
+			_FAILED="$$_FAILED $$node(scp)"; \
+			continue; \
+		fi; \
+		echo "    [3/3] Running apply-patch.sh"; \
+		if ! $(_SSH_AUTH) $(SSH_USER)@$$node 'sudo bash ~/patch/apply-patch.sh'; then \
+			echo "  !! FAILED: apply-patch.sh on $$node exited non-zero (see output above)"; \
+			_FAILED="$$_FAILED $$node(patch)"; \
+			continue; \
+		fi; \
+		echo "  OK: $$node"; \
+		_OK="$$_OK $$node"; \
+	done; \
+	echo ""; \
+	echo "══════════════════════════════════════════"; \
+	echo " Deploy summary"; \
+	echo "══════════════════════════════════════════"; \
+	for n in $$_OK;      do echo "  ✓  $$n"; done; \
+	for n in $$_SKIPPED; do echo "  -  $$n (skipped — not ClusterOS or down)"; done; \
+	for n in $$_FAILED;  do echo "  ✗  $$n"; done; \
+	echo "══════════════════════════════════════════"; \
+	if [ -n "$$_FAILED" ]; then \
+		echo "Some nodes FAILED. Retry with:"; \
+		echo "  make deploy NODES='$$(echo $$_FAILED | tr ' ' '\n' | sed 's/(.*//' | tr '\n' ' ')'"; \
+		exit 1; \
+	fi; \
+	if [ -z "$$_OK" ]; then \
+		echo "No nodes were updated. Check Tailscale connectivity and SSH credentials."; \
+		exit 1; \
+	fi; \
+	echo "All ClusterOS nodes updated successfully."
+
+# setup-ssh-keys — copy this machine's public key to all nodes (one-time setup).
+# After this, deploy works without passwords.
+# Usage:  make setup-ssh-keys              (uses SSH_PASS=clusteros)
+#         make setup-ssh-keys SSH_PASS=mypass
+setup-ssh-keys:
+	@if [ -z "$(NODES)" ]; then echo "No nodes (set NODES=...)"; exit 1; fi
+	@PUB_KEY=""; \
+	for candidate in $(SSH_KEY).pub $(HOME)/.ssh/id_rsa.pub $(HOME)/.ssh/id_ed25519.pub; do \
+		if [ -f "$$candidate" ]; then PUB_KEY="$$candidate"; break; fi; \
+	done; \
+	if [ -z "$$PUB_KEY" ]; then echo "No public key found — run: ssh-keygen -t ed25519"; exit 1; fi; \
+	echo "Copying $$PUB_KEY to nodes..."; \
+	for node in $(NODES); do \
+		printf "  %-20s " "$$node:"; \
+		sshpass -p '$(SSH_PASS)' ssh-copy-id -i "$$PUB_KEY" \
+			-o StrictHostKeyChecking=no $(SSH_USER)@$$node 2>/dev/null && \
+			echo "OK" || echo "FAILED"; \
+	done; \
+	echo ""; \
+	echo "Done. Future deploys will use key auth (no password needed)."
 
 # deploy-status — quick status check across all nodes after deploy.
 deploy-status:
 	@if [ -z "$(NODES)" ]; then echo "No nodes (set NODES=...)"; exit 1; fi
 	@for node in $(NODES); do \
 		printf "%-20s " "$$node:"; \
-		ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 $(SSH_USER)@$$node \
+		$(_SSH_AUTH) -o ConnectTimeout=5 $(SSH_USER)@$$node \
 			"cluster status 2>/dev/null | grep -E 'Phase|Members|Leader' | tr '\n' ' '" 2>/dev/null || \
 		echo "(unreachable)"; \
 	done
@@ -324,6 +496,10 @@ vm-status:
 
 vm-info:
 	@./test/vm/qemu/cluster-ctl.sh info
+
+usb-local:
+	@echo "Creating USB installer locally (runs scripts/create-usb-installer.sh)"
+	@sudo ./scripts/create-usb-installer.sh --usb
 
 vm-stop:
 	@./test/vm/qemu/cluster-ctl.sh stop

@@ -24,7 +24,7 @@
 #   patches first.  Patch all nodes within a few minutes to avoid the old and
 #   new daemons talking to each other.
 
-set -eo pipefail
+set -e
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -52,8 +52,459 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# ── Print bundle version ───────────────────────────────────────────────────────
+if [ -f "$SCRIPT_DIR/VERSION" ]; then
+    BUNDLE_VERSION=$(grep '^version=' "$SCRIPT_DIR/VERSION" | cut -d= -f2)
+    BUNDLE_COMMIT=$(grep '^commit='  "$SCRIPT_DIR/VERSION" | cut -d= -f2)
+    ok "Bundle: $BUNDLE_VERSION ($BUNDLE_COMMIT)"
+fi
+
+# ── Kill old node-agent immediately (MUST be first) ───────────────────────────
+# The old binary calls setupFirewallRules() continuously.  If we flush iptables
+# or nftables BEFORE killing it, it re-adds REDIRECT rules within milliseconds —
+# causing _internet_ok to return false, the wrong exit-node to be selected, and
+# those stale rules to be saved back to /etc/iptables/rules.v4 at the end of
+# this script.  Killing first guarantees a clean slate for all network operations.
+#
+# Note: make deploy also pre-kills the agent via SSH before uploading the patch
+# bundle, eliminating the race window where the old binary re-adds REDIRECT rules
+# during SCP.  This kill is belt-and-suspenders for manual apply-patch.sh runs.
+systemctl stop node-agent 2>/dev/null || true
+# Kill by path (covers standard install) AND by executable name (catches
+# any copy started from a non-standard path, e.g. /tmp or a USB image path).
+pkill -TERM -f '/usr/local/bin/node-agent' 2>/dev/null || true
+pkill -TERM -f '/tmp/node-agent'           2>/dev/null || true
+pkill -TERM -x 'node-agent'                2>/dev/null || true
+sleep 1
+pkill -KILL -f '/usr/local/bin/node-agent' 2>/dev/null || true
+pkill -KILL -f '/tmp/node-agent'           2>/dev/null || true
+pkill -KILL -x 'node-agent'               2>/dev/null || true
+ok "Old node-agent killed (cannot re-add iptables/nftables rules)"
+
+# ── Install binaries and helpers immediately (before any step that can fail) ───
+# Everything here runs right after the root check and node-agent kill.
+# If apt/network/iptables steps later fail, these are already on disk.
+
+echo ""
+echo "  Bundle dir: $SCRIPT_DIR"
+echo "  Bundle contents:"
+ls -1 "$SCRIPT_DIR/" 2>/dev/null | sed 's/^/    /' || echo "    (empty or unreadable)"
+echo ""
+
+# node-agent binary
+_BINARY="$SCRIPT_DIR/node-agent"
+case "$(uname -m)" in
+    x86_64)        [ -f "$SCRIPT_DIR/node-agent-amd64" ] && _BINARY="$SCRIPT_DIR/node-agent-amd64" ;;
+    aarch64|arm64) [ -f "$SCRIPT_DIR/node-agent-arm64" ] && _BINARY="$SCRIPT_DIR/node-agent-arm64" ;;
+esac
+if [ -f "$_BINARY" ]; then
+    install -m 755 "$_BINARY" /usr/local/bin/node-agent
+    _VER=$(/usr/local/bin/node-agent --version 2>/dev/null | head -1 || echo "unknown")
+    ok "node-agent installed: $_VER  →  /usr/local/bin/node-agent"
+else
+    err "node-agent NOT in bundle ($SCRIPT_DIR) — binary will not be updated"
+fi
+
+# cluster-make-usb
+if [ -f "$SCRIPT_DIR/cluster-make-usb.sh" ]; then
+    install -m 755 "$SCRIPT_DIR/cluster-make-usb.sh" /usr/local/bin/cluster-make-usb
+    ok "cluster-make-usb installed  →  /usr/local/bin/cluster-make-usb"
+else
+    err "cluster-make-usb.sh NOT in bundle ($SCRIPT_DIR)"
+    err "  This means 'sudo cluster-make-usb' will not work on this node."
+    err "  On dev machine: make patch && make deploy"
+fi
+
+# cluster CLI
+if [ -f "$SCRIPT_DIR/cluster" ]; then
+    install -m 755 "$SCRIPT_DIR/cluster" /usr/local/bin/cluster
+    ok "cluster CLI installed  →  /usr/local/bin/cluster"
+fi
+
+# ── Verify all three critical binaries are now on disk ─────────────────────────
+echo ""
+_INSTALL_OK=true
+for _bin in /usr/local/bin/node-agent /usr/local/bin/cluster-make-usb /usr/local/bin/cluster; do
+    if [ -x "$_bin" ]; then
+        ok "Verified: $_bin"
+    else
+        err "MISSING after install attempt: $_bin"
+        _INSTALL_OK=false
+    fi
+done
+[ "$_INSTALL_OK" = true ] || warn "One or more binaries failed to install — check bundle contents above"
+echo ""
+
+# ── Update MOTD ────────────────────────────────────────────────────────────────
+# Write a dynamic MOTD script so every SSH login shows the node version,
+# available ClusterOS commands, and cluster phase.
+mkdir -p /etc/update-motd.d
+cat > /etc/update-motd.d/99-clusteros <<'MOTD_SCRIPT'
+#!/bin/bash
+# ClusterOS dynamic MOTD — runs on every SSH login
+CYAN='\033[0;36m'; BOLD='\033[1m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+
+HOSTNAME=$(hostname 2>/dev/null || echo "unknown")
+NODE_VER=$(/usr/local/bin/node-agent --version 2>/dev/null | head -1 || echo "unknown")
+TS_IP=$(tailscale ip -4 2>/dev/null || echo "not connected")
+
+PHASE="unknown"
+if [ -f /run/clusteros/status.json ] && command -v jq &>/dev/null; then
+    PHASE=$(jq -r '.phase // "unknown"' /run/clusteros/status.json 2>/dev/null)
+fi
+
+printf "\n${CYAN}${BOLD}"
+printf "  ╔══════════════════════════════════════════════════╗\n"
+printf "  ║  ClusterOS                                       ║\n"
+printf "  ╚══════════════════════════════════════════════════╝\n"
+printf "${NC}"
+printf "  Node      : ${BOLD}%s${NC}  (Tailscale: %s)\n" "$HOSTNAME" "$TS_IP"
+printf "  Version   : %s\n" "$NODE_VER"
+printf "  Phase     : %s\n" "$PHASE"
+printf "\n"
+printf "  ${BOLD}Commands:${NC}\n"
+printf "    cluster status          — cluster health\n"
+printf "    cluster dash            — live dashboard\n"
+printf "    cluster logs            — node-agent logs\n"
+printf "    sudo cluster-make-usb   — build USB installer for new nodes\n"
+printf "\n"
+MOTD_SCRIPT
+chmod +x /etc/update-motd.d/99-clusteros
+
+# Disable the default Ubuntu MOTD scripts that add noise (ads, updates spam)
+for _f in /etc/update-motd.d/10-help-text /etc/update-motd.d/50-motd-news \
+           /etc/update-motd.d/80-esm-announce /etc/update-motd.d/95-hwe-eol; do
+    [ -f "$_f" ] && chmod -x "$_f" 2>/dev/null || true
+done
+ok "MOTD updated  →  /etc/update-motd.d/99-clusteros"
+
+# Tailscale credentials + auto-auth.
+# If the bundle includes tailscale.env (placed by cluster-make-usb or make deploy),
+# install it and authenticate now — before any step that might need network.
+# This is what gets a fresh node onto the Tailscale overlay so 'make deploy' can
+# find it automatically next time without needing the IP to be specified manually.
+if [ -f "$SCRIPT_DIR/tailscale.env" ]; then
+    mkdir -p /etc/clusteros
+    install -m 600 "$SCRIPT_DIR/tailscale.env" /etc/clusteros/tailscale.env
+    ok "Tailscale credentials installed → /etc/clusteros/tailscale.env"
+
+    if command -v tailscale >/dev/null 2>&1; then
+        if tailscale status --json 2>/dev/null | grep -q '"BackendState":"Running"'; then
+            ok "Tailscale already connected ($(tailscale ip -4 2>/dev/null))"
+        else
+            ok "Running Tailscale auth from bundled credentials..."
+            /usr/local/bin/clusteros-tailscale-init 2>/dev/null || \
+                warn "Tailscale auth failed — node may not appear on Tailscale until manually connected"
+        fi
+    else
+        warn "Tailscale not installed — run 'make deploy' once node has internet to install it"
+    fi
+fi
+
+# cluster CLI.
+if [ -f "$SCRIPT_DIR/cluster" ]; then
+    install -m 755 "$SCRIPT_DIR/cluster" /usr/local/bin/cluster
+    ok "cluster CLI installed"
+fi
+
+# ── Pre-flight: networking sanity ──────────────────────────────────────────────
+# Runs before ALL network operations (apt, k3s install, curl, containerd pulls).
+step "pre" "Networking pre-flight"
+
+# 1. Force apt to IPv4.
+#    Cluster nodes typically have no IPv6 internet routing.  Without this, apt
+#    resolves archive.ubuntu.com and gets AAAA records first (e.g. 2a06:bc80:...),
+#    tries them, hits "Network is unreachable", and only falls back to IPv4 after
+#    a long timeout — or fails entirely.  The same applies to pkgs.tailscale.com
+#    and any other apt source.  Pinning to IPv4 fixes silent apt failures instantly.
+echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99clusteros-force-ipv4
+ok "apt pinned to IPv4 (skips unreachable IPv6 on bare-metal nodes)"
+
+# 2. Tailscale cooperative exit-node mesh.
+#
+#    Every cluster node has its own LAN connection.  By advertising each node as an
+#    exit node, any online node can serve as an internet gateway for peers whose LAN
+#    path is temporarily broken (flaky WiFi, DHCP hiccup, firewall rule, etc.).
+#
+#    Strategy:
+#      a) Test direct internet connectivity (DNS + TCP 443).
+#      b) If direct internet works:
+#           - Advertise THIS node as an exit node (helps peers).
+#           - Clear any previously selected exit node (we don't need one).
+#      c) If direct internet is broken:
+#           - Find a Tailscale peer that IS advertising an exit node.
+#           - Select it so apt/k3s/Docker can route through it.
+#           - Also advertise self (so peers can use us once our LAN recovers).
+#      d) If nothing works: warn and continue; apt will fail, but that is a
+#         physical layer problem, not a Tailscale configuration problem.
+#
+#    NOTE: On official Tailscale (tailscale.com) exit nodes must be approved in
+#    the admin console (Settings → Machines → Edit route settings) or via ACL
+#    autoApprovers.  On Headscale add:  "autoApprovers": {"exitNode": ["*"]}
+#    to your policy.  Without approval --advertise-exit-node has no effect on peers.
+
+_ts_set() {
+    # tailscale set (v1.40+) is non-disruptive; fall back to tailscale up for older clients.
+    if tailscale set "$@" 2>/dev/null; then
+        return 0
+    fi
+    tailscale up "$@" 2>/dev/null
+}
+
+_internet_ok() {
+    # Quick dual-check: DNS resolution AND TCP port 443.
+    # Both must succeed so a DNS-only or TCP-only outage is caught.
+    host -W 3 archive.ubuntu.com 8.8.8.8 &>/dev/null 2>&1 || \
+        nslookup -timeout=3 archive.ubuntu.com 8.8.8.8 &>/dev/null 2>&1 || \
+        getent hosts archive.ubuntu.com &>/dev/null 2>&1
+    DNS_OK=$?
+    nc -zw 4 archive.ubuntu.com 443 &>/dev/null 2>&1
+    TCP_OK=$?
+    [ "$DNS_OK" -eq 0 ] && [ "$TCP_OK" -eq 0 ]
+}
+
+if command -v tailscale &>/dev/null; then
+    # Pre-flush the nat OUTPUT chain before checking internet reachability.
+    # Stale REDIRECT/REJECT rules in nat OUTPUT cause _internet_ok to return
+    # false (connection refused / refused on port 443), which makes the script
+    # wrongly select a Tailscale exit peer and route all subsequent traffic
+    # (apt, containerd image pulls) through that peer — which may itself have
+    # issues.  Flushing first means the internet check reflects the actual
+    # network state, not an iptables artifact.
+    iptables -t nat -F OUTPUT 2>/dev/null || true
+    nft flush ruleset 2>/dev/null || true
+    if _internet_ok; then
+        ok "Direct internet reachable"
+        # Advertise this node as a potential exit node for peers that need it.
+        if _ts_set --advertise-exit-node=true --accept-routes=true 2>/dev/null; then
+            ok "Advertising as Tailscale exit node + accepting peer routes"
+        else
+            warn "Could not set --advertise-exit-node (may need admin approval on tailscale.com)"
+        fi
+        # Clear any previously selected exit node — we have direct internet.
+        SPLIT_ROUTES=$(ip route show 2>/dev/null | grep -cE '^(0\.0\.0\.0/1|128\.0\.0\.0/1)' || true)
+        if [ "${SPLIT_ROUTES:-0}" -gt 0 ]; then
+            _ts_set --exit-node= 2>/dev/null || true
+            sleep 2
+            ok "Cleared stale exit-node selection (direct internet preferred)"
+        fi
+    else
+        warn "Direct internet unreachable — attempting to route via a Tailscale exit-node peer"
+        # List peers advertising as exit nodes; pick the first online one.
+        EXIT_PEER=""
+        if command -v jq &>/dev/null; then
+            EXIT_PEER=$(tailscale status --json 2>/dev/null | \
+                jq -r '
+                  .Peer[]
+                  | select(.ExitNodeOption == true and .Online == true)
+                  | .TailscaleIPs[0]
+                ' 2>/dev/null | head -1)
+        fi
+        if [ -n "$EXIT_PEER" ]; then
+            warn "Trying exit node: $EXIT_PEER"
+            if _ts_set --exit-node="$EXIT_PEER" --exit-node-allow-lan-access=true \
+                        --accept-routes=true --advertise-exit-node=true 2>/dev/null; then
+                sleep 3   # let routing table settle
+                if _internet_ok; then
+                    ok "Internet restored via exit node $EXIT_PEER"
+                else
+                    warn "Exit node $EXIT_PEER selected but internet still unreachable"
+                    warn "apt / k3s installs may fail — check Tailscale connectivity"
+                fi
+            else
+                warn "Could not set exit node $EXIT_PEER"
+            fi
+        else
+            warn "No online Tailscale exit-node peers found"
+            warn "All nodes may have lost internet simultaneously — check LAN/router"
+            warn "Proceeding; apt will fail if internet is truly unavailable"
+        fi
+        # Advertise self regardless so we serve peers once our LAN recovers.
+        _ts_set --advertise-exit-node=true --accept-routes=true 2>/dev/null || true
+    fi
+else
+    ok "Tailscale not present — skipping exit node configuration"
+fi
+
+# ── Emergency NAT cleanup ───────────────────────────────────────────────────────
+# Must run before ANYTHING else (including k3s install) because stale OUTPUT
+# REDIRECT rules intercept outbound TCP 80/443 — blocking containerd image pulls,
+# helm, and apt.
+#
+# ROOT CAUSE of why these rules keep coming back:
+#   iptables-persistent / netfilter-persistent saves and restores /etc/iptables/rules.v4
+#   on every reboot.  If that file was saved while OLD redirect rules were active
+#   (by a previous node-agent version that added them), they are restored after
+#   every reboot — even after apply-patch.sh and the new daemon have removed them.
+#
+# Node-agent was already killed at the very top of this script (before
+# any flush) to prevent the race condition where old binary re-adds rules.
+
+# 2. Disable ALL persistent firewall services and wipe their rule files.
+#    Both iptables-persistent (/etc/iptables/rules.v4) and nftables.service
+#    (/etc/nftables.conf) restore stale DROP/REDIRECT rules at every boot.
+#    Either can silently block pod networking (CoreDNS ContainerCreating,
+#    flannel VXLAN, kube-proxy NodePort) even after an in-memory flush.
+
+for svc in netfilter-persistent iptables-persistent nftables ufw; do
+    systemctl stop    "$svc" 2>/dev/null || true
+    systemctl disable "$svc" 2>/dev/null || true
+done
+# Remove network hooks that may restore rules on interface up.
+rm -f /etc/network/if-pre-up.d/iptables 2>/dev/null || true
+rm -f /etc/network/if-pre-up.d/ip6tables 2>/dev/null || true
+
+# Wipe persisted iptables rule files — nothing should restore them on next boot.
+rm -f /etc/iptables/rules.v4 /etc/iptables/rules.v6 2>/dev/null || true
+ok "iptables-persistent disabled and stale rules files deleted"
+
+# Ensure the iptables directory exists early so subsequent saves won't fail
+mkdir -p /etc/iptables 2>/dev/null || true
+
+# Flush the live nftables ruleset.  On Ubuntu 20.04+ iptables uses the nftables
+# backend (iptables-nft), so this also clears any stale iptables rules that were
+# stored in nftables tables from previous installs.  We do this BEFORE setting
+# our own iptables rules so we start from a clean slate.
+nft flush ruleset 2>/dev/null || true
+
+# Write a no-op /etc/nftables.conf so nftables.service cannot re-poison the
+# ruleset if it is ever re-enabled (e.g. by an unattended-upgrade).
+cat > /etc/nftables.conf << 'NFTEOF'
+#!/usr/sbin/nft -f
+# Managed by cluster-os apply-patch.sh — do not edit manually.
+# All cluster networking is managed by k3s / kube-proxy / node-agent.
+flush ruleset
+NFTEOF
+ok "nftables flushed and /etc/nftables.conf cleared (no-op)"
+
+# 3. Flush ALL OUTPUT nat rules — this removes every REDIRECT regardless of port.
+#    We use a full chain flush rather than per-rule removal because an old daemon
+#    version might have added rules we don't know about.  The OUTPUT chain only
+#    affects locally-originated traffic (apt, containerd, curl); kube-proxy and
+#    Tailscale use PREROUTING and POSTROUTING, which are left intact.
+iptables -t nat -F OUTPUT 2>/dev/null || true
+ok "Flushed iptables nat OUTPUT chain (no REDIRECT rules can block apt/containerd)"
+
+# ── DNS rescue ─────────────────────────────────────────────────────────────────
+# k3s rewrites /etc/resolv.conf to point at its CoreDNS service (10.43.0.10).
+# If k3s is running but broken (agent can't reach the server, CoreDNS pods haven't
+# started), ALL DNS resolution fails — including apt, curl, helm, and any outbound
+# connections.  This is the most common reason for "apt update: Could not resolve
+# archive.ubuntu.com" on nodes that already have k3s installed.
+#
+# Fix: run this check BEFORE apt (step 1) so package installs don't fail.
+#   If DNS works         → leave /etc/resolv.conf untouched.
+#   If DNS is broken     → inject 8.8.8.8/1.1.1.1 as working nameservers.
+#   Systemd-resolved     → set FallbackDNS so it survives future k3s restarts.
+
+_dns_working() {
+    # Try a real DNS lookup — getent uses the system resolver, so this accurately
+    # reflects whether apt will be able to resolve package archive hostnames.
+    getent hosts archive.ubuntu.com &>/dev/null 2>&1
+}
+
+if ! _dns_working; then
+    warn "DNS resolution failing — k3s CoreDNS (10.43.0.10) is probably down"
+    if [ -L /etc/resolv.conf ]; then
+        # /etc/resolv.conf is a symlink → systemd-resolved is in charge.
+        # Configure FallbackDNS so resolved falls back to 8.8.8.8 when primary fails.
+        RESOLVED_CONF="/etc/systemd/resolved.conf"
+        if [ -f "$RESOLVED_CONF" ] && ! grep -q '^FallbackDNS=' "$RESOLVED_CONF" 2>/dev/null; then
+            # Append under [Resolve] section if it exists, otherwise append at end.
+            if grep -q '^\[Resolve\]' "$RESOLVED_CONF" 2>/dev/null; then
+                sed -i '/^\[Resolve\]/a FallbackDNS=8.8.8.8 1.1.1.1' "$RESOLVED_CONF"
+            else
+                printf '\n[Resolve]\nFallbackDNS=8.8.8.8 1.1.1.1\n' >> "$RESOLVED_CONF"
+            fi
+            systemctl restart systemd-resolved 2>/dev/null || true
+            sleep 2
+        fi
+    else
+        # Plain resolv.conf file (k3s has written it directly).
+        # Prepend public nameservers; keep any existing non-k3s entries below.
+        cp /etc/resolv.conf /etc/resolv.conf.pre-patch 2>/dev/null || true
+        {
+            printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n'
+            # Keep search/domain lines; drop CoreDNS nameserver (10.x) lines.
+            grep -vE '^nameserver 10\.' /etc/resolv.conf.pre-patch 2>/dev/null || true
+        } > /etc/resolv.conf
+    fi
+
+    if _dns_working; then
+        ok "DNS restored with fallback nameservers (8.8.8.8 / 1.1.1.1)"
+    else
+        warn "DNS still failing after fallback injection — apt installs may fail"
+        warn "Check physical network / router connectivity"
+    fi
+else
+    ok "DNS resolution working"
+fi
+
+# ── 0. Pause image airgap install ─────────────────────────────────────────────
+# The k3s sandbox (pause) image MUST be on disk before k3s starts.
+# If it isn't, k3s pulls from Docker Hub/registry.k8s.io — which fails whenever
+# the network has issues (stale nftables rules, rate-limits, cold-boot DNS lag).
+#
+# Strategy — two layers, both always attempted:
+#   Layer A: copy the pre-bundled tar from the patch directory into the k3s
+#            airgap folder.  k3s auto-imports every *.tar in agent/images/ at
+#            startup, so the image is available from disk with zero network I/O.
+#            Works even when containerd is not yet running.
+#   Layer B: if containerd IS already running (upgrade-in-place), import the
+#            tar immediately so running pods recover without a k3s restart.
+CONTAINERD_SOCK="/run/k3s/containerd/containerd.sock"
+PAUSE_IMG="registry.k8s.io/pause:3.6"
+PAUSE_ALIAS="docker.io/rancher/mirrored-pause:3.6"
+AIRGAP_DIR="/var/lib/rancher/k3s/agent/images"
+AIRGAP_FILE="$AIRGAP_DIR/pause-3.6.tar"
+PATCH_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+step "0/10" "Installing pause image airgap bundle"
+mkdir -p "$AIRGAP_DIR"
+
+# Layer A — install from the pre-bundled tar shipped with the patch.
+# 'make patch' on the dev machine pulls pause:3.6 via docker/skopeo and saves it
+# as patch/pause-3.6.tar so every node gets it with no internet dependency.
+if [ -f "$PATCH_DIR/pause-3.6.tar" ]; then
+    cp -f "$PATCH_DIR/pause-3.6.tar" "$AIRGAP_FILE"
+    ok "Installed pause image from patch bundle → $AIRGAP_FILE (network-independent)"
+else
+    warn "patch/pause-3.6.tar not found — re-run 'make patch' on dev machine with docker/skopeo installed"
+    warn "Nodes will attempt to pull pause image from the internet at k3s startup"
+fi
+
+# Layer B — hot-inject into running containerd (upgrade-in-place path).
+if [ -S "$CONTAINERD_SOCK" ]; then
+    if [ -f "$AIRGAP_FILE" ]; then
+        # Import the tar we just installed so the running containerd sees it now.
+        if k3s ctr images import "$AIRGAP_FILE" 2>/dev/null; then
+            k3s ctr images tag "$PAUSE_IMG" "$PAUSE_ALIAS" 2>/dev/null || true
+            ok "Hot-imported pause image into running containerd — pods recover without restart"
+        fi
+    else
+        # No bundle — attempt a live pull as best-effort fallback.
+        if k3s ctr images pull "$PAUSE_IMG" 2>/dev/null; then
+            k3s ctr images tag "$PAUSE_IMG" "$PAUSE_ALIAS" 2>/dev/null || true
+            k3s ctr images export "$AIRGAP_FILE" "$PAUSE_IMG" 2>/dev/null || true
+            ok "Pulled + cached $PAUSE_IMG from registry.k8s.io (network was available)"
+        else
+            warn "Live pull of $PAUSE_IMG failed — k3s will retry at startup after rules are cleaned"
+        fi
+    fi
+fi
+
 # ── 1. Dependencies ────────────────────────────────────────────────────────────
 step "1/10" "Ensuring dependencies"
+
+# Pre-apt connectivity check: confirm port 80 is reachable before running apt.
+# If it still gets connection refused here, an iptables rule is still blocking it.
+# Diagnose by dumping the nat OUTPUT chain so we know exactly what rule is at fault.
+if ! timeout 3 bash -c 'echo >/dev/tcp/91.189.91.81/80' 2>/dev/null; then
+    warn "TCP port 80 still blocked — checking iptables nat OUTPUT chain:"
+    iptables -t nat -L OUTPUT -n --line-numbers 2>/dev/null | head -20 || true
+    warn "Attempting full nat OUTPUT flush as fallback"
+    iptables -t nat -F OUTPUT 2>/dev/null || true
+fi
 
 PKGS=""
 command -v jq      &>/dev/null || PKGS="$PKGS jq"
@@ -75,12 +526,27 @@ dpkg -s nfs-common       &>/dev/null 2>&1 || PKGS="$PKGS nfs-common"
 dpkg -s multipath-tools  &>/dev/null 2>&1 || PKGS="$PKGS multipath-tools"
 
 if [ -n "$PKGS" ]; then
-    apt-get update -qq
+    apt-get -o Acquire::ForceIPv4=true update -qq
     # shellcheck disable=SC2086
-    apt-get install -y -qq $PKGS
+    apt-get -o Acquire::ForceIPv4=true install -y -qq $PKGS
     ok "Installed:$PKGS"
 else
     ok "All dependencies present"
+fi
+
+# k3s — node-agent manages this directly; install binary only (no systemd service).
+# INSTALL_K3S_SKIP_ENABLE + INSTALL_K3S_SKIP_START ensure the installer doesn't
+# create or start a k3s.service — node-agent owns the lifecycle via exec.
+if ! command -v k3s &>/dev/null; then
+    ok "Installing k3s (binary only, systemd service will be masked)..."
+    if INSTALL_K3S_SKIP_ENABLE=true INSTALL_K3S_SKIP_START=true \
+            curl -sfL https://get.k3s.io | sh - 2>/dev/null; then
+        ok "k3s installed ($(k3s --version 2>/dev/null | head -1))"
+    else
+        warn "k3s install failed — ensure internet access or pre-install k3s manually"
+    fi
+else
+    ok "k3s already present ($(k3s --version 2>/dev/null | head -1))"
 fi
 
 # Enable and start iscsid (required by Longhorn for iSCSI volume attachment).
@@ -174,7 +640,22 @@ pkill -9 munged            2>/dev/null || true
 pkill -9 slurmctld         2>/dev/null || true
 pkill -9 slurmd            2>/dev/null || true
 sleep 1
-ok "All services stopped"
+
+# Kill orphaned k3s-embedded containerd.
+#
+# pkill -9 on 'k3s server'/'k3s agent' SIGKILLs k3s but leaves its embedded
+# containerd subprocess orphaned — containerd is a separate child process that
+# keeps running at /run/k3s/containerd/containerd.sock with the OLD in-memory
+# config (sandbox_image="rancher/mirrored-pause:3.6").  When the new k3s binary
+# starts it finds the socket, reuses the running containerd, and inherits the
+# stale config — even though the new binary passes
+# --pause-image registry.k8s.io/pause:3.6.  Killing it here forces a fresh
+# containerd start with the correct config every time.
+pkill -TERM -f '/run/k3s/containerd/containerd' 2>/dev/null || true
+sleep 2
+pkill -KILL -f '/run/k3s/containerd/containerd' 2>/dev/null || true
+rm -f /run/k3s/containerd/containerd.sock 2>/dev/null || true
+ok "All services stopped (incl. orphaned k3s containerd)"
 
 # Mask SLURM + munge systemd units — node-agent manages them directly via exec.
 # Without masking, systemd races node-agent and starts slurmd before slurm.conf exists.
@@ -183,6 +664,16 @@ for svc in slurmd slurmctld munge; do
     systemctl mask    "$svc".service 2>/dev/null || true
 done
 ok "Masked slurmd / slurmctld / munge (node-agent manages these directly)"
+
+# Mask k3s systemd units — node-agent manages k3s directly via exec.
+# Without masking, the k3s installer's systemd service races node-agent's direct
+# exec, causing double-start and port 6443 conflicts.
+for svc in k3s k3s-agent; do
+    systemctl stop    "$svc".service 2>/dev/null || true
+    systemctl disable "$svc".service 2>/dev/null || true
+    systemctl mask    "$svc".service 2>/dev/null || true
+done
+ok "Masked k3s / k3s-agent (node-agent manages these directly)"
 
 # ── 5. Wipe stale state ────────────────────────────────────────────────────────
 step "5/10" "Wiping stale cluster state"
@@ -198,9 +689,61 @@ if [ -d /var/lib/rancher/k3s/server/db ]; then
     rm -rf /var/lib/rancher/k3s/server/db
     ok "Removed stale K3s etcd database"
 fi
+
+# K3s agent — surgical wipe: remove auth/bootstrap/config files so the agent
+# re-bootstraps against the correct leader, but PRESERVE the containerd image
+# store (/var/lib/rancher/k3s/agent/containerd/).
+#
+# WHY preserve containerd?
+#   Wiping the full agent dir removes all cached images, including pause:3.6.
+#   On the next start k3s must re-pull pause:3.6 from the internet.  If the
+#   node has no internet at that moment (common when the exit-node setup is
+#   still converging), pod sandbox creation fails with
+#   "failed to get sandbox image rancher/mirrored-pause:3.6: connection refused".
+#   Keeping the containerd blobs means the image is served from disk and no
+#   network pull is needed.
 if [ -d /var/lib/rancher/k3s/agent ]; then
-    rm -rf /var/lib/rancher/k3s/agent
-    ok "Removed stale K3s agent state"
+    for _stale in etc .lock server-ca.crt server-ca.key \
+                  client-ca.crt client-kubelet.crt client-kubelet.key \
+                  kubelet.kubeconfig token; do
+        rm -rf "/var/lib/rancher/k3s/agent/${_stale}" 2>/dev/null || true
+    done
+    ok "Cleared k3s agent auth/config (containerd image store preserved)"
+fi
+
+# ── 5b. Pre-seed cluster CA certificate ────────────────────────────────────────
+# Root cause of "failed to get CA certs: connection reset by peer" every 2 s:
+#   k3s agent starts an internal load-balancer on port 6444 that proxies to the
+#   k3s server on 6443.  During the LB's backend health-probe warm-up (typically
+#   5–30 s) the LB RSTs any incoming connection.  Agent goroutines fetching
+#   /cacerts through 6444 hit these RSTs and log the error every 2 s.
+#
+# Fix: place a pre-shared CA cert so k3s agent trusts the server TLS immediately
+# without fetching /cacerts at all.  k3s uses two file paths:
+#   /var/lib/rancher/k3s/agent/server-ca.crt  — agent reads at startup to trust
+#       the server TLS handshake; skips the /cacerts HTTP fetch entirely.
+#   /var/lib/rancher/k3s/server/tls/server-ca.crt + server-ca.key  — if present
+#       when k3s server starts, k3s uses this CA instead of generating a new one.
+#       All nodes sharing the same CA means workers always have the right cert.
+#
+# This step runs AFTER the surgical wipe above so the cert is not removed again.
+if [ -f "$PATCH_DIR/k3s-ca.crt" ] && [ -f "$PATCH_DIR/k3s-ca.key" ]; then
+    # Agent path — all nodes (leader and workers).
+    mkdir -p /var/lib/rancher/k3s/agent
+    cp -f "$PATCH_DIR/k3s-ca.crt" /var/lib/rancher/k3s/agent/server-ca.crt
+    chmod 644 /var/lib/rancher/k3s/agent/server-ca.crt
+    ok "Installed cluster CA → /var/lib/rancher/k3s/agent/server-ca.crt (agent will skip /cacerts fetch)"
+
+    # Server path — leader only, but harmless on workers (k3s server is not run there).
+    mkdir -p /var/lib/rancher/k3s/server/tls
+    cp -f "$PATCH_DIR/k3s-ca.crt" /var/lib/rancher/k3s/server/tls/server-ca.crt
+    cp -f "$PATCH_DIR/k3s-ca.key" /var/lib/rancher/k3s/server/tls/server-ca.key
+    chmod 644 /var/lib/rancher/k3s/server/tls/server-ca.crt
+    chmod 600 /var/lib/rancher/k3s/server/tls/server-ca.key
+    ok "Installed cluster CA → /var/lib/rancher/k3s/server/tls/ (leader will use shared CA)"
+else
+    warn "patch/k3s-ca.crt not found — run 'make patch' on dev machine to generate it"
+    warn "k3s agent will fall back to fetching /cacerts (expect brief 6444 RST errors at boot)"
 fi
 
 # K3s IP-marker file used by the new server.go to detect node IP changes
@@ -216,6 +759,42 @@ rm -f /run/clusteros/status.json 2>/dev/null || true
 # Munge socket left behind by a crashed munged
 rm -f /var/run/munge/munge.socket.2 2>/dev/null || true
 
+# Orphaned kubelet pod volumes — kubelet refuses to rmdir() a volume if the
+# directory is non-empty (e.g. Longhorn local-volume data left behind when the
+# pod was force-deleted or the node crashed).  kubelet logs these as:
+#   "orphaned pod found, but failed to rmdir() volume ... directory not empty"
+# and retries every 2 s indefinitely — filling the journal with noise.
+#
+# Root cause of persistence across patches: Longhorn local-volumes use nested
+# bind-mounts.  Per-mount 'umount -l' misses nested entries so directories stay
+# non-empty.  'umount -R -f' (recursive + force) walks the entire subtree and
+# detaches ALL mounts in one call, after which rm -rf succeeds.
+# k3s is already stopped above, so this is safe.
+KUBELET_PODS_DIR="/var/lib/kubelet/pods"
+if [ -d "$KUBELET_PODS_DIR" ]; then
+    # Two-pass unmount to reliably remove Longhorn local-volume nested bind-mounts.
+    #
+    # Pass 1 — enumerate all mount points under the pods dir and lazy-unmount each
+    #   individually in reverse depth order (deepest/longest path first).
+    #   'umount -l' (lazy) succeeds even on busy mounts by detaching from the
+    #   namespace immediately; the kernel cleans up when the last fd is closed.
+    #   This handles cases where 'umount -R' fails with "target is busy".
+    if command -v findmnt &>/dev/null; then
+        findmnt -R -n -o TARGET "$KUBELET_PODS_DIR" 2>/dev/null \
+            | awk 'length > 0' \
+            | sort -r \
+            | while IFS= read -r mp; do
+                [ "$mp" = "$KUBELET_PODS_DIR" ] && continue
+                umount -l "$mp" 2>/dev/null || true
+              done || true   # findmnt exits 1 when no mounts found; || true prevents pipefail exit
+    fi
+    # Pass 2 — recursive force-unmount for anything pass 1 missed.
+    umount -R -f "$KUBELET_PODS_DIR" 2>/dev/null || true
+    rm -rf "$KUBELET_PODS_DIR" || true
+    mkdir -p "$KUBELET_PODS_DIR"
+    ok "Cleared kubelet pod volume trees (findmnt lazy-unmount + recursive remove)"
+fi
+
 # Stale Rancher Helm release (re-deployed by node-agent with correct auth config)
 KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 export KUBECONFIG
@@ -228,6 +807,68 @@ if command -v helm &>/dev/null && [ -f "$KUBECONFIG" ]; then
 fi
 
 ok "Stale state cleared"
+
+# ── 5b. Pre-seed k3s cluster CA certificate ────────────────────────────────────
+# PURPOSE: eliminate the "failed to get CA certs: connection reset by peer" loop.
+#
+# How the loop happens without this step:
+#   1. k3s agent starts and its internal load-balancer (port 6444) begins probing
+#      the upstream k3s server (port 6443).
+#   2. While the probe is still warming up, k3s's own goroutines try to fetch the
+#      cluster CA cert through the same LB: GET https://127.0.0.1:6444/cacerts
+#   3. The LB resets the connection (backend health probe not confirmed yet) →
+#      k3s logs "failed to get CA certs: connection reset by peer" every 2 s.
+#   4. This is NORMAL for the first 30-60 s but fills the journal with noise.
+#      If the server is genuinely unreachable it loops indefinitely.
+#
+# Fix — pre-seed the CA cert before k3s agent starts:
+#   • /var/lib/rancher/k3s/agent/server-ca.crt  — agent reads this to trust the
+#     server's TLS cert; skips the /cacerts HTTP fetch entirely.
+#   • /var/lib/rancher/k3s/server/tls/server-ca.crt + .key — whichever node
+#     becomes leader uses these instead of generating a new CA, so ALL nodes
+#     share the same CA (consistent TLS across the cluster without extra fetching).
+#
+# The CA cert+key pair is generated ONCE during 'make patch' and bundled here.
+# Stable across re-deployments: the same CA is reused until you delete
+# patch/k3s-ca.crt and re-run 'make patch'.
+
+if [ -f "$SCRIPT_DIR/k3s-ca.crt" ]; then
+    step "5b/10" "Pre-seeding k3s cluster CA certificate"
+
+    # Server directory — used by whichever node wins leader election.
+    # k3s server reads server-ca.crt/.key at startup; if present it uses them
+    # rather than generating a new self-signed CA.  All nodes share the same
+    # CA so any node can verify any other's cert without a separate fetch step.
+    mkdir -p /var/lib/rancher/k3s/server/tls
+    cp "$SCRIPT_DIR/k3s-ca.crt" /var/lib/rancher/k3s/server/tls/server-ca.crt
+    chmod 0644 /var/lib/rancher/k3s/server/tls/server-ca.crt
+    if [ -f "$SCRIPT_DIR/k3s-ca.key" ]; then
+        cp "$SCRIPT_DIR/k3s-ca.key" /var/lib/rancher/k3s/server/tls/server-ca.key
+        chmod 0600 /var/lib/rancher/k3s/server/tls/server-ca.key
+    fi
+
+    # Agent directory — agent checks this file BEFORE making the /cacerts HTTP
+    # request.  Finding a trusted CA here means the LB (6444) bootstrap fetch
+    # is skipped entirely: no "connection reset by peer" noise during startup.
+    mkdir -p /var/lib/rancher/k3s/agent
+    cp "$SCRIPT_DIR/k3s-ca.crt" /var/lib/rancher/k3s/agent/server-ca.crt
+    chmod 0644 /var/lib/rancher/k3s/agent/server-ca.crt
+
+    ok "k3s cluster CA pre-seeded → server/tls/ and agent/server-ca.crt"
+    ok "  Agents will trust the leader TLS cert immediately (no /cacerts fetch loop)"
+else
+    warn "No k3s-ca.crt in patch directory — k3s will generate a new CA on leader start"
+    warn "  Run 'make patch' on the build machine to generate and bundle the CA cert"
+fi
+
+# If a pre-seeded token was provided with the patch, install it so agents can
+# bootstrap without fetching a token from the leader over the network.
+if [ -f "$SCRIPT_DIR/k3s-token" ]; then
+    mkdir -p /var/lib/rancher/k3s/agent
+    cp -f "$SCRIPT_DIR/k3s-token" /var/lib/rancher/k3s/agent/token
+    chmod 0600 /var/lib/rancher/k3s/agent/token || true
+    ok "Installed pre-seeded k3s token → /var/lib/rancher/k3s/agent/token"
+fi
 
 # ── 6. Munge directories ───────────────────────────────────────────────────────
 step "6/10" "Munge directories"
@@ -242,6 +883,17 @@ else
     warn "munge user not found — install: apt-get install -y munge"
 fi
 
+    # If a fallback munge key is bundled in the patch directory, install it now.
+    if [ -f "$SCRIPT_DIR/munge.key" ]; then
+        step "6a/10" "Installing fallback munge key from patch/munge.key"
+        cp "$SCRIPT_DIR/munge.key" /etc/munge/munge.key
+        chmod 0400 /etc/munge/munge.key
+        if id munge &>/dev/null; then
+            chown munge:munge /etc/munge/munge.key
+        fi
+        ok "Installed fallback munge key to /etc/munge/munge.key (0400)"
+    fi
+
 # ── 7. Firewall ────────────────────────────────────────────────────────────────
 step "7/10" "Firewall rules"
 
@@ -255,6 +907,8 @@ open_port() {
 }
 
 open_port 22    tcp   # SSH
+open_port 80    tcp   # HTTP  — nginx-ingress hostNetwork (no REDIRECT needed)
+open_port 443   tcp   # HTTPS — nginx-ingress hostNetwork
 open_port 7946  tcp   # Serf gossip
 open_port 7946  udp
 open_port 6443  tcp   # K3s API
@@ -281,8 +935,154 @@ iptables -C INPUT -s 100.64.0.0/10 -j ACCEPT 2>/dev/null || \
 
 ok "Firewall rules applied (including Tailscale interface trust)"
 
+# Remove any stale NAT REDIRECTs (80→30080, 443→30443) that may redirect
+# outbound or inbound traffic to local ports. Older versions created PREROUTING
+# or OUTPUT REDIRECT rules which interfere with outbound TLS and local tests.
+cleanup_redirect() {
+    local from="$1" to="$2"
+    # PREROUTING
+    while iptables -t nat -C PREROUTING -p tcp --dport "$from" -j REDIRECT --to-ports "$to" 2>/dev/null; do
+        iptables -t nat -D PREROUTING -p tcp --dport "$from" -j REDIRECT --to-ports "$to" 2>/dev/null || break
+    done
+    # OUTPUT (local process redirection)
+    while iptables -t nat -C OUTPUT -p tcp --dport "$from" -j REDIRECT --to-ports "$to" 2>/dev/null; do
+        iptables -t nat -D OUTPUT -p tcp --dport "$from" -j REDIRECT --to-ports "$to" 2>/dev/null || break
+    done
+}
+
+cleanup_redirect 80 30080 || true
+cleanup_redirect 443 30443 || true
+
+# UFW FORWARD policy (required for pod traffic through kube-proxy DNAT).
+# Default is DROP; pods cannot route through the host without ACCEPT.
+if [ -f /etc/default/ufw ] && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw; then
+    sed -i 's/^DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+    ufw reload &>/dev/null 2>&1 || true
+    ok "UFW FORWARD policy set to ACCEPT (was DROP — required for pod routing)"
+fi
+
+# IP forwarding — nodes must route packets between LAN, Tailscale, and pod network.
+sysctl -w net.ipv4.ip_forward=1 &>/dev/null || true
+cat > /etc/sysctl.d/99-clusteros.conf <<'EOF'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+sysctl -p /etc/sysctl.d/99-clusteros.conf &>/dev/null || true
+ok "IP forwarding enabled (persistent via /etc/sysctl.d/99-clusteros.conf)"
+
+# Pod CIDR FORWARD rules — Flannel VXLAN packets must traverse the FORWARD chain.
+for cidr in "10.42.0.0/16" "10.43.0.0/16"; do
+    iptables -C FORWARD -d "$cidr" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -d "$cidr" -j ACCEPT 2>/dev/null || true
+    iptables -C FORWARD -s "$cidr" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -s "$cidr" -j ACCEPT 2>/dev/null || true
+done
+for iface in flannel.1 cni0; do
+    ufw allow in on "$iface" &>/dev/null 2>&1 || true
+    iptables -C FORWARD -i "$iface" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i "$iface" -j ACCEPT 2>/dev/null || true
+    iptables -C FORWARD -o "$iface" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o "$iface" -j ACCEPT 2>/dev/null || true
+done
+ok "Pod CIDRs 10.42.0.0/16 + 10.43.0.0/16 allowed in FORWARD"
+
+# Snapshot the clean iptables state after all our rules are in place.
+# iptables-persistent is disabled so this file won't be auto-loaded on boot,
+# but it acts as a safety net if someone re-enables the service later — they
+# get our clean rules rather than old stale REDIRECT/DROP rules.
+if command -v iptables-save &>/dev/null; then
+    mkdir -p /etc/iptables
+    # Write atomically to avoid partial files if the save fails mid-write.
+    if iptables-save > /etc/iptables/rules.v4.tmp 2>/dev/null; then
+        mv /etc/iptables/rules.v4.tmp /etc/iptables/rules.v4
+    else
+        rm -f /etc/iptables/rules.v4.tmp 2>/dev/null || true
+    fi
+    ok "Saved clean iptables snapshot to /etc/iptables/rules.v4 (iptables-persistent is disabled)"
+fi
+
+# ── 7b. K3s pause image + registry mirrors ────────────────────────────────────
+# Two-layer fix for "failed to get sandbox image rancher/mirrored-pause:3.6":
+#
+# Layer 1 — config.yaml (persistent, read by k3s server AND agent at every start)
+#   Forces sandbox_image = registry.k8s.io/pause:3.6 in containerd's CRI config.
+#   More reliable than --pause-image CLI flags because this file is always read
+#   regardless of how k3s is invoked.
+#
+# Layer 2 — registries.yaml rewrite (containerd-level redirect, belt-and-suspenders)
+#   Even if containerd still requests "rancher/mirrored-pause:3.6", the rewrite
+#   intercepts the pull BEFORE it reaches the network and redirects to
+#   registry.k8s.io/pause:3.6 (Google CDN, not Docker Hub).
+step "7b/10" "Configuring k3s pause image and registry mirrors"
+
+mkdir -p /etc/rancher/k3s /etc/clusteros
+
+# Reliable upstream DNS file for k3s CoreDNS.
+# k3s reads this via 'resolv-conf' below to configure CoreDNS's forwarding upstreams.
+# Using public DNS (8.8.8.8/1.1.1.1) means CoreDNS can always resolve external names
+# even if the node's ISP DNS is unreachable.  This also prevents the CoreDNS Corefile
+# from being configured with "forward . 10.43.0.10" (circular) when the cluster DNS
+# entry somehow ends up in /etc/resolv.conf before k3s reads it.
+cat > /etc/clusteros/resolv.conf <<'DNSEOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+nameserver 8.8.4.4
+DNSEOF
+ok "Created /etc/clusteros/resolv.conf with reliable upstream DNS for k3s CoreDNS"
+
+# Configure systemd-resolved FallbackDNS so DNS survives k3s restarts / crashes.
+# When k3s is down, /etc/resolv.conf still points to 10.43.0.10 (CoreDNS),
+# but with FallbackDNS set, systemd-resolved falls back to 8.8.8.8 automatically.
+if [ -f /etc/systemd/resolved.conf ]; then
+    if ! grep -q '^FallbackDNS=' /etc/systemd/resolved.conf 2>/dev/null; then
+        if grep -q '^\[Resolve\]' /etc/systemd/resolved.conf 2>/dev/null; then
+            sed -i '/^\[Resolve\]/a FallbackDNS=8.8.8.8 1.1.1.1' /etc/systemd/resolved.conf
+        else
+            printf '\n[Resolve]\nFallbackDNS=8.8.8.8 1.1.1.1\n' >> /etc/systemd/resolved.conf
+        fi
+        systemctl restart systemd-resolved 2>/dev/null || true
+        ok "systemd-resolved: FallbackDNS=8.8.8.8 1.1.1.1 configured"
+    else
+        ok "systemd-resolved: fallback DNS already configured"
+    fi
+fi
+
+# Layer 1: k3s persistent config — forces the correct pause image for all modes
+cat > /etc/rancher/k3s/config.yaml <<'K3SCFG'
+# ClusterOS: use the official k8s pause image from Google CDN (not Docker Hub).
+# Docker Hub (registry-1.docker.io) is frequently rate-limited or unreachable;
+# this setting applies to both k3s server and k3s agent at every startup.
+pause-image: "registry.k8s.io/pause:3.6"
+# Use our reliable upstream DNS file so CoreDNS always has 8.8.8.8/1.1.1.1 as
+# forwarders — even if the node's /etc/resolv.conf is pointing to CoreDNS itself.
+resolv-conf: "/etc/clusteros/resolv.conf"
+K3SCFG
+ok "k3s config.yaml written → pause-image + resolv-conf: /etc/clusteros/resolv.conf"
+
+# Layer 2: containerd rewrite rule — redirects pause image pulls at network level.
+# If containerd still requests "docker.io/rancher/mirrored-pause:3.6" (e.g. from a
+# stale CRI config), the rewrite "^rancher/mirrored-pause:(.*)" → "pause:$1" strips
+# the rancher prefix, and the registry.k8s.io endpoint serves the correct image.
+# Other docker.io images fall through to registry-1.docker.io unchanged.
+cat > /etc/rancher/k3s/registries.yaml <<'REGSEOF'
+mirrors:
+  "docker.io":
+    endpoint:
+      - "https://registry.k8s.io"
+      - "https://registry-1.docker.io"
+    rewrite:
+      "^rancher/mirrored-pause:(.*)": "pause:$1"
+  "registry.k8s.io":
+    endpoint:
+      - "https://registry.k8s.io"
+  "ghcr.io":
+    endpoint:
+      - "https://ghcr.io"
+REGSEOF
+ok "registries.yaml written → docker.io/rancher/mirrored-pause:X redirected to registry.k8s.io/pause:X"
+
 # ── 8. Install files ───────────────────────────────────────────────────────────
 step "8/10" "Installing files"
+
+# Show bundle contents so deploy logs clearly show what was uploaded.
+echo "  Bundle contents in $SCRIPT_DIR:"
+ls -1 "$SCRIPT_DIR/" 2>/dev/null | sed 's/^/    /' || true
 
 mkdir -p /run/clusteros
 chmod 755 /run/clusteros
@@ -324,8 +1124,42 @@ for script in cluster-status cluster-test cluster-dashboard cluster-init cluster
 done
 ok "Legacy helper scripts installed"
 
+# cluster-make-usb — re-install in case the early-install above was skipped
+# (e.g. manual apply-patch.sh run from a partial bundle without cluster-make-usb.sh
+# that was later fixed by re-running from a full bundle reaching step 8).
+if [ -f "$SCRIPT_DIR/cluster-make-usb.sh" ]; then
+    install -m 755 "$SCRIPT_DIR/cluster-make-usb.sh" /usr/local/bin/cluster-make-usb
+    ok "cluster-make-usb confirmed at /usr/local/bin/cluster-make-usb"
+fi
+
+# Persist apply-patch.sh to /usr/local/lib/clusteros/ so cluster-make-usb can
+# bundle it into USB installers it creates (without needing ~/patch/ to exist).
+mkdir -p /usr/local/lib/clusteros
+install -m 755 "$SCRIPT_DIR/apply-patch.sh" /usr/local/lib/clusteros/apply-patch.sh
+ok "apply-patch.sh persisted → /usr/local/lib/clusteros/apply-patch.sh"
+
+# clusteros-make-usb systemd service (oneshot, triggered manually).
+if [ -f "$SCRIPT_DIR/systemd/clusteros-make-usb.service" ]; then
+    install -m 644 "$SCRIPT_DIR/systemd/clusteros-make-usb.service" \
+        /etc/systemd/system/clusteros-make-usb.service
+    systemctl daemon-reload 2>/dev/null || true
+    ok "clusteros-make-usb.service installed (trigger: sudo systemctl start clusteros-make-usb)"
+fi
+
 # ── 9. Start and verify ────────────────────────────────────────────────────────
+
 step "9/10" "Starting node-agent and verifying"
+
+# Temporarily disable node-agent firewall modifications while the patch
+# completes. The service unit reads /etc/cluster-os/node-agent.env (EnvironmentFile)
+# at start; creating this file with CLUSTEROS_SKIP_FIREWALL=1 prevents the daemon
+# from re-adding redirect rules that could block apt/containerd during patch.
+NODE_ENV_DIR="/etc/cluster-os"
+NODE_ENV_FILE="$NODE_ENV_DIR/node-agent.env"
+mkdir -p "$NODE_ENV_DIR"
+echo 'CLUSTEROS_SKIP_FIREWALL=1' > "$NODE_ENV_FILE"
+chmod 0644 "$NODE_ENV_FILE" || true
+ok "Temporarily set CLUSTEROS_SKIP_FIREWALL=1 → $NODE_ENV_FILE"
 
 systemctl start node-agent
 sleep 4
@@ -349,6 +1183,67 @@ if [ -f /run/clusteros/status.json ] && command -v jq &>/dev/null; then
     ok "Status file created  (phase=$PHASE)"
 else
     warn "Status file not yet written — node-agent may still be starting"
+fi
+
+# Remove the temporary env override so the daemon will run its normal
+# firewall setup on the next reboot. Leaving this file removed now avoids
+# permanently disabling the firewall behavior after the patch completes.
+if [ -f "$NODE_ENV_FILE" ]; then
+    rm -f "$NODE_ENV_FILE" || true
+    ok "Removed temporary node-agent env file: $NODE_ENV_FILE (firewall setup will run on next reboot)"
+fi
+
+# Install one-time cleanup script + systemd unit from the patch bundle (if present)
+if [ -f "$SCRIPT_DIR/scripts/clear-stale-redirects.sh" ]; then
+    install -m 755 "$SCRIPT_DIR/scripts/clear-stale-redirects.sh" /usr/local/bin/clear-stale-redirects.sh
+    ok "Installed clear-stale-redirects.sh → /usr/local/bin/clear-stale-redirects.sh"
+    if [ -f "$SCRIPT_DIR/systemd/clear-stale-redirects.service" ]; then
+        install -m 644 "$SCRIPT_DIR/systemd/clear-stale-redirects.service" /etc/systemd/system/clear-stale-redirects.service
+        systemctl daemon-reload
+        # Start now and enable for next boot; the script disables & removes the unit after running.
+        systemctl enable --now clear-stale-redirects.service 2>/dev/null || systemctl start clear-stale-redirects.service 2>/dev/null || true
+        ok "Installed + started clear-stale-redirects.service"
+    else
+        # If unit not bundled, run script immediately to attempt cleanup now.
+        /usr/local/bin/clear-stale-redirects.sh || true
+    fi
+fi
+
+# ── Kubeconfig cleanup ─────────────────────────────────────────────────────────
+# k3s writes /etc/rancher/k3s/k3s.yaml as mode 0600 (root-only) by default.
+# If the node previously ran as a leader, this file may also contain an invalid
+# 0.0.0.0:6443 server address (written when Tailscale wasn't up yet at k3s start).
+# Fix both so that non-root users (e.g. the 'clusteros' account running
+# 'cluster test') can use kubectl immediately without sudo.
+KUBECONFIG_FILE="/etc/rancher/k3s/k3s.yaml"
+if [ -f "$KUBECONFIG_FILE" ]; then
+    # Fix permissions
+    chmod 0644 "$KUBECONFIG_FILE" 2>/dev/null && ok "kubeconfig: set mode 0644" || true
+    # Fix 0.0.0.0 → 127.0.0.1 (stale address from a previous leader role)
+    if grep -q 'server: https://0\.0\.0\.0' "$KUBECONFIG_FILE" 2>/dev/null; then
+        sed -i 's|server: https://0\.0\.0\.0:|server: https://127.0.0.1:|g' "$KUBECONFIG_FILE"
+        ok "kubeconfig: fixed 0.0.0.0 → 127.0.0.1"
+    fi
+    # Symlink into standard kubectl location for all users
+    mkdir -p /etc/skel/.kube /root/.kube
+    ln -sf "$KUBECONFIG_FILE" /root/.kube/config 2>/dev/null || true
+    if id clusteros &>/dev/null; then
+        CLUSTEROS_HOME=$(getent passwd clusteros | cut -d: -f6)
+        mkdir -p "${CLUSTEROS_HOME}/.kube"
+        ln -sf "$KUBECONFIG_FILE" "${CLUSTEROS_HOME}/.kube/config" 2>/dev/null || true
+    fi
+    ok "kubeconfig: symlinked to ~/.kube/config for root and clusteros"
+else
+    ok "kubeconfig: not present yet (will be written when k3s server starts on leader)"
+fi
+
+# Also fix agent kubelet kubeconfig (used by kubelet) if present and points to 0.0.0.0
+AGENT_KUBECONFIG="/var/lib/rancher/k3s/agent/kubelet.kubeconfig"
+if [ -f "$AGENT_KUBECONFIG" ]; then
+    if grep -q 'server: https://0\.0\.0\.0' "$AGENT_KUBECONFIG" 2>/dev/null; then
+        sed -i 's|server: https://0\.0\.0\.0:|server: https://127.0.0.1:|g' "$AGENT_KUBECONFIG" || true
+        ok "agent kubeconfig: fixed 0.0.0.0 → 127.0.0.1 in $AGENT_KUBECONFIG"
+    fi
 fi
 
 # ── Summary ────────────────────────────────────────────────────────────────────

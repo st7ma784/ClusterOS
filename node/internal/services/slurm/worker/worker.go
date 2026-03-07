@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"syscall"
@@ -18,11 +19,12 @@ import (
 // by the phase machine — no cluster-state lookups, no retry loops.
 type SLURMWorker struct {
 	*roles.BaseRole
-	controllerIP    string
-	mungeKey        []byte
-	nodeIP          string
-	slurmdCmd       *exec.Cmd
-	mungeKeyManager *auth.MungeKeyManager
+	controllerIP     string
+	mungeKey         []byte
+	nodeIP           string
+	slurmdCmd        *exec.Cmd
+	mungeKeyManager  *auth.MungeKeyManager
+	skipClientConfig bool // true when running on the controller (full slurm.conf already present)
 }
 
 // NewSLURMWorkerRole creates a worker with explicit connection parameters.
@@ -33,6 +35,19 @@ func NewSLURMWorkerRole(controllerIP string, mungeKey []byte, nodeIP string, log
 		mungeKey:        mungeKey,
 		nodeIP:          nodeIP,
 		mungeKeyManager: auth.NewMungeKeyManager(logger),
+	}
+}
+
+// NewSLURMWorkerRoleNoConfig creates a worker that skips writing /etc/slurm/slurm.conf.
+// Used on the controller node, which already has a full slurm.conf written by slurmctld.
+func NewSLURMWorkerRoleNoConfig(controllerIP string, mungeKey []byte, nodeIP string, logger *logrus.Logger) *SLURMWorker {
+	return &SLURMWorker{
+		BaseRole:         roles.NewBaseRole("slurm-worker", logger),
+		controllerIP:     controllerIP,
+		mungeKey:         mungeKey,
+		nodeIP:           nodeIP,
+		mungeKeyManager:  auth.NewMungeKeyManager(logger),
+		skipClientConfig: true,
 	}
 }
 
@@ -61,8 +76,11 @@ func (sw *SLURMWorker) Start() error {
 
 	// Write a minimal slurm.conf for CLIENT tools (squeue, sbatch, sinfo) only.
 	// slurmd itself fetches its full config from the controller via --conf-server.
-	if err := sw.writeClientConfig(); err != nil {
-		return fmt.Errorf("write slurm client config: %w", err)
+	// Skip on the controller node — its full slurm.conf must not be overwritten.
+	if !sw.skipClientConfig {
+		if err := sw.writeClientConfig(); err != nil {
+			return fmt.Errorf("write slurm client config: %w", err)
+		}
 	}
 
 	if err := sw.startSlurmd(); err != nil {
@@ -113,11 +131,34 @@ AccountingStorageType=accounting_storage/none
 	return os.WriteFile("/etc/slurm/slurm.conf", []byte(conf), 0644)
 }
 
+// waitForSlurmctld polls controllerIP:6817 until reachable or deadline passes.
+// This prevents slurmd from exiting immediately with "connect failure" when the
+// cluster is still starting up, which would trigger a rapid HealthCheck restart loop.
+func (sw *SLURMWorker) waitForSlurmctld() {
+	if sw.controllerIP == "" {
+		return
+	}
+	addr := sw.controllerIP + ":6817"
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err == nil {
+			conn.Close()
+			sw.Logger().Infof("slurmctld reachable at %s", addr)
+			return
+		}
+		sw.Logger().Debugf("Waiting for slurmctld at %s (%v)...", addr, err)
+		time.Sleep(5 * time.Second)
+	}
+	sw.Logger().Warnf("slurmctld at %s not reachable after 90s — starting slurmd anyway", addr)
+}
+
 func (sw *SLURMWorker) startSlurmd() error {
 	// Use --conf-server so slurmd fetches the authoritative config from slurmctld.
 	// This avoids the NodeName=localhost problem: slurmd registers itself with its
 	// actual hostname/IP, which must match a NodeName entry in the controller's config
 	// (populated by the leader's Serf watcher).
+	sw.waitForSlurmctld()
 	confServer := fmt.Sprintf("%s:6817", sw.controllerIP)
 	args := []string{"-D", "--conf-server", confServer}
 
@@ -137,20 +178,33 @@ func (sw *SLURMWorker) startSlurmd() error {
 	}
 	sw.slurmdCmd = cmd
 	sw.Logger().Infof("slurmd started (PID %d, conf-server=%s, node=%s)", cmd.Process.Pid, confServer, nodeName)
+
+	// Reap the process when it exits so HealthCheck can detect death via nil check.
+	// Without this, slurmd becomes a zombie on exit: kill(pid,0) on a zombie returns 0
+	// (success), so Signal(0) never errors and HealthCheck never triggers a restart.
+	go func(c *exec.Cmd) {
+		c.Wait()
+		sw.Logger().Warnf("slurmd (PID %d) exited — HealthCheck will restart", c.Process.Pid)
+		if sw.slurmdCmd == c {
+			sw.slurmdCmd = nil
+			sw.SetRunning(false)
+		}
+	}(cmd)
 	return nil
 }
 
 func (sw *SLURMWorker) stopSlurmd() error {
-	if sw.slurmdCmd == nil || sw.slurmdCmd.Process == nil {
+	cmd := sw.slurmdCmd // capture before reaper goroutine can nil it
+	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	sw.slurmdCmd.Process.Signal(os.Interrupt)
+	cmd.Process.Signal(os.Interrupt)
 	done := make(chan error, 1)
-	go func() { done <- sw.slurmdCmd.Wait() }()
+	go func() { done <- cmd.Wait() }()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		sw.slurmdCmd.Process.Kill()
+		cmd.Process.Kill()
 		<-done
 	}
 	sw.slurmdCmd = nil

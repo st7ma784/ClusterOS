@@ -169,6 +169,18 @@ See [SECURITY.md](SECURITY.md) and [docs/cluster-authentication.md](docs/cluster
 4. **Failure as First-Class** - Automatic re-election, partition tolerance
 5. **No Single Point of Failure** - Fully distributed control plane
 
+## Networking
+
+Cluster-OS uses a three-layer networking model:
+
+- **Layer 1: Physical LAN / WiFi** — DHCP host IPs, unrestricted outbound 80/443 (required for image pulls)
+- **Layer 2: Tailscale Mesh (100.64.0.0/10)** — all cluster-internal traffic (Serf, k3s API, SLURM, etcd); fully encrypted; trusted on INPUT
+- **Layer 3: k3s Pod Network (Flannel)** — pod IPs 10.42.0.0/16, service IPs 10.43.0.0/16; FORWARD chain must ACCEPT these CIDRs
+
+**Ingress design**: nginx-ingress runs as a DaemonSet with `hostNetwork: true`, binding directly to host ports 80/443. No iptables REDIRECT or PREROUTING rules are used — these would intercept outbound connections from containerd, helm, and apt, breaking image pulls.
+
+See [docs/NETWORKING.md](docs/NETWORKING.md) for the full networking guide including traffic flows, iptables chain order, required sysctl settings, and troubleshooting.
+
 ## Project Structure
 
 ```

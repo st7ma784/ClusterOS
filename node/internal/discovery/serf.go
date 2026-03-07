@@ -299,6 +299,27 @@ func (sd *SerfDiscovery) UpdateTags(tags map[string]string) error {
 	return nil
 }
 
+// DeleteTags removes specific keys from the local node's Serf tag set.
+// Because Serf's SetTags replaces the full set, we rebuild it minus the
+// deleted keys.  Unknown keys are silently ignored.
+func (sd *SerfDiscovery) DeleteTags(keys []string) error {
+	remove := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		remove[k] = true
+	}
+	existing := sd.serf.LocalMember().Tags
+	updated := make(map[string]string, len(existing))
+	for k, v := range existing {
+		if !remove[k] {
+			updated[k] = v
+		}
+	}
+	if err := sd.serf.SetTags(updated); err != nil {
+		return fmt.Errorf("failed to delete tags: %w", err)
+	}
+	return nil
+}
+
 // GetAliveMembers returns all currently alive Serf members
 func (sd *SerfDiscovery) GetAliveMembers() []serf.Member {
 	var alive []serf.Member

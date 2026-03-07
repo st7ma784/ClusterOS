@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -59,6 +60,7 @@ type Daemon struct {
 	leaderName     string
 	slurmCtrl      *controller.SLURMController // non-nil only on leader
 	failedPeerCache *peerFailCache
+	k3sServerURL   string // URL this worker joined with; empty on leader nodes
 }
 
 // Config contains configuration for creating a daemon.
@@ -157,8 +159,18 @@ func (d *Daemon) Start() error {
 		d.logger.Warnf("Networking init failed: %v (continuing)", err)
 	}
 
-	if err := d.setupFirewallRules(); err != nil {
-		d.logger.Warnf("Firewall setup failed: %v (continuing)", err)
+	// Allow an operator or the patch workflow to temporarily skip firewall
+	// modifications. When `CLUSTEROS_SKIP_FIREWALL` is set to "1" or "true",
+	// the daemon will not run `setupFirewallRules()` at startup. This is used
+	// by `apply-patch.sh` to avoid racing with iptables manipulations during
+	// patching and prevents the agent from re-adding redirect rules that would
+	// block outbound traffic while the patch is being applied.
+	if v := os.Getenv("CLUSTEROS_SKIP_FIREWALL"); v == "1" || strings.ToLower(v) == "true" {
+		d.logger.Info("CLUSTEROS_SKIP_FIREWALL set — skipping firewall setup at startup")
+	} else {
+		if err := d.setupFirewallRules(); err != nil {
+			d.logger.Warnf("Firewall setup failed: %v (continuing)", err)
+		}
 	}
 
 	if d.tailscale != nil && d.config.Tailscale.APIDiscovery {
@@ -326,9 +338,50 @@ func (d *Daemon) runProvisioning() error {
 
 	// --- Munge key ---
 	mungeManager := slurmauth.NewMungeKeyManager(d.logger)
-	mungeKey, err := mungeManager.GenerateMungeKey()
-	if err != nil {
-		return fmt.Errorf("generate munge key: %w", err)
+	var mungeKey []byte
+
+	// Prefer an existing local key (persistent across reboots/elections).
+	if k, err := mungeManager.ReadMungeKey(); err == nil && len(k) == slurmauth.MungeKeySize {
+		d.logger.Info("Found existing /etc/munge/munge.key — reusing")
+		mungeKey = k
+	} else if d.discovery != nil {
+		// If no local key, check our Serf tags (could have been published earlier).
+		if tag, ok := d.getLeaderTag("munge-key"); ok && tag != "" {
+			if k2, err := base64.StdEncoding.DecodeString(tag); err == nil && len(k2) == slurmauth.MungeKeySize {
+				d.logger.Info("Found munge-key in Serf tags — using and persisting to disk")
+				mungeKey = k2
+				if err := mungeManager.WriteMungeKey(mungeKey); err != nil {
+					d.logger.Warnf("Failed to persist munge key from tag: %v", err)
+				}
+			} else {
+				d.logger.Warn("munge-key tag present but failed to decode or wrong size")
+			}
+		}
+	}
+
+	// If still empty, generate a fresh key.
+	if mungeKey == nil {
+		mungeKey, err = mungeManager.GenerateMungeKey()
+		if err != nil {
+			return fmt.Errorf("generate munge key: %w", err)
+		}
+	}
+
+	// Publish the munge key immediately so workers can start `munged` as soon
+	// as the leader is elected. The full cluster-ready payload is still
+	// published atomically later by publishClusterReady.
+	// NOTE: do NOT publish extra diagnostic tags (e.g. munge-key-hash) here —
+	// the Serf MetaMaxSize is 512 bytes across all 11 tags; every extra tag
+	// risks pushing the publishClusterReady call over the limit.
+	if d.discovery != nil {
+		mungeKeyB64 := base64.StdEncoding.EncodeToString(mungeKey)
+		d.logger.Infof("Publishing early munge-key (len=%d)", len(mungeKeyB64))
+		d.publishTag("munge-key", mungeKeyB64)
+		if err := d.discovery.SendEvent("munge-key", []byte(mungeKeyB64), false); err != nil {
+			d.logger.Warnf("Failed to send munge-key user event: %v", err)
+		} else {
+			d.logger.Debug("Sent munge-key as Serf user event for reliable delivery")
+		}
 	}
 
 	// --- SLURM controller ---
@@ -358,6 +411,20 @@ func (d *Daemon) runProvisioning() error {
 	// if the two gossip messages arrived via different peers or were in different UDP batches.
 	if err := d.publishClusterReady(serverURL, token, mungeKey); err != nil {
 		return fmt.Errorf("publish cluster ready state: %w", err)
+	}
+
+	// Start slurmd on the leader so it participates as a compute node.
+	// This is essential for single-node clusters and allows jobs to run on the leader.
+	// Uses NewSLURMWorkerRoleNoConfig to avoid overwriting the controller's full slurm.conf.
+	// Register with the role manager BEFORE Start() so that if the first attempt fails
+	// (e.g. slurmctld still initializing), the 30s health-check loop will keep retrying.
+	d.logger.Info("Starting slurmd on leader node...")
+	leaderWorker := worker.NewSLURMWorkerRoleNoConfig(nodeIP, mungeKey, nodeIP, d.logger)
+	d.roleManager.RegisterRole("slurm-worker", leaderWorker)
+	if err := leaderWorker.Start(); err != nil {
+		d.logger.Warnf("slurmd on leader failed to start: %v — will retry via HealthCheck", err)
+	} else {
+		d.logger.Info("slurmd running on leader — leader participates as compute node")
 	}
 
 	// Deploy Longhorn, Rancher, nginx-ingress, slurmdbd in the background.
@@ -398,30 +465,48 @@ func (d *Daemon) runJoining() error {
 	if err != nil {
 		return fmt.Errorf("read k3s-token tag: %w", err)
 	}
+	var mungeKey []byte
 	mungeKeyB64, err := d.waitForLeaderTag("munge-key", "", 5*time.Minute)
 	if err != nil {
-		d.logger.Errorf("munge-key tag not found; leader tags visible: %v", d.getLeaderTags())
-		return fmt.Errorf("read munge-key tag: %w", err)
-	}
-
-	mungeKey, err := base64.StdEncoding.DecodeString(mungeKeyB64)
-	if err != nil {
-		return fmt.Errorf("decode munge key: %w", err)
+		d.logger.Warnf("munge-key tag not found; leader tags visible: %v — will try local munge.key or user-event delivery", d.getLeaderTags())
+		// Attempt to read a locally-applied munge key (might have arrived via user event)
+		mungeManager := slurmauth.NewMungeKeyManager(d.logger)
+		if k, err2 := mungeManager.ReadMungeKey(); err2 == nil {
+			d.logger.Info("Found local /etc/munge/munge.key written by user event; using it")
+			mungeKey = k
+		} else {
+			// No local key — fail with original error
+			return fmt.Errorf("read munge-key tag: %w", err)
+		}
+	} else {
+		mungeKey, err = base64.StdEncoding.DecodeString(mungeKeyB64)
+		if err != nil {
+			return fmt.Errorf("decode munge key: %w", err)
+		}
 	}
 
 	// Extract controller IP from the K3s server URL (https://<IP>:6443).
 	controllerIP := d.extractHost(k3sServerURL)
 	nodeIP := d.getLocalIP()
 
+	// Remember which server URL we joined with so runReady() can detect changes.
+	d.mu.Lock()
+	d.k3sServerURL = k3sServerURL
+	d.mu.Unlock()
+
 	// --- K3s agent ---
+	// Non-fatal: if k3s agent fails (binary missing, version mismatch, TLS error),
+	// we log a warning and continue — SLURM must still start regardless.
 	d.logger.Infof("Starting K3s agent → %s", k3sServerURL)
 	k3sAgent := k3s.NewK3sAgentRole(k3sServerURL, k3sToken, nodeIP, d.logger)
 	if err := k3sAgent.Start(); err != nil {
-		return fmt.Errorf("start k3s agent: %w", err)
+		d.logger.Warnf("k3s agent failed to start: %v — SLURM will still start", err)
+	} else {
+		d.roleManager.RegisterRole("k3s-agent", k3sAgent)
 	}
-	d.roleManager.RegisterRole("k3s-agent", k3sAgent)
 
 	// --- SLURM worker ---
+	// Always attempt, even if k3s failed above.
 	d.logger.Infof("Starting SLURM worker (controller=%s)", controllerIP)
 	slurmWorker := worker.NewSLURMWorkerRole(controllerIP, mungeKey, nodeIP, d.logger)
 	if err := slurmWorker.Start(); err != nil {
@@ -433,11 +518,20 @@ func (d *Daemon) runJoining() error {
 	return nil
 }
 
-// runReady loops, monitoring for leadership changes.
+// runReady loops, monitoring for leadership changes and remote k3s server availability.
 func (d *Daemon) runReady() {
 	d.logger.Info("Cluster ready — monitoring leadership")
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+
+	// serverUnreachable counts how many consecutive 30s checks have found the
+	// k3s server at joinedURL unreachable.  After 10 checks (~5 min) we force a
+	// re-join.  This catches the case where the old leader's Serf member is still
+	// in "suspected" state (not yet marked failed), so ComputeLeader() keeps
+	// returning the old name and getLeaderTag returns the same URL as joinedURL —
+	// meaning the URL-change check below never fires even though a new leader with
+	// a different k3s server has been elected.
+	serverUnreachable := 0
 
 	for {
 		select {
@@ -447,6 +541,7 @@ func (d *Daemon) runReady() {
 			nowLeader := d.leaderElector.IsLeader()
 			d.mu.RLock()
 			wasLeader := d.isLeader
+			joinedURL := d.k3sServerURL
 			d.mu.RUnlock()
 
 			if nowLeader != wasLeader {
@@ -467,6 +562,42 @@ func (d *Daemon) runReady() {
 				d.mu.Unlock()
 				d.setPhase(PhaseJoining)
 				return
+			}
+
+			if !nowLeader && joinedURL != "" {
+				// Check 1: URL change in Serf tags.
+				// Fires when the leader publishes a new k3s-server tag (new leader elected
+				// and Serf gossip has propagated the change).
+				if currentURL, ok := d.getLeaderTag("k3s-server"); ok && currentURL != "" && currentURL != joinedURL {
+					d.logger.Warnf("k3s server URL changed (%s → %s) — re-joining", joinedURL, currentURL)
+					serverUnreachable = 0
+					d.setPhase(PhaseJoining)
+					return
+				}
+
+				// Check 2: Direct TCP reachability of port 6443 on the server we joined.
+				// This catches the case where the old leader's Serf member is still
+				// "suspected" (not yet failed) so ComputeLeader() keeps returning the same
+				// name and Check 1 never fires, even though a new leader has been elected
+				// and is already running k3s at a different IP.
+				// After ~5 minutes of unreachability we re-join so the worker reads
+				// whatever the CURRENT Serf leader is publishing, regardless of whether
+				// the old member has been marked failed yet.
+				serverHost := net.JoinHostPort(d.extractHost(joinedURL), "6443")
+				conn, dialErr := net.DialTimeout("tcp", serverHost, 3*time.Second)
+				if dialErr == nil {
+					conn.Close()
+					serverUnreachable = 0
+				} else {
+					serverUnreachable++
+					d.logger.Debugf("k3s server %s unreachable (check %d/10): %v", joinedURL, serverUnreachable, dialErr)
+					if serverUnreachable >= 10 {
+						d.logger.Warnf("k3s server %s unreachable for %d consecutive checks (~5 min) — forcing re-join to refresh leader", joinedURL, serverUnreachable)
+						serverUnreachable = 0
+						d.setPhase(PhaseJoining)
+						return
+					}
+				}
 			}
 		}
 	}
@@ -498,6 +629,14 @@ func (d *Daemon) publishClusterReady(k3sServerURL, k3sToken string, mungeKey []b
 	// "Encoded length of tags exceeds limit of 512 bytes" (memberlist MetaMaxSize).
 	d.logger.Infof("publishClusterReady: k3s-token=%d chars, munge-key=%d chars (raw %d bytes)",
 		len(k3sToken), len(mungeKeyB64), len(mungeKey))
+
+	// Purge stale diagnostic tags that may have been published by a previous
+	// provisioning attempt in the same session.  These are not needed for cluster
+	// operation and consume budget from the 512-byte Serf MetaMaxSize limit.
+	if err := d.discovery.DeleteTags([]string{"munge-key-hash"}); err != nil {
+		d.logger.Debugf("DeleteTags(munge-key-hash): %v (non-fatal)", err)
+	}
+
 	tags := map[string]string{
 		"k3s-server": k3sServerURL,
 		"k3s-token":  k3sToken,
@@ -563,11 +702,18 @@ func (d *Daemon) buildWorkerList() []controller.WorkerInfo {
 		if cpu < 1 {
 			cpu = 1
 		}
-		// Use the Serf member address as NodeAddr; Name as NodeName.
-		// The node name matches what slurmd registers with (its Serf node name).
+		// Use the Tailscale IP as SLURM NodeName so it matches what slurmd registers as.
+		// slurmd is started with -N <nodeIP> (Tailscale IP) on every worker.
+		// m.Name is the Serf member name (original hostname at startup), which differs from
+		// the Tailscale IP — using m.Name here would cause slurmctld to reject every worker.
+		// m.Addr is the AdvertiseAddr set to the Tailscale IP; prefer the explicit wgip tag.
+		nodeIP := m.Addr.String()
+		if wgip, ok := m.Tags["wgip"]; ok && wgip != "" {
+			nodeIP = wgip
+		}
 		workers = append(workers, controller.WorkerInfo{
-			Name: m.Name,
-			Addr: m.Addr.String(),
+			Name: nodeIP, // must match slurmd's -N flag
+			Addr: nodeIP,
 			CPUs: cpu,
 		})
 	}
@@ -598,6 +744,11 @@ func (d *Daemon) watchWorkersAndReconfigureSLURM() {
 		}
 
 		workers := d.buildWorkerList()
+
+		// Sort by name so the hash is stable regardless of Serf member iteration order.
+		// Without sorting, non-deterministic Go map/slice order causes a new hash on every
+		// poll even when the worker set is unchanged, triggering spurious reconfigurations.
+		sort.Slice(workers, func(i, j int) bool { return workers[i].Name < workers[j].Name })
 
 		// Build a simple hash of worker names to detect changes without spurious reconfigures.
 		hash := ""
@@ -730,6 +881,34 @@ func (d *Daemon) initDiscovery(localNode *state.Node, advertiseAddr string) erro
 		return fmt.Errorf("create discovery: %w", err)
 	}
 	d.discovery = disc
+	// Register a handler to receive munge-key user events.  Serf tags are
+	// limited to ~512 bytes, so leaders may choose to broadcast the full
+	// munge key as a user event instead of relying solely on tags.  Handlers
+	// write the key to disk and start munged so workers can authenticate.
+	d.discovery.RegisterUserEventHandler(func(name string, payload []byte) error {
+		if name != "munge-key" {
+			return nil
+		}
+		d.logger.Infof("Received munge-key user event (len=%d)", len(payload))
+		// payload is base64-encoded
+		kb64 := string(payload)
+		key, err := base64.StdEncoding.DecodeString(kb64)
+		if err != nil {
+			d.logger.Warnf("Failed to decode munge-key payload: %v", err)
+			return err
+		}
+		mungeManager := slurmauth.NewMungeKeyManager(d.logger)
+		if err := mungeManager.WriteMungeKey(key); err != nil {
+			d.logger.Warnf("Failed to write munge key from user event: %v", err)
+			return err
+		}
+		if err := mungeManager.StartMungeDaemon(); err != nil {
+			d.logger.Warnf("Failed to start munged after user event: %v", err)
+			return err
+		}
+		d.logger.Info("Munge key applied from user event and munged started")
+		return nil
+	})
 	d.logger.Infof("Discovery initialised (cluster size: %d)", disc.GetClusterSize())
 	return nil
 }
@@ -775,6 +954,22 @@ func (d *Daemon) initNetworking() error {
 	if err := d.setUniqueHostname(ts.GetLocalIP()); err != nil {
 		d.logger.Warnf("Failed to set unique hostname: %v (continuing)", err)
 	}
+
+	// Re-affirm exit-node advertisement on every start.
+	// --advertise-exit-node makes this node available as an internet gateway for
+	// cluster peers whose LAN path is temporarily broken.
+	// --accept-routes lets this node use routes (including exit nodes) advertised by peers.
+	// This is a best-effort fire-and-forget; failures are non-fatal.
+	// NOTE: on tailscale.com the exit node must still be approved in the admin console
+	// (or via ACL autoApprovers).  On Headscale add autoApprovers to your policy.
+	go func() {
+		args := []string{"set", "--advertise-exit-node=true", "--accept-routes=true"}
+		if out, err := exec.Command("tailscale", args...).CombinedOutput(); err != nil {
+			d.logger.Debugf("tailscale set --advertise-exit-node: %v (%s)", err, strings.TrimSpace(string(out)))
+		} else {
+			d.logger.Info("Tailscale: advertising as exit node, accepting peer routes")
+		}
+	}()
 
 	d.logger.Infof("Tailscale networking initialised, local IP: %s", ts.GetLocalIP())
 	return nil
@@ -1132,6 +1327,8 @@ func (d *Daemon) setupFirewallRules() error {
 	d.logger.Info("Setting up firewall rules")
 	rules := []struct{ port, proto, comment string }{
 		{"22", "tcp", "SSH"},
+		{"80", "tcp", "HTTP (nginx-ingress hostNetwork)"},
+		{"443", "tcp", "HTTPS (nginx-ingress hostNetwork)"},
 		{"7946", "tcp", "Serf TCP"},
 		{"7946", "udp", "Serf UDP"},
 		{"6443", "tcp", "K3s API"},
@@ -1163,7 +1360,69 @@ func (d *Daemon) setupFirewallRules() error {
 		exec.Command("iptables", "-I", "INPUT", "-s", "100.64.0.0/10", "-j", "ACCEPT").Run()
 	}
 
-	d.logger.Info("Firewall rules set (including Tailscale interface trust)")
+	// Remove stale REDIRECT rules for ports 80/443 from both the OUTPUT and
+	// PREROUTING nat chains.  Old daemon versions added these rules to redirect
+	// HTTP/HTTPS traffic to ingress-nginx NodePorts (30080/30443), but they break
+	// outbound connections (apt, containerd, curl) with ECONNREFUSED.
+	//
+	// We flush the entire OUTPUT chain (no kube-proxy rules live there) but use
+	// targeted deletion for PREROUTING to avoid disturbing kube-proxy's
+	// KUBE-SERVICES jump rule which also lives in PREROUTING.
+	d.logger.Info("Flushing nat OUTPUT chain and removing stale PREROUTING REDIRECTs")
+	exec.Command("iptables", "-t", "nat", "-F", "OUTPUT").Run() //nolint:errcheck
+	for _, pair := range [][2]string{{"80", "30080"}, {"443", "30443"}} {
+		from, to := pair[0], pair[1]
+		for {
+			if exec.Command("iptables", "-t", "nat", "-C", "PREROUTING",
+				"-p", "tcp", "--dport", from, "-j", "REDIRECT", "--to-ports", to).Run() != nil {
+				break
+			}
+			exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", //nolint:errcheck
+				"-p", "tcp", "--dport", from, "-j", "REDIRECT", "--to-ports", to).Run()
+		}
+	}
+
+	// Persist the now-clean iptables state so iptables-persistent/netfilter-persistent
+	// cannot restore stale rules from /etc/iptables/rules.v4 on the next reboot.
+	os.MkdirAll("/etc/iptables", 0755)
+	if f, err := os.Create("/etc/iptables/rules.v4"); err == nil {
+		saveCmd := exec.Command("iptables-save")
+		saveCmd.Stdout = f
+		saveCmd.Run()
+		f.Close()
+		d.logger.Info("Saved iptables state to /etc/iptables/rules.v4")
+	} else {
+		d.logger.Warnf("Could not write /etc/iptables/rules.v4: %v", err)
+	}
+
+	// UFW FORWARD policy — must be ACCEPT for pod NodePort traffic to route correctly.
+	// kube-proxy DNAT's NodePort traffic to pod IPs; UFW's default DROP blocks this.
+	if data, err := os.ReadFile("/etc/default/ufw"); err == nil {
+		if strings.Contains(string(data), `DEFAULT_FORWARD_POLICY="DROP"`) {
+			newData := strings.ReplaceAll(string(data),
+				`DEFAULT_FORWARD_POLICY="DROP"`,
+				`DEFAULT_FORWARD_POLICY="ACCEPT"`)
+			if os.WriteFile("/etc/default/ufw", []byte(newData), 0644) == nil {
+				exec.Command("ufw", "reload").Run()
+				d.logger.Info("Fixed UFW FORWARD policy: DROP → ACCEPT (required for pod routing)")
+			}
+		}
+	}
+
+	// IP forwarding — required for routing between LAN, Tailscale, and pod network.
+	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
+
+	// Pod CIDR FORWARD rules — allow Flannel-routed packets through the FORWARD chain.
+	for _, cidr := range []string{"10.42.0.0/16", "10.43.0.0/16"} {
+		if exec.Command("iptables", "-C", "FORWARD", "-d", cidr, "-j", "ACCEPT").Run() != nil {
+			exec.Command("iptables", "-I", "FORWARD", "1", "-d", cidr, "-j", "ACCEPT").Run()
+		}
+		if exec.Command("iptables", "-C", "FORWARD", "-s", cidr, "-j", "ACCEPT").Run() != nil {
+			exec.Command("iptables", "-I", "FORWARD", "1", "-s", cidr, "-j", "ACCEPT").Run()
+		}
+	}
+
+	d.logger.Info("Firewall rules set (including Tailscale interface trust and pod CIDR forwarding)")
 	return nil
 }
 

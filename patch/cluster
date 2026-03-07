@@ -7,6 +7,7 @@
 #   dash [--interval N] [--once]   Live dashboard (refreshes every N seconds, default 5)
 #   test [all|slurm|k3s|mpi|quick] Integration tests
 #   logs [service]  Tail logs (node-agent|k3s|slurm|munge)
+#   diag            Quick prerequisite and service diagnostics
 #   ui              Print all web UI URLs
 #   help            This help text
 
@@ -199,24 +200,49 @@ cmd_dash() {
 
         # ── SLURM ──
         echo -e "\n${YELLOW}${BOLD} SLURM${NC}"
-        if pgrep -x slurmctld &>/dev/null || pgrep -x slurmd &>/dev/null; then
+        local slurm_phase
+        slurm_phase=$(status_field "phase" "unknown")
+        if pgrep -x slurmctld &>/dev/null; then
+            echo -e "  ${GREEN}● slurmctld${NC}"
             local squeue_out squeue_err
-            squeue_out=$(squeue --format="  %-10i %-10u %-10j %-8T %-8r" 2>/tmp/.cluster_squeue_err | head -6)
+            squeue_out=$(squeue --noheader --format="  %-10i %-10u %-10j %-8T %-8r" 2>/tmp/.cluster_squeue_err | head -6)
             squeue_err=$(cat /tmp/.cluster_squeue_err 2>/dev/null | head -1 | sed 's/squeue: error: //')
             if [ -n "$squeue_err" ]; then
-                echo -e "  ${YELLOW}squeue: ${squeue_err}${NC}"
-                pgrep -x munged &>/dev/null || echo -e "  ${RED}munged not running — munge auth will fail${NC}"
+                echo -e "  ${YELLOW}  ⚠ squeue: ${squeue_err}${NC}"
+                pgrep -x munged &>/dev/null \
+                    && echo -e "  ${DIM}  munged running — possible key mismatch; check 'cluster logs slurm'${NC}" \
+                    || echo -e "  ${RED}  munged not running — munge auth will fail${NC}"
+            elif [ -n "$squeue_out" ]; then
+                echo "$squeue_out"
             else
-                echo "${squeue_out:-(no jobs)}"
+                echo -e "  ${DIM}  (no jobs)${NC}"
             fi
             echo ""
             sinfo --format="  %-12P %-6D %-10T %-10C" 2>/dev/null | head -5 || true
+        elif pgrep -x slurmd &>/dev/null; then
+            echo -e "  ${GREEN}● slurmd${NC}  (worker)"
+            local squeue_out squeue_err
+            squeue_out=$(squeue --noheader --format="  %-10i %-10u %-10j %-8T %-8r" 2>/tmp/.cluster_squeue_err | head -6)
+            squeue_err=$(cat /tmp/.cluster_squeue_err 2>/dev/null | head -1 | sed 's/squeue: error: //')
+            if [ -n "$squeue_err" ]; then
+                echo -e "  ${DIM}  ⚠ ${squeue_err}${NC}"
+            elif [ -n "$squeue_out" ]; then
+                echo "$squeue_out"
+            else
+                echo -e "  ${DIM}  (no jobs)${NC}"
+            fi
+        elif [ "$slurm_phase" != "ready" ]; then
+            echo -e "  ${DIM}○ waiting — cluster phase: $(phase_colour "$slurm_phase")${NC}"
         else
             echo -e "  ${YELLOW}○ SLURM not running${NC}"
+            command -v slurmctld &>/dev/null || echo -e "  ${RED}  slurmctld binary not found — run apply-patch.sh${NC}"
+            command -v munged    &>/dev/null || echo -e "  ${RED}  munged binary not found — run apply-patch.sh${NC}"
         fi
 
         # ── K3s Workloads ──
         echo -e "\n${YELLOW}${BOLD} K3s${NC}"
+        local k3s_phase
+        k3s_phase=$(status_field "phase" "unknown")
         if pgrep -f 'k3s server' &>/dev/null; then
             k3s kubectl get nodes --no-headers 2>/dev/null | \
                 awk '{printf "  %-20s %-10s %s\n", $1, $2, $5}' | head -6 || true
@@ -225,8 +251,16 @@ cmd_dash() {
                 awk '{printf "  %-20s %-30s %-10s\n", $1, $2, $4}' | head -8 || true
         elif pgrep -f 'k3s agent' &>/dev/null; then
             echo -e "  ${GREEN}● k3s agent connected${NC}"
+            # Show node status from agent perspective
+            KUBECONFIG=/etc/rancher/k3s/k3s.yaml k3s kubectl get nodes --no-headers 2>/dev/null | \
+                awk '{printf "  %-20s %-10s %s\n", $1, $2, $5}' | head -6 || true
+        elif [ "$k3s_phase" != "ready" ]; then
+            echo -e "  ${DIM}○ waiting — cluster phase: $(phase_colour "$k3s_phase")${NC}"
         else
             echo -e "  ${YELLOW}○ k3s not running${NC}"
+            if ! command -v k3s &>/dev/null; then
+                echo -e "  ${RED}  k3s binary not found — run apply-patch.sh${NC}"
+            fi
         fi
 
         # ── Web UIs ──
@@ -387,32 +421,106 @@ EOF
         local kctl="kubectl"
         command -v kubectl &>/dev/null || kctl="k3s kubectl"
 
-        $kctl cluster-info &>/dev/null \
-            && pass "kubectl cluster-info" || fail "kubectl cluster-info failed"
+        # ── Kubeconfig setup ─────────────────────────────────────────────────
+        # Pick a usable kubeconfig.  Priority:
+        #   1. $KUBECONFIG if already set and file exists
+        #   2. /etc/rancher/k3s/k3s.yaml if readable
+        #   3. ~/.kube/config
+        # On worker nodes the file may have 0600 permissions (root only) or
+        # contain a stale 0.0.0.0:6443 address — detect both and adapt.
+        local kubeconf=""
+        if [ -n "${KUBECONFIG:-}" ] && [ -f "$KUBECONFIG" ]; then
+            kubeconf="$KUBECONFIG"
+        elif [ -r /etc/rancher/k3s/k3s.yaml ]; then
+            kubeconf=/etc/rancher/k3s/k3s.yaml
+        elif [ -r "${HOME}/.kube/config" ]; then
+            kubeconf="${HOME}/.kube/config"
+        fi
 
-        $kctl get nodes &>/dev/null \
-            && pass "kubectl get nodes" || fail "kubectl get nodes failed"
+        # Check whether the kubeconfig points at 0.0.0.0 (broken address written
+        # when k3s server started before Tailscale was ready).
+        if [ -n "$kubeconf" ] && grep -q 'server: https://0\.0\.0\.0' "$kubeconf" 2>/dev/null; then
+            # Attempt in-place fix: replace 0.0.0.0 with 127.0.0.1.
+            # This works on the leader; on a worker the file is from a stale
+            # previous leader role and can be safely overwritten.
+            if sudo sed -i 's|server: https://0\.0\.0\.0:|server: https://127.0.0.1:|g' \
+                    "$kubeconf" 2>/dev/null; then
+                pass "Fixed 0.0.0.0 kubeconfig address → 127.0.0.1"
+            fi
+            # Also fix permissions while we're here
+            sudo chmod 0644 "$kubeconf" 2>/dev/null || true
+        fi
 
-        # Test pod scheduling
-        local pod_name="cluster-test-$(date +%s)"
-        $kctl run "$pod_name" \
-            --image=busybox --restart=Never \
-            --command -- sh -c "echo K3s OK" &>/dev/null
+        # ── Leader vs worker ─────────────────────────────────────────────────
+        if pgrep -f 'k3s server' &>/dev/null; then
+            # ── LEADER: full kubectl test suite ──────────────────────────────
+            [ -n "$kubeconf" ] && export KUBECONFIG="$kubeconf"
 
-        local waited=0
-        while [ $waited -lt 60 ]; do
-            local phase
-            phase=$($kctl get pod "$pod_name" -o jsonpath='{.status.phase}' 2>/dev/null)
-            [ "$phase" = "Succeeded" ] && break
-            sleep 3; ((waited+=3))
-        done
+            KUBECONFIG="${kubeconf:-}" $kctl cluster-info &>/dev/null \
+                && pass "kubectl cluster-info" || fail "kubectl cluster-info failed"
 
-        local logs
-        logs=$($kctl logs "$pod_name" 2>/dev/null)
-        echo "$logs" | grep -q "K3s OK" \
-            && pass "Pod scheduling and execution" || fail "Pod test failed"
+            KUBECONFIG="${kubeconf:-}" $kctl get nodes &>/dev/null \
+                && pass "kubectl get nodes" || fail "kubectl get nodes failed"
 
-        $kctl delete pod "$pod_name" --grace-period=0 2>/dev/null || true
+            # Test pod scheduling
+            local pod_name="cluster-test-$(date +%s)"
+            KUBECONFIG="${kubeconf:-}" $kctl run "$pod_name" \
+                --image=busybox --restart=Never \
+                --command -- sh -c "echo K3s OK" &>/dev/null
+
+            local waited=0
+            while [ $waited -lt 60 ]; do
+                local phase
+                phase=$(KUBECONFIG="${kubeconf:-}" $kctl get pod "$pod_name" \
+                    -o jsonpath='{.status.phase}' 2>/dev/null)
+                [ "$phase" = "Succeeded" ] && break
+                sleep 3; ((waited+=3))
+            done
+
+            local logs
+            logs=$(KUBECONFIG="${kubeconf:-}" $kctl logs "$pod_name" 2>/dev/null)
+            echo "$logs" | grep -q "K3s OK" \
+                && pass "Pod scheduling and execution" || fail "Pod test failed"
+
+            KUBECONFIG="${kubeconf:-}" $kctl delete pod "$pod_name" \
+                --grace-period=0 2>/dev/null || true
+
+        elif pgrep -f 'k3s agent' &>/dev/null; then
+            # ── WORKER: test API reachability instead of running kubectl ─────
+            # Workers have no admin kubeconfig (it only exists on the leader).
+            # We verify the agent is connected and can reach the leader's API.
+            local leader_api=""
+            # Read the leader's k3s-server Serf tag from status.json
+            if [ -f /run/clusteros/status.json ] && command -v jq &>/dev/null; then
+                leader_api=$(jq -r '.k3s_server // empty' /run/clusteros/status.json 2>/dev/null)
+            fi
+            # Fallback: parse from the running k3s agent cmdline
+            if [ -z "$leader_api" ]; then
+                leader_api=$(cat /proc/$(pgrep -f 'k3s agent' | head -1)/cmdline \
+                    2>/dev/null | tr '\0' '\n' | grep -A1 '\-\-server' | tail -1 || true)
+            fi
+
+            if [ -n "$leader_api" ]; then
+                # Strip https:// and port to get host
+                local leader_host
+                leader_host=$(echo "$leader_api" | sed 's|https://||;s|:.*||')
+                if nc -zw 4 "$leader_host" 6443 &>/dev/null 2>&1; then
+                    pass "k3s agent connected — leader API ($leader_host:6443) reachable"
+                else
+                    fail "k3s agent running but leader API ($leader_host:6443) not reachable"
+                fi
+            else
+                # Agent supervisor proxy port — confirms agent ↔ server tunnel is up
+                if nc -zw 4 127.0.0.1 6444 &>/dev/null 2>&1; then
+                    pass "k3s agent running — supervisor proxy (6444) active"
+                else
+                    fail "k3s agent supervisor proxy (6444) not responding"
+                fi
+            fi
+            skip "kubectl tests require admin kubeconfig (leader-only) — run 'cluster test k3s' on the leader"
+        else
+            fail "k3s not running (neither server nor agent)"
+        fi
     }
 
     # Quick smoke test
@@ -485,11 +593,69 @@ cmd_logs() {
 # ──────────────────────────────────────────────────────────────────────────────
 
 cmd_ui() {
-    local ip
-    ip=$(tailscale ip -4 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo localhost)
+    # Always show the LEADER's IP for NodePort URLs.
+    # Workers running 'cluster ui' used to show their own Tailscale IP, producing
+    # wrong URLs that point at a node with no k3s server or NodePort DNAT rules.
+    local leader_ip local_ts_ip
+    local_ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
+
+    # Read leader address from Serf status file (written by node-agent on all nodes).
+    leader_ip=""
+    if [ -f "$STATUS_FILE" ] && command -v jq &>/dev/null; then
+        local leader_name
+        leader_name=$(jq -r '.leader // ""' "$STATUS_FILE" 2>/dev/null)
+        if [ -n "$leader_name" ]; then
+            # Find the leader's addr from the members list
+            leader_ip=$(jq -r --arg n "$leader_name" \
+                '.members[] | select(.name==$n) | .addr' "$STATUS_FILE" 2>/dev/null | head -1)
+        fi
+    fi
+    # Fall back to local Tailscale IP only if we can't determine the leader
+    local ip="${leader_ip:-${local_ts_ip:-localhost}}"
+
+    local is_leader=false
+    pgrep -f 'k3s server' &>/dev/null && is_leader=true
+
+    # Check MetalLB VIP (only readable from the leader node)
+    local vip=""
+    $is_leader && vip=$(k3s kubectl get svc ingress-nginx-controller -n ingress-nginx \
+        -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null | tr -d '[:space:]')
+
+    # Check whether nginx-ingress DaemonSet is running with hostNetwork
+    local nginx_host_net=false
+    $is_leader && {
+        hn=$(k3s kubectl get ds ingress-nginx-controller -n ingress-nginx \
+            -o jsonpath='{.spec.template.spec.hostNetwork}' 2>/dev/null | tr -d '[:space:]')
+        [ "$hn" = "true" ] && nginx_host_net=true
+    }
 
     echo -e "${CYAN}${BOLD}═══ ClusterOS Web UIs ═══${NC}"
+    if [ "$ip" != "${local_ts_ip:-localhost}" ]; then
+        echo -e "  Leader: ${BOLD}${leader_ip}${NC}  (this node: ${local_ts_ip:-local})"
+    fi
     echo ""
+
+    if [ -n "$vip" ]; then
+        echo -e "${GREEN}MetalLB VIP:${NC} ${BOLD}${vip}${NC} — standard ports reachable from any LAN device"
+        echo ""
+        echo -e "${YELLOW}Ingress (MetalLB LAN VIP)${NC}"
+        echo    "  HTTP:          http://${vip}"
+        echo    "  HTTPS:         https://${vip}"
+        echo ""
+    elif $nginx_host_net; then
+        echo -e "${GREEN}nginx-ingress DaemonSet (hostNetwork)${NC} — port 80/443 on leader:"
+        echo ""
+        echo -e "${YELLOW}Ingress${NC}"
+        echo "  Tailscale:     http://${ip}"
+        echo -e "  ${DIM}(MetalLB VIP not yet assigned — check: cluster diag)${NC}"
+        echo ""
+    else
+        echo -e "${YELLOW}nginx-ingress NodePort (leader: ${ip})${NC}"
+        echo    "  HTTP:          http://${ip}:30080"
+        echo    "  HTTPS:         https://${ip}:30443"
+        echo ""
+    fi
+
     echo -e "${YELLOW}Kubernetes / Cluster Management${NC}"
     echo    "  Rancher:       https://${ip}:30444"
     echo ""
@@ -499,11 +665,578 @@ cmd_ui() {
     echo -e "${YELLOW}HPC / SLURM${NC}"
     echo    "  SLURM REST:    http://${ip}:30819"
     echo ""
-    echo -e "${YELLOW}Ingress${NC}"
-    echo    "  HTTP:          http://${ip}:30080"
-    echo    "  HTTPS:         https://${ip}:30443"
+    if ! $is_leader; then
+        echo -e "${DIM}Note: run 'cluster ui' on the leader (${leader_ip:-node-123-80}) for live MetalLB/ingress status.${NC}"
+    fi
+    echo -e "${DIM}Note: services become available ~15 min after cluster reaches 'ready' phase.${NC}"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster firewall  (must run as root)
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_firewall() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}✗${NC} Must run as root: sudo cluster firewall"
+        exit 1
+    fi
+
+    _fw_ok()   { echo -e "  ${GREEN}✓${NC} $*"; }
+    _fw_warn() { echo -e "  ${YELLOW}!${NC} $*"; }
+
+    echo -e "${CYAN}${BOLD}═══ Applying ClusterOS Firewall Rules ═══${NC}"
     echo ""
-    echo -e "${DIM}Note: services become available a few minutes after cluster reaches 'ready' phase.${NC}"
+
+    # Helper: open a port in both UFW and iptables.
+    # Both must run: UFW manages its own chains (raw iptables -A appended after
+    # UFW's reject rule is never reached); iptables -I inserts at top so it fires
+    # before any existing REJECT rule when UFW is inactive or not installed.
+    _open() {
+        local port="$1" proto="${2:-tcp}"
+        ufw allow "${port}/${proto}" &>/dev/null 2>&1 || true
+        iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT 1 -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+    }
+
+    echo -e "${YELLOW}Opening ports…${NC}"
+    _open 22    tcp  && _fw_ok "22/tcp    (SSH)"
+    _open 7946  tcp  && _fw_ok "7946/tcp  (Serf)"
+    _open 7946  udp  && _fw_ok "7946/udp  (Serf)"
+    _open 80    tcp  && _fw_ok "80/tcp    (HTTP — nginx hostNetwork)"
+    _open 443   tcp  && _fw_ok "443/tcp   (HTTPS — nginx hostNetwork)"
+    _open 6443  tcp  && _fw_ok "6443/tcp  (K3s API)"
+    _open 6444  tcp  && _fw_ok "6444/tcp  (K3s supervisor/agent bootstrap)"
+    _open 6817  tcp  && _fw_ok "6817/tcp  (slurmctld)"
+    _open 6818  tcp  && _fw_ok "6818/tcp  (slurmd)"
+    _open 6819  tcp  && _fw_ok "6819/tcp  (slurmdbd)"
+    _open 7476  tcp  && _fw_ok "7476/tcp  (MetalLB memberlist)"
+    _open 8472  udp  && _fw_ok "8472/udp  (Flannel VXLAN — inter-node pod traffic)"
+    _open 10250 tcp  && _fw_ok "10250/tcp (Kubelet)"
+    _open "2379:2380" tcp && _fw_ok "2379:2380/tcp (etcd)"
+    _open "30000:32767" tcp && _fw_ok "30000:32767/tcp (K8s NodePorts)"
+    _open "30000:32767" udp && _fw_ok "30000:32767/udp (K8s NodePorts)"
+
+    echo ""
+    echo -e "${YELLOW}Tailscale interface trust…${NC}"
+    for iface in tailscale0 ts0; do
+        ufw allow in on "$iface" &>/dev/null 2>&1 || true
+    done
+    iptables -C INPUT -s 100.64.0.0/10 -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -s 100.64.0.0/10 -j ACCEPT 2>/dev/null || true
+    _fw_ok "Tailscale CGNAT (100.64.0.0/10) trusted"
+
+    echo ""
+    echo -e "${YELLOW}UFW FORWARD policy…${NC}"
+    if [ -f /etc/default/ufw ] && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw; then
+        sed -i 's/^DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+        ufw reload &>/dev/null 2>&1 || true
+        _fw_ok "DEFAULT_FORWARD_POLICY set to ACCEPT (was DROP — would block pod NodePort traffic)"
+    else
+        _fw_ok "DEFAULT_FORWARD_POLICY already ACCEPT"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}Pod CIDR FORWARD rules…${NC}"
+    sysctl -w net.ipv4.ip_forward=1 &>/dev/null || true
+    for cidr in "10.42.0.0/16" "10.43.0.0/16"; do
+        iptables -C FORWARD -d "$cidr" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -d "$cidr" -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -s "$cidr" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -s "$cidr" -j ACCEPT 2>/dev/null || true
+    done
+    for iface in flannel.1 cni0; do
+        ufw allow in on "$iface" &>/dev/null 2>&1 || true
+        iptables -C FORWARD -i "$iface" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -i "$iface" -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -o "$iface" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -o "$iface" -j ACCEPT 2>/dev/null || true
+    done
+    _fw_ok "Pod CIDR 10.42.0.0/16 + 10.43.0.0/16 allowed in FORWARD"
+    _fw_ok "Flannel interfaces (flannel.1, cni0) allowed in FORWARD"
+
+    echo ""
+    echo -e "${YELLOW}Cleaning up stale PREROUTING REDIRECT rules (port 80/443)…${NC}"
+    # PREROUTING REDIRECT for port 80→30080 / 443→30443 was removed because it
+    # is fundamentally broken with kube-proxy iptables mode: REDIRECT fires after
+    # KUBE-SERVICES (which is at pos 1), so the re-written packet exits PREROUTING
+    # without being DNAT'd to the nginx pod. Nothing listens on 30080 → RST.
+    # nginx-ingress uses hostNetwork=true instead and binds directly to port 80/443.
+    for pair in "80:30080" "443:30443"; do
+        local from="${pair%%:*}" to="${pair##*:}"
+        local removed=false
+        while iptables -t nat -C PREROUTING -p tcp --dport "$from" -j REDIRECT --to-ports "$to" 2>/dev/null; do
+            iptables -t nat -D PREROUTING -p tcp --dport "$from" -j REDIRECT --to-ports "$to" 2>/dev/null && removed=true || break
+        done
+        while iptables -t nat -C OUTPUT -p tcp --dport "$from" -j REDIRECT --to-ports "$to" 2>/dev/null; do
+            iptables -t nat -D OUTPUT -p tcp --dport "$from" -j REDIRECT --to-ports "$to" 2>/dev/null || break
+        done
+        "$removed" && _fw_ok "Removed stale REDIRECT ${from}→${to}" || true
+    done
+
+    echo ""
+    echo -e "${YELLOW}nginx-ingress DaemonSet status…${NC}"
+    # nginx-ingress runs as a DaemonSet with hostNetwork=true — every node binds port 80/443 directly.
+    if k3s kubectl get ds -n ingress-nginx ingress-nginx-controller &>/dev/null 2>&1; then
+        HN=$(k3s kubectl get ds -n ingress-nginx ingress-nginx-controller \
+            -o jsonpath='{.spec.template.spec.hostNetwork}' 2>/dev/null)
+        READY=$(k3s kubectl get ds -n ingress-nginx ingress-nginx-controller \
+            -o jsonpath='{.status.numberReady}' 2>/dev/null)
+        if [ "$HN" = "true" ]; then
+            _fw_ok "nginx-ingress DaemonSet: hostNetwork=true, ${READY} node(s) ready"
+        else
+            k3s kubectl patch ds -n ingress-nginx ingress-nginx-controller \
+                --type=merge \
+                -p '{"spec":{"template":{"spec":{"hostNetwork":true,"dnsPolicy":"ClusterFirstWithHostNet"}}}}' \
+                &>/dev/null \
+                && _fw_ok "DaemonSet patched to hostNetwork=true" \
+                || _fw_warn "DaemonSet patch failed"
+        fi
+    elif k3s kubectl get deploy -n ingress-nginx ingress-nginx-controller &>/dev/null 2>&1; then
+        _fw_warn "Legacy Deployment detected — patching hostNetwork=true (only fixes leader; reprovision to convert to DaemonSet on all nodes)"
+        k3s kubectl patch deploy -n ingress-nginx ingress-nginx-controller \
+            --type=merge \
+            -p '{"spec":{"template":{"spec":{"hostNetwork":true,"dnsPolicy":"ClusterFirstWithHostNet"}}}}' \
+            &>/dev/null && _fw_ok "Deployment patched" || _fw_warn "patch failed"
+    else
+        _fw_warn "nginx-ingress not yet deployed — will deploy as DaemonSet during provisioning"
+    fi
+
+    echo ""
+    if command -v ufw &>/dev/null; then
+        echo -e "${YELLOW}UFW status:${NC}"
+        ufw status 2>/dev/null | head -20 | sed 's/^/  /' || true
+    fi
+
+    echo ""
+    echo -e "${GREEN}${BOLD}Firewall rules applied.${NC}"
+    echo -e "${DIM}These rules are in-memory and survive until reboot."
+    echo -e "To make them permanent, run: sudo bash apply-patch.sh${NC}"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster diag
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_diag() {
+    echo -e "${CYAN}${BOLD}═══ ClusterOS Diagnostics ═══${NC}"
+    echo ""
+
+    ok()   { echo -e "  ${GREEN}✓${NC} $1"; }
+    warn() { echo -e "  ${YELLOW}!${NC} $1"; }
+    fail() { echo -e "  ${RED}✗${NC} $1"; }
+    info() { echo -e "  ${DIM}  $1${NC}"; }
+
+    echo -e "${YELLOW}${BOLD} Binaries${NC}"
+    command -v k3s        &>/dev/null && ok "k3s $(k3s --version 2>/dev/null | head -1)" || fail "k3s not found — run apply-patch.sh"
+    command -v slurmctld  &>/dev/null && ok "slurmctld $(slurmctld --version 2>/dev/null)" || fail "slurmctld not found — apt install slurmctld"
+    command -v slurmd     &>/dev/null && ok "slurmd"   || fail "slurmd not found — apt install slurmd"
+    command -v munged     &>/dev/null && ok "munged"   || fail "munged not found — apt install munge"
+    command -v squeue     &>/dev/null && ok "squeue"   || fail "squeue not found — apt install slurm-client"
+    command -v tailscale  &>/dev/null && ok "tailscale $(tailscale version 2>/dev/null | head -1)" || fail "tailscale not found"
+    command -v jq         &>/dev/null && ok "jq"       || fail "jq not found — apt install jq"
+
+    echo ""
+    echo -e "${YELLOW}${BOLD} Connectivity${NC}"
+    local ts_ip
+    ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
+    if [ -n "$ts_ip" ]; then
+        ok "Tailscale connected ($ts_ip)"
+    else
+        fail "Tailscale not connected — run: tailscale up"
+    fi
+
+    # ── Outbound internet connectivity (direct IP, bypasses DNS) ─────────────
+    # Use hardcoded IPs to distinguish routing/iptables failures from DNS failures.
+    # Connection refused = REDIRECT rule in nat OUTPUT or REJECT rule.
+    # Connection timed out = firewall DROP or route missing.
+    echo ""
+    echo -e "${YELLOW}${BOLD} Outbound Internet Connectivity${NC}"
+    _ubuntu_ip="91.189.91.81"   # archive.ubuntu.com
+    _ghcr_ip="185.199.108.154"  # ghcr.io
+    _k8s_reg="34.107.244.51"    # registry.k8s.io (Google CDN)
+    for _entry in \
+        "$_ubuntu_ip:80:apt (archive.ubuntu.com)" \
+        "$_k8s_reg:443:registry.k8s.io" \
+        "$_ghcr_ip:443:ghcr.io (GitHub registry)"; do
+        _check_ip="${_entry%%:*}"; _rest="${_entry#*:}"; _port="${_rest%%:*}"; _label="${_rest#*:}"
+        _result=$(timeout 4 bash -c "echo >/dev/tcp/$_check_ip/$_port" 2>&1)
+        _rc=$?
+        if [ $_rc -eq 0 ]; then
+            ok "${_label} (${_check_ip}:${_port})  REACHABLE"
+        else
+            _errno=$(echo "$_result" | grep -oE 'Connection refused|No route|Network unreachable|timed out' | head -1)
+            fail "${_label} (${_check_ip}:${_port})  FAILED — ${_errno:-rc=$_rc}"
+            if echo "$_errno" | grep -qi "refused"; then
+                warn "  → 'Connection refused' = iptables REDIRECT or REJECT rule is blocking this port"
+                warn "  → Run: sudo iptables -t nat -L OUTPUT -n --line-numbers | grep -E 'REDIRECT|REJECT'"
+            elif echo "$_errno" | grep -qi "route\|unreachable"; then
+                warn "  → 'No route' = missing default gateway or Tailscale routing issue"
+            fi
+        fi
+    done
+
+    # ── Tailscale exit-node status ────────────────────────────────────────────
+    # An active exit node routes ALL internet traffic through a peer.
+    # If that peer has iptables issues, apt/containerd on THIS node gets
+    # connection refused even though THIS node's iptables are clean.
+    echo ""
+    echo -e "${YELLOW}${BOLD} Tailscale Exit Node${NC}"
+    _split_routes=$(ip route show 2>/dev/null | grep -cE '^(0\.0\.0\.0/1|128\.0\.0\.0/1)' || echo 0)
+    if [ "${_split_routes:-0}" -gt 0 ]; then
+        _exit_node=$(tailscale status 2>/dev/null | grep -i "exit node" | head -1)
+        warn "Exit-node ACTIVE — all internet traffic routed through a Tailscale peer"
+        warn "  $_exit_node"
+        warn "  If that peer has iptables redirect rules, apt/containerd on THIS node fails"
+        warn "  Disable: sudo tailscale set --exit-node="
+    else
+        ok "No Tailscale exit-node selected (direct internet routing)"
+    fi
+
+    # ── Containerd pause image config ─────────────────────────────────────────
+    echo ""
+    echo -e "${YELLOW}${BOLD} Containerd Pause Image Config${NC}"
+    _ctr_cfg="/var/lib/rancher/k3s/agent/etc/containerd/config.toml"
+    if [ -f "$_ctr_cfg" ]; then
+        _sandbox=$(grep -i sandbox_image "$_ctr_cfg" 2>/dev/null | head -1 | tr -d ' "')
+        if echo "$_sandbox" | grep -q "registry.k8s.io"; then
+            ok "containerd sandbox_image: $_sandbox"
+        elif echo "$_sandbox" | grep -q "rancher"; then
+            fail "containerd sandbox_image uses Docker Hub: $_sandbox"
+            fail "  → Orphaned containerd has stale in-memory config"
+            fail "  → Fix: sudo systemctl restart node-agent  (kills orphaned containerd)"
+        else
+            warn "containerd config not yet written: $_ctr_cfg"
+            info "  k3s writes this file when it first starts the agent"
+        fi
+    else
+        info "containerd config not found (k3s agent not started yet)"
+    fi
+    if k3s ctr images ls 2>/dev/null | grep -q "pause"; then
+        ok "pause image in containerd cache:"
+        k3s ctr images ls 2>/dev/null | grep pause | awk '{printf "    %s\n", $1}'
+    else
+        warn "No pause image in containerd cache (will pull from network on first pod)"
+        info "  Fix: make patch && make deploy  (airgap tarball in step 0/10)"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}${BOLD} Cluster State${NC}"
+    if [ -f "$STATUS_FILE" ]; then
+        local phase members leader
+        phase=$(status_field "phase" "unknown")
+        members=$(status_field "member_count" "0")
+        leader=$(status_field "leader" "unknown")
+        ok "Status file present (updated $(jq -r '.updated_at // "?"' "$STATUS_FILE" 2>/dev/null))"
+        echo -e "  Phase: $(phase_colour "$phase")   Members: ${members}   Leader: ${leader}"
+        [ "$phase" = "ready" ] && ok "Phase is ready" || warn "Phase is '$phase' — services start only after phase=ready"
+    else
+        fail "Status file missing: $STATUS_FILE — is node-agent running?"
+        info "Start with: systemctl start node-agent"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}${BOLD} Processes${NC}"
+    pgrep -x slurmctld &>/dev/null && ok "slurmctld running (PID $(pgrep -x slurmctld))" || warn "slurmctld not running"
+    pgrep -x slurmd    &>/dev/null && ok "slurmd running (PID $(pgrep -x slurmd))"    || warn "slurmd not running"
+    pgrep -x munged    &>/dev/null && ok "munged running (PID $(pgrep -x munged))"    || warn "munged not running"
+    pgrep -f 'k3s server' &>/dev/null && ok "k3s server running" || \
+        { pgrep -f 'k3s agent' &>/dev/null && ok "k3s agent running" || warn "k3s not running"; }
+
+    echo ""
+    echo -e "${YELLOW}${BOLD} Munge Authentication${NC}"
+    if pgrep -x munged &>/dev/null; then
+        if munge -n 2>/dev/null | unmunge &>/dev/null; then
+            ok "munge encode/decode self-test passed"
+        else
+            fail "munge self-test failed — key mismatch or socket issue"
+            info "Check: ls -la /var/run/munge/ /etc/munge/"
+            info "Logs:  cluster logs munge"
+        fi
+    else
+        warn "munged not running — skipping munge test"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}${BOLD} SLURM${NC}"
+    if pgrep -x slurmctld &>/dev/null || pgrep -x slurmd &>/dev/null; then
+        local sinfo_out
+        sinfo_out=$(sinfo --noheader 2>/dev/null)
+        if [ -n "$sinfo_out" ]; then
+            ok "sinfo responds — nodes:"
+            echo "$sinfo_out" | head -5 | sed 's/^/    /'
+        else
+            warn "sinfo returned no nodes"
+            info "Workers may not have joined yet — check 'cluster logs slurm'"
+        fi
+        local sq_err
+        sq_err=$(squeue --noheader 2>&1 >/dev/null)
+        [ -z "$sq_err" ] && ok "squeue responds" || fail "squeue error: $sq_err"
+        [ -f /etc/slurm/slurm.conf ] && ok "/etc/slurm/slurm.conf exists" || fail "/etc/slurm/slurm.conf missing"
+    else
+        warn "SLURM not running — skipping SLURM checks"
+    fi
+
+    echo ""
+    echo -e "${YELLOW}${BOLD} Kubernetes${NC}"
+    local k3s_server_pid k3s_agent_pid
+    k3s_server_pid=$(pgrep -f 'k3s server' 2>/dev/null | head -1)
+    k3s_agent_pid=$(pgrep -f 'k3s agent' 2>/dev/null | head -1)
+
+    if [ -n "$k3s_server_pid" ]; then
+        ok "k3s server running (PID $k3s_server_pid)"
+        if nc -z -w2 127.0.0.1 6443 &>/dev/null; then
+            ok "API port 6443 reachable"
+            local kctl_out
+            kctl_out=$(k3s kubectl get nodes --no-headers 2>/dev/null)
+            if [ -n "$kctl_out" ]; then
+                ok "kubectl get nodes:"
+                echo "$kctl_out" | head -8 | sed 's/^/    /'
+            else
+                warn "kubectl get nodes returned nothing — API still initialising"
+            fi
+        else
+            fail "API port 6443 not reachable — k3s starting up or crashed"
+            info "Check: journalctl -u node-agent -n 30 --no-pager | grep -i k3s"
+        fi
+    elif [ -n "$k3s_agent_pid" ]; then
+        ok "k3s agent running (PID $k3s_agent_pid) — worker node"
+        info "kubectl requires the leader node's kubeconfig"
+        if nc -z -w2 127.0.0.1 6444 &>/dev/null; then
+            ok "Agent bootstrap proxy (6444) active"
+        else
+            warn "Agent proxy 6444 not responding — still bootstrapping or firewall blocked"
+            info "Fix: sudo cluster firewall"
+        fi
+    else
+        fail "k3s not running"
+        local k3s_phase
+        k3s_phase=$(status_field "phase" "unknown")
+        case "$k3s_phase" in
+            ready|provisioning|joining)
+                fail "Phase='$k3s_phase' but k3s has exited — likely a zombie reaper bug in the old binary"
+                info "Immediate fix: sudo systemctl restart node-agent"
+                info "Permanent fix: rebuild and redeploy (make patch && make deploy)"
+                info "Logs: journalctl -u node-agent -n 50 --no-pager | grep -i k3s"
+                ;;
+            *)
+                info "Phase='$k3s_phase' — k3s will start after leader election completes"
+                ;;
+        esac
+    fi
+
+    echo ""
+    echo -e "${YELLOW}${BOLD} MetalLB${NC}"
+    if pgrep -f 'k3s server' &>/dev/null; then
+        local metallb_controller metallb_speaker
+        metallb_controller=$(k3s kubectl get pods -n metallb-system \
+            -l component=controller --no-headers 2>/dev/null | head -1)
+        metallb_speaker=$(k3s kubectl get pods -n metallb-system \
+            -l component=speaker --no-headers 2>/dev/null | head -1)
+
+        if [ -z "$metallb_controller" ]; then
+            info "MetalLB not deployed — will be installed on next leader provisioning"
+        else
+            local ctrl_status speak_status
+            ctrl_status=$(echo "$metallb_controller" | awk '{print $4}')
+            speak_status=$(echo "$metallb_speaker" | awk '{print $4}')
+            if [ "$ctrl_status" = "Running" ]; then
+                ok "metallb controller: Running"
+            else
+                warn "metallb controller: ${ctrl_status}"
+            fi
+            if [ "$speak_status" = "Running" ]; then
+                ok "metallb speaker: Running"
+            else
+                warn "metallb speaker: ${speak_status}"
+            fi
+
+            local vip
+            vip=$(k3s kubectl get svc ingress-nginx-controller -n ingress-nginx \
+                -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+            if [ -n "$vip" ]; then
+                ok "VIP assigned to ingress-nginx: ${vip}"
+                info "http://${vip}  and  https://${vip}  reachable from any LAN device"
+            else
+                warn "No VIP assigned to ingress-nginx-controller yet"
+                local svc_type
+                svc_type=$(k3s kubectl get svc ingress-nginx-controller -n ingress-nginx \
+                    -o jsonpath='{.spec.type}' 2>/dev/null || echo "unknown")
+                if [ "$svc_type" = "LoadBalancer" ]; then
+                    info "Service type is LoadBalancer — MetalLB may still be allocating (check pool exhaustion or ARP)"
+                    info "Pool: k3s kubectl get ipaddresspools -n metallb-system"
+                else
+                    info "Service type is ${svc_type} — MetalLB deployment may have failed; check provisioning logs"
+                fi
+            fi
+        fi
+    else
+        info "MetalLB check requires k3s server — run on the leader node"
+    fi
+
+    # ── Web UI pod status ─────────────────────────────────────────────────────
+    echo ""
+    echo -e "${YELLOW}${BOLD} Web UI Pod Status${NC}"
+    _K3S_API=0
+    pgrep -f 'k3s server' &>/dev/null && nc -z -w2 127.0.0.1 6443 &>/dev/null && _K3S_API=1
+    if [ "$_K3S_API" -eq 1 ]; then
+        for _ns in ingress-nginx cert-manager longhorn-system cattle-system slurm; do
+            _pods=$(k3s kubectl get pods -n "$_ns" --no-headers 2>/dev/null)
+            if [ -z "$_pods" ]; then
+                warn "$_ns: no pods (not deployed yet or namespace missing)"
+                continue
+            fi
+            _total=$(echo "$_pods" | wc -l)
+            _running=$(echo "$_pods" | grep -c "Running" 2>/dev/null || echo 0)
+            _failing=$(echo "$_pods" | grep -cE "Error|CrashLoop|ImagePull|Evicted|OOMKill|Init:" 2>/dev/null || echo 0)
+            _pending=$(echo "$_pods" | grep -c "Pending" 2>/dev/null || echo 0)
+            if [ "$_running" -eq "$_total" ]; then
+                ok "$_ns: ${_running}/${_total} Running"
+            elif [ "$_failing" -gt 0 ]; then
+                fail "$_ns: ${_running}/${_total} Running — ${_failing} failing"
+                echo "$_pods" | grep -E "Error|CrashLoop|ImagePull|Evicted|OOMKill|Init:" \
+                    | awk '{printf "    %-40s %s\n", $1, $4}' | head -5
+            else
+                warn "$_ns: ${_running}/${_total} Running, ${_pending} pending"
+                echo "$_pods" | grep -v "Running" | awk '{printf "    %-40s %s\n", $1, $4}' | head -4
+            fi
+        done
+    else
+        info "k3s API not reachable — run 'cluster diag' on the leader node"
+    fi
+
+    # ── NodePort service definitions ──────────────────────────────────────────
+    echo ""
+    echo -e "${YELLOW}${BOLD} NodePort Services${NC}"
+    if [ "$_K3S_API" -eq 1 ]; then
+        _np=$(k3s kubectl get svc -A --no-headers 2>/dev/null | grep NodePort)
+        if [ -n "$_np" ]; then
+            echo "$_np" | awk '{printf "  %-14s %-28s %s\n", $1, $2, $6}' | head -20
+        else
+            warn "No NodePort services found — cluster services may not be deployed yet"
+            info "Check: journalctl -u node-agent | grep -i deploy | tail -30"
+        fi
+    else
+        info "k3s API not reachable — run on leader"
+    fi
+
+    # ── NodePort local probe ──────────────────────────────────────────────────
+    echo ""
+    echo -e "${YELLOW}${BOLD} NodePort Connectivity (localhost)${NC}"
+    declare -A _port_labels=(
+        [30080]="nginx-ingress HTTP"
+        [30443]="nginx-ingress HTTPS"
+        [30444]="Rancher"
+        [30819]="SLURM REST"
+        [30900]="Longhorn UI"
+    )
+    _any_open=0
+    for _port in 30080 30443 30444 30819 30900; do
+        _label="${_port_labels[$_port]}"
+        if nc -z -w2 127.0.0.1 "$_port" &>/dev/null; then
+            ok "127.0.0.1:${_port}  OPEN   (${_label})"
+            _any_open=1
+        else
+            warn "127.0.0.1:${_port}  closed (${_label} — pod not ready or service missing)"
+        fi
+    done
+    if [ "$_any_open" -eq 0 ]; then
+        info "All NodePorts closed → cluster services still deploying OR k3s server not running"
+        info "Deployment takes ~15 min after phase=ready; check pod status above"
+    fi
+
+    # ── kube-proxy DNAT rules ─────────────────────────────────────────────────
+    echo ""
+    echo -e "${YELLOW}${BOLD} kube-proxy NodePort DNAT rules${NC}"
+    _kp=$(iptables -t nat -L KUBE-NODEPORTS -n 2>/dev/null || true)
+    if [ -z "$_kp" ]; then
+        warn "KUBE-NODEPORTS chain not found — kube-proxy may not be running"
+    else
+        _rules_found=0
+        for _port in 30080 30443 30444 30819 30900; do
+            if echo "$_kp" | grep -q "dpt:${_port}"; then
+                ok "DNAT rule present for :${_port}"
+                _rules_found=$((_rules_found+1))
+            else
+                warn "No DNAT rule for :${_port} — service not yet created OR kube-proxy not synced"
+            fi
+        done
+        if [ "$_rules_found" -eq 0 ]; then
+            info "No NodePort DNAT rules at all — services not deployed or kube-proxy restarting"
+            info "kube-proxy re-syncs every ~30s; wait then re-run 'cluster diag'"
+        fi
+    fi
+
+    # ── Firewall / Port Accessibility ─────────────────────────────────────────
+    echo ""
+    echo -e "${YELLOW}${BOLD} Firewall${NC}"
+
+    # nginx-ingress DaemonSet with hostNetwork=true binds directly to port 80/443.
+    if pgrep -f 'k3s server' &>/dev/null && [ "$_K3S_API" -eq 1 ]; then
+        if k3s kubectl get ds -n ingress-nginx ingress-nginx-controller &>/dev/null 2>&1; then
+            hn=$(k3s kubectl get ds -n ingress-nginx ingress-nginx-controller \
+                -o jsonpath='{.spec.template.spec.hostNetwork}' 2>/dev/null)
+            ready=$(k3s kubectl get ds -n ingress-nginx ingress-nginx-controller \
+                -o jsonpath='{.status.numberReady}' 2>/dev/null)
+            if [ "$hn" = "true" ]; then
+                ok "nginx-ingress DaemonSet: hostNetwork=true, ${ready:-0} node(s) ready"
+            else
+                warn "nginx-ingress DaemonSet: hostNetwork=false — run: sudo cluster firewall"
+            fi
+        else
+            warn "nginx-ingress DaemonSet not found"
+        fi
+    fi
+
+    # Flannel VXLAN port 8472/udp — required for inter-node pod communication.
+    if iptables -C INPUT -p udp --dport 8472 -j ACCEPT &>/dev/null 2>&1; then
+        ok "8472/udp open (Flannel VXLAN — inter-node pod traffic)"
+    else
+        fail "8472/udp not open — run: sudo cluster firewall  (blocks cross-node NodePort traffic)"
+    fi
+
+    # FORWARD chain: pod CIDR must be allowed for NodePort DNAT'd packets to reach pods.
+    if iptables -C FORWARD -d 10.42.0.0/16 -j ACCEPT &>/dev/null 2>&1; then
+        ok "FORWARD chain: pod CIDR 10.42.0.0/16 allowed"
+    else
+        warn "FORWARD chain: pod CIDR not found — run: sudo cluster firewall"
+    fi
+
+    # UFW FORWARD policy check.
+    if [ -f /etc/default/ufw ]; then
+        fw_policy=$(grep '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw 2>/dev/null | cut -d'"' -f2)
+        if [ "$fw_policy" = "ACCEPT" ]; then
+            ok "UFW DEFAULT_FORWARD_POLICY=ACCEPT"
+        else
+            warn "UFW DEFAULT_FORWARD_POLICY=${fw_policy:-unknown} — should be ACCEPT; run: sudo cluster firewall"
+        fi
+    fi
+
+    # NAT OUTPUT chain — must NOT have stale REDIRECT rules (they break NodePort connections).
+    _redir=$(iptables -t nat -L OUTPUT -n 2>/dev/null | grep -c REDIRECT 2>/dev/null || echo 0)
+    if [ "${_redir:-0}" -gt 0 ]; then
+        fail "nat OUTPUT chain has ${_redir} REDIRECT rule(s) — blocking outbound 80/443"
+        fail "  Fix: sudo iptables -t nat -F OUTPUT"
+        info "  These rules redirect outbound TCP to localhost and break connectivity"
+    else
+        ok "nat OUTPUT chain clean (no stale REDIRECT rules)"
+    fi
+
+    # ── Recent deployment log tail ────────────────────────────────────────────
+    echo ""
+    echo -e "${YELLOW}${BOLD} Recent Deployment Activity (last 25 relevant lines)${NC}"
+    journalctl -u node-agent -n 2000 --no-pager 2>/dev/null \
+        | grep -iE "(deploy|helm|nginx|ingress|longhorn|rancher|cert-manager|error deploying|failed to deploy|cluster service)" \
+        | tail -25 \
+        | sed 's/^/  /' \
+        || info "No deployment logs found (node-agent may not have reached provisioning yet)"
+
+    echo ""
+    echo -e "${YELLOW}${BOLD} Logs hints${NC}"
+    echo "  cluster logs node-agent   — daemon phase machine logs"
+    echo "  cluster logs slurm        — slurmctld logs"
+    echo "  cluster logs slurmd       — slurmd logs"
+    echo "  cluster logs munge        — munged logs"
+    echo "  cluster logs k3s          — k3s logs"
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -522,6 +1255,9 @@ cmd_help() {
     echo "  test [all|slurm|k3s|mpi|quick]"
     echo "                           Run integration tests (default: all)"
     echo "  logs [service]           Tail logs: node-agent|k3s|slurm|slurmd|munge"
+    echo "  diag                     Prerequisite and service diagnostics (run first if broken)"
+    echo "  firewall                 Apply all firewall rules now (requires root)"
+    echo "                           Fixes: port 80/443→NodePort redirect, port 6444, etc."
     echo "  ui                       Print all web UI URLs"
     echo "  help                     This help text"
     echo ""
@@ -542,11 +1278,13 @@ CMD="${1:-help}"
 shift || true
 
 case "$CMD" in
-    status)  cmd_status ;;
-    dash)    cmd_dash "$@" ;;
-    test)    cmd_test "$@" ;;
-    logs)    cmd_logs "$@" ;;
-    ui)      cmd_ui ;;
+    status)    cmd_status ;;
+    dash)      cmd_dash "$@" ;;
+    test)      cmd_test "$@" ;;
+    logs)      cmd_logs "$@" ;;
+    diag)      cmd_diag ;;
+    ui)        cmd_ui ;;
+    firewall)  cmd_firewall ;;
     help|-h|--help) cmd_help ;;
     *)
         echo -e "${RED}Unknown command: $CMD${NC}"

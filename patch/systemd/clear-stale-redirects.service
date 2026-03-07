@@ -1,0 +1,12 @@
+[Unit]
+Description=ClusterOS one-time cleanup of stale iptables REDIRECTs
+After=network.target kubelet.service
+Wants=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/clear-stale-redirects.sh
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
