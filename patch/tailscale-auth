@@ -1,0 +1,332 @@
+#!/bin/bash
+# ClusterOS Tailscale Authentication Script
+# Uses OAuth client credentials to generate a one-time auth key and authenticate
+#
+# This enables automatic Tailscale enrollment for all nodes built from this image.
+
+# Don't use -u (unset variable errors) since env file may have optional vars
+set -o pipefail
+
+CONFIG_DIR="/etc/clusteros"
+TAILSCALE_ENV="$CONFIG_DIR/tailscale.env"
+STATE_FILE="/var/lib/tailscale/tailscaled.state"
+
+log() {
+    echo "[tailscale-auth] $1"
+    logger -t tailscale-auth "$1" 2>/dev/null || true
+}
+
+error() {
+    echo "[tailscale-auth] ERROR: $1" >&2
+    logger -t tailscale-auth "ERROR: $1" 2>/dev/null || true
+}
+
+# Wait for network connectivity
+wait_for_network() {
+    log "Waiting for network..."
+    for i in $(seq 1 60); do
+        if ping -c1 -W2 8.8.8.8 >/dev/null 2>&1 || ping -c1 -W2 1.1.1.1 >/dev/null 2>&1; then
+            log "Network is up"
+            return 0
+        fi
+        sleep 2
+    done
+    error "Network not available after 2 minutes"
+    return 1
+}
+
+# Wait for tailscaled to be ready
+wait_for_tailscaled() {
+    log "Waiting for tailscaled..."
+    
+    # First ensure tailscaled service is running
+    if ! systemctl is-active --quiet tailscaled; then
+        log "tailscaled not running, attempting to start..."
+        systemctl start tailscaled 2>/dev/null || true
+        sleep 3
+    fi
+    
+    # If still not running, try to debug why
+    if ! systemctl is-active --quiet tailscaled; then
+        log "tailscaled failed to start. Debug info:"
+        systemctl status tailscaled --no-pager -l 2>&1 | head -10 | while read line; do 
+            log "  $line"
+        done
+        
+        # Try manual restart once
+        log "Attempting manual restart..."
+        systemctl stop tailscaled 2>/dev/null || true
+        sleep 2
+        systemctl start tailscaled 2>/dev/null || true
+        sleep 3
+    fi
+    
+    # Wait up to 90 seconds for tailscaled to be ready
+    for i in $(seq 1 90); do
+        # Check if we can communicate with tailscaled (any response means it's working)
+        if [ -S /var/run/tailscale/tailscaled.sock ]; then
+            # Try to get status - any response means tailscaled is ready
+            local status_output
+            status_output=$(tailscale status 2>&1 || true)
+            
+            # If we get any output (including "Logged out"), tailscaled is ready
+            if [ -n "$status_output" ]; then
+                log "tailscaled is ready (took ${i}s) - status: $(echo "$status_output" | head -1)"
+                return 0
+            fi
+        fi
+        # Show progress every 15 seconds
+        if [ $((i % 15)) -eq 0 ]; then
+            log "Still waiting for tailscaled... (${i}s)"
+        fi
+        sleep 1
+    done
+    error "tailscaled not ready after 90 seconds"
+    log "tailscaled service status: $(systemctl is-active tailscaled 2>/dev/null || echo 'unknown')"
+    log "Socket exists: $([ -S /var/run/tailscale/tailscaled.sock ] && echo yes || echo no)"
+    return 1
+}
+
+# Check if already authenticated and connected
+check_already_connected() {
+    local status_output
+    status_output=$(tailscale status 2>/dev/null || true)
+    
+    # Check for "Running" state (fully connected) or existing IP
+    if echo "$status_output" | grep -q "100\." || \
+       tailscale status --json 2>/dev/null | grep -q '"BackendState":"Running"'; then
+        local ip=$(tailscale ip -4 2>/dev/null || echo "unknown")
+        log "Tailscale already connected (IP: $ip)"
+        return 0
+    fi
+    
+    # Log current status for debugging
+    log "Tailscale status: $(echo "$status_output" | head -1 | tr -d '\n')"
+    return 1
+}
+
+# Main
+main() {
+    log "Starting Tailscale authentication..."
+    
+    # Wait for network first
+    wait_for_network || exit 1
+    
+    # Wait for tailscaled
+    wait_for_tailscaled || exit 1
+    
+    # Check if already connected
+    if check_already_connected; then
+        exit 0
+    fi
+    
+    # Load environment file
+    if [ ! -f "$TAILSCALE_ENV" ]; then
+        error "Tailscale config not found: $TAILSCALE_ENV"
+        log "Directory listing for $CONFIG_DIR:"
+        ls -la "$CONFIG_DIR" 2>/dev/null | while read line; do log "  $line"; done
+        exit 1
+    fi
+    
+    log "Tailscale config file found: $TAILSCALE_ENV"
+    log "File permissions: $(ls -la "$TAILSCALE_ENV" 2>/dev/null)"
+    log "File content (non-comment lines):"
+    grep -v '^#\|^$' "$TAILSCALE_ENV" 2>/dev/null | while read line; do
+        # Redact secrets in logs
+        case "$line" in
+            *SECRET=*|*AUTHKEY=*) log "  $(echo "$line" | sed 's/=.*/=***REDACTED***/')" ;;
+            *) log "  $line" ;;
+        esac
+    done
+    
+    # Load credentials explicitly by parsing the file (more reliable than source)
+    TAILSCALE_OAUTH_CLIENT_ID=$(grep -v '^#' "$TAILSCALE_ENV" | grep '^TAILSCALE_OAUTH_CLIENT_ID=' | tail -1 | cut -d'=' -f2- | tr -d ' \r')
+    TAILSCALE_OAUTH_CLIENT_SECRET=$(grep -v '^#' "$TAILSCALE_ENV" | grep '^TAILSCALE_OAUTH_CLIENT_SECRET=' | tail -1 | cut -d'=' -f2- | tr -d ' \r')
+    TAILSCALE_AUTHKEY=$(grep -v '^#' "$TAILSCALE_ENV" | grep '^TAILSCALE_AUTHKEY=' | tail -1 | cut -d'=' -f2- | tr -d ' \r')
+    TAILSCALE_TAGS=$(grep -v '^#' "$TAILSCALE_ENV" | grep '^TAILSCALE_TAGS=' | tail -1 | cut -d'=' -f2- | tr -d ' \r')
+    TAILSCALE_HOSTNAME=$(grep -v '^#' "$TAILSCALE_ENV" | grep '^TAILSCALE_HOSTNAME=' | tail -1 | cut -d'=' -f2- | tr -d ' \r')
+    
+    # Filter out placeholder values
+    case "${TAILSCALE_OAUTH_CLIENT_ID}" in
+        your_*|"") TAILSCALE_OAUTH_CLIENT_ID="" ;;
+    esac
+    case "${TAILSCALE_OAUTH_CLIENT_SECRET}" in
+        your_*|"") TAILSCALE_OAUTH_CLIENT_SECRET="" ;;
+    esac
+    case "${TAILSCALE_AUTHKEY}" in
+        your_*|"") TAILSCALE_AUTHKEY="" ;;
+    esac
+    
+    # Debug: Show what we loaded
+    log "Parsed credentials:"
+    log "  OAuth Client ID: $([ -n "$TAILSCALE_OAUTH_CLIENT_ID" ] && echo "SET ($TAILSCALE_OAUTH_CLIENT_ID)" || echo "NOT SET")"
+    log "  OAuth Client Secret: $([ -n "$TAILSCALE_OAUTH_CLIENT_SECRET" ] && echo "SET (length ${#TAILSCALE_OAUTH_CLIENT_SECRET})" || echo "NOT SET")"
+    log "  Auth Key: $([ -n "$TAILSCALE_AUTHKEY" ] && echo "SET (length ${#TAILSCALE_AUTHKEY})" || echo "NOT SET")"
+    log "  Tags: ${TAILSCALE_TAGS:-NOT SET}"
+    
+    # Determine hostname for Tailscale
+    TS_HOSTNAME="${TAILSCALE_HOSTNAME:-$(hostname)}"
+    log "Hostname: $TS_HOSTNAME"
+    
+    # Method 1: Use OAuth to generate a one-time auth key (recommended)
+    if [ -n "$TAILSCALE_OAUTH_CLIENT_ID" ] && [ -n "$TAILSCALE_OAUTH_CLIENT_SECRET" ]; then
+        log "Generating auth key via OAuth..."
+        
+        # Step 1: Get OAuth access token
+        log "Requesting access token..."
+        ACCESS_TOKEN_RESPONSE=$(curl -s --connect-timeout 10 -X POST "https://api.tailscale.com/api/v2/oauth/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "client_id=${TAILSCALE_OAUTH_CLIENT_ID}&client_secret=${TAILSCALE_OAUTH_CLIENT_SECRET}" 2>&1)
+        
+        ACCESS_TOKEN=$(echo "$ACCESS_TOKEN_RESPONSE" | jq -r '.access_token // empty' 2>/dev/null)
+        
+        if [ -z "$ACCESS_TOKEN" ]; then
+            ERROR_MSG=$(echo "$ACCESS_TOKEN_RESPONSE" | jq -r '.error // .message // empty' 2>/dev/null)
+            error "Failed to get OAuth access token: ${ERROR_MSG:-$ACCESS_TOKEN_RESPONSE}"
+            log "Falling back to auth key method..."
+        else
+            log "Access token obtained"
+            
+            # Step 2: Generate an ephemeral, pre-authorized auth key
+            log "Generating auth key..."
+            
+            # Prepare tags if configured
+            local auth_request
+            if [ -n "${TAILSCALE_TAGS:-}" ]; then
+                # Ensure tags have "tag:" prefix required by API
+                local formatted_tags=""
+                IFS=',' read -ra TAG_ARRAY <<< "$TAILSCALE_TAGS"
+                for tag in "${TAG_ARRAY[@]}"; do
+                    tag=$(echo "$tag" | tr -d ' ')
+                    # Add tag: prefix if not already present
+                    if [[ "$tag" != tag:* ]]; then
+                        tag="tag:$tag"
+                    fi
+                    if [ -n "$formatted_tags" ]; then
+                        formatted_tags="$formatted_tags,\"$tag\""
+                    else
+                        formatted_tags="\"$tag\""
+                    fi
+                done
+                local tags_json="[$formatted_tags]"
+                log "Using tags: $tags_json"
+                auth_request="{
+                    \"capabilities\": {
+                        \"devices\": {
+                            \"create\": {
+                                \"reusable\": false,
+                                \"ephemeral\": false,
+                                \"preauthorized\": true,
+                                \"tags\": $tags_json
+                            }
+                        }
+                    },
+                    \"expirySeconds\": 300
+                }"
+            else
+                log "No tags specified - auth key creation may fail if organization requires tags"
+                auth_request='{
+                    "capabilities": {
+                        "devices": {
+                            "create": {
+                                "reusable": false,
+                                "ephemeral": false,
+                                "preauthorized": true
+                            }
+                        }
+                    },
+                    "expirySeconds": 300
+                }'
+            fi
+            
+            # Generate auth key
+            AUTH_KEY_RESPONSE=$(curl -s --connect-timeout 10 -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+                -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -d "$auth_request" 2>&1)
+            
+            AUTH_KEY=$(echo "$AUTH_KEY_RESPONSE" | jq -r '.key // empty' 2>/dev/null)
+            
+            if [ -z "$AUTH_KEY" ]; then
+                ERROR_MSG=$(echo "$AUTH_KEY_RESPONSE" | jq -r '.message // .error // empty' 2>/dev/null)
+                error "Failed to generate OAuth auth key with tags: ${ERROR_MSG:-$AUTH_KEY_RESPONSE}"
+                
+                # If tags were the problem, retry without tags
+                if [ -n "${TAILSCALE_TAGS:-}" ]; then
+                    log "Retrying auth key generation WITHOUT tags (tags may not be configured in ACL policy)..."
+                    log "HINT: To fix this, add '\"tag:clusteros\": [\"autogroup:admin\"]' to tagOwners in your Tailscale ACL policy"
+                    log "      at https://login.tailscale.com/admin/acls"
+                    log "      Then grant the OAuth client the tag:clusteros scope."
+                    
+                    local no_tag_request='{
+                        "capabilities": {
+                            "devices": {
+                                "create": {
+                                    "reusable": false,
+                                    "ephemeral": false,
+                                    "preauthorized": true
+                                }
+                            }
+                        },
+                        "expirySeconds": 300
+                    }'
+                    
+                    AUTH_KEY_RESPONSE=$(curl -s --connect-timeout 10 -X POST "https://api.tailscale.com/api/v2/tailnet/-/keys" \
+                        -H "Authorization: Bearer ${ACCESS_TOKEN}" \
+                        -H "Content-Type: application/json" \
+                        -d "$no_tag_request" 2>&1)
+                    
+                    AUTH_KEY=$(echo "$AUTH_KEY_RESPONSE" | jq -r '.key // empty' 2>/dev/null)
+                    
+                    if [ -z "$AUTH_KEY" ]; then
+                        ERROR_MSG=$(echo "$AUTH_KEY_RESPONSE" | jq -r '.message // .error // empty' 2>/dev/null)
+                        error "Failed to generate OAuth auth key without tags too: ${ERROR_MSG:-$AUTH_KEY_RESPONSE}"
+                        log "Falling back to pre-configured auth key..."
+                    fi
+                else
+                    log "Falling back to pre-configured auth key..."
+                fi
+            fi
+            
+            if [ -n "$AUTH_KEY" ]; then
+                log "Auth key generated (expires in 5 minutes)"
+                
+                # Step 3: Authenticate with the generated key
+                log "Authenticating Tailscale..."
+                if tailscale up --authkey="$AUTH_KEY" --hostname="$TS_HOSTNAME" \
+                    --accept-routes --accept-dns=false --reset 2>&1; then
+                    log "Successfully authenticated via OAuth"
+                    sleep 2
+                    TS_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
+                    log "Tailscale IP: $TS_IP"
+                    exit 0
+                else
+                    error "Failed to authenticate with OAuth-generated key"
+                    log "Falling back to pre-configured auth key..."
+                fi
+            fi
+        fi
+    else
+        log "OAuth credentials not set - skipping OAuth method"
+    fi
+    
+    # Method 2: Use pre-configured auth key (fallback)
+    if [ -n "$TAILSCALE_AUTHKEY" ]; then
+        log "Trying pre-configured auth key..."
+        if tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="$TS_HOSTNAME" \
+            --accept-routes --accept-dns=false --reset 2>&1; then
+            log "Successfully authenticated with pre-configured auth key"
+            sleep 2
+            tailscale ip -4 2>/dev/null && log "Connected!"
+            exit 0
+        else
+            error "Auth key failed: $TAILSCALE_AUTHKEY"
+        fi
+    fi
+    
+    error "No valid Tailscale credentials configured"
+    error "Set TAILSCALE_AUTHKEY or TAILSCALE_OAUTH_CLIENT_ID/SECRET in $TAILSCALE_ENV"
+    exit 1
+}
+
+main "$@"
