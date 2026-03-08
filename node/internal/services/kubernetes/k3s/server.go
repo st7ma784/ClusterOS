@@ -325,6 +325,10 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 
 	if err := ks.deployLonghorn(); err != nil {
 		ks.Logger().Warnf("Failed to deploy Longhorn: %v", err)
+	} else {
+		// Register each node's extra disks with Longhorn now that the CRDs are installed.
+		// We wait briefly for the Longhorn node controller to create Node resources.
+		go ks.registerAllNodesExtraDisks()
 	}
 
 	if err := ks.deployCertManager(); err != nil {
@@ -1098,6 +1102,79 @@ func (ks *K3sServer) deployLonghorn() error {
 	ks.createLonghornIngress()
 	ks.Logger().Info("Longhorn storage ready (NodePort 30900)")
 	return nil
+}
+
+// registerAllNodesExtraDisks waits for Longhorn Node resources to appear (one per k8s
+// node) then patches each one with the extra disk paths discovered by apply-patch.sh.
+// Disk paths follow the standard pattern /mnt/clusteros/disk-N so we only need to store
+// the count (ndisks Serf tag) to reconstruct them, keeping the Serf tag budget tight.
+func (ks *K3sServer) registerAllNodesExtraDisks() {
+	// Give Longhorn node controller time to create Node resources.
+	time.Sleep(60 * time.Second)
+
+	// Get all k8s nodes and their Longhorn counterparts.
+	out, err := exec.Command("k3s", "kubectl", "get", "nodes", "-o",
+		"jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}").Output()
+	if err != nil {
+		ks.Logger().Warnf("[longhorn] Could not list k8s nodes: %v", err)
+		return
+	}
+
+	for _, nodeName := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		nodeName = strings.TrimSpace(nodeName)
+		if nodeName == "" {
+			continue
+		}
+		// Read the ndisks annotation set by node-agent via apply-patch.sh output.
+		// We stored ndisks as a k8s node label so we don't need SSH.
+		labelOut, err := exec.Command("k3s", "kubectl", "get", "node", nodeName,
+			"-o", "jsonpath={.metadata.labels.clusteros-ndisks}").Output()
+		if err != nil {
+			continue
+		}
+		ndisksStr := strings.TrimSpace(string(labelOut))
+		ndisks := 0
+		if ndisksStr != "" {
+			fmt.Sscanf(ndisksStr, "%d", &ndisks)
+		}
+		if ndisks == 0 {
+			continue
+		}
+		ks.registerNodeDisksWithLonghorn(nodeName, ndisks)
+	}
+}
+
+// registerNodeDisksWithLonghorn patches the Longhorn Node resource for nodeName
+// to add extra disk paths /mnt/clusteros/disk-0 … disk-(n-1).
+func (ks *K3sServer) registerNodeDisksWithLonghorn(nodeName string, n int) {
+	// Check Longhorn Node resource exists.
+	if exec.Command("k3s", "kubectl", "-n", "longhorn-system", "get",
+		"node.longhorn.io", nodeName).Run() != nil {
+		ks.Logger().Debugf("[longhorn] Node resource for %s not yet ready — skipping disk registration", nodeName)
+		return
+	}
+
+	// Build the disk map JSON.
+	diskEntries := ""
+	for i := 0; i < n; i++ {
+		path := fmt.Sprintf("/mnt/clusteros/disk-%d", i)
+		key := fmt.Sprintf("clusteros-disk-%d", i)
+		if diskEntries != "" {
+			diskEntries += ","
+		}
+		diskEntries += fmt.Sprintf(`"%s":{"path":"%s","allowScheduling":true,"storageReserved":1073741824,"tags":["extra"]}`,
+			key, path)
+	}
+	patch := fmt.Sprintf(`{"spec":{"disks":{%s}}}`, diskEntries)
+
+	out, err := exec.Command("k3s", "kubectl", "-n", "longhorn-system",
+		"patch", "node.longhorn.io", nodeName,
+		"--type=merge", "-p", patch).CombinedOutput()
+	if err != nil {
+		ks.Logger().Warnf("[longhorn] Failed to register disks for node %s: %v — %s", nodeName, err, string(out))
+		return
+	}
+	ks.Logger().Infof("[longhorn] Registered %d extra disk(s) for node %s", n, nodeName)
 }
 
 func (ks *K3sServer) exposeLonghornUI() {

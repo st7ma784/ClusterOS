@@ -1,16 +1,27 @@
 network:
   version: 2
-  renderer: networkd
   ethernets:
-    all-eth:
+    all-en:
       match:
         name: "en*"
       dhcp4: true
+      dhcp-identifier: mac
       optional: true
-    all-eth2:
+      link-local: [ipv4, ipv6]   # 169.254.x.x + fe80:: when no DHCP — enables p2p Ethernet patches
+    all-eth:
       match:
         name: "eth*"
       dhcp4: true
+      dhcp-identifier: mac
       optional: true
-  # WiFi is handled by cluster-wifi.service via wpa_supplicant
-  # Removing direct wlan0 reference to avoid blocking boot when no WiFi hardware exists
+      link-local: [ipv4, ipv6]   # 169.254.x.x + fe80:: when no DHCP — enables p2p Ethernet patches
+  wifis:
+    all-wl:
+      match:
+        name: "wl*"
+      dhcp4: true
+      optional: true
+      link-local: [ipv4, ipv6]
+      access-points:
+        "MANDER84":
+          password: "M4nd3rsM0b"

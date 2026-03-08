@@ -1,4 +1,9 @@
 #!/bin/bash
+# DEPRECATED: cluster-test is superseded by the unified 'cluster' CLI.
+# Use: cluster test [all|slurm|k3s|mpi|quick]
+# This script is kept for backwards compatibility only and may be removed in a future release.
+echo "WARNING: cluster-test is deprecated. Use 'cluster test' instead." >&2
+
 # ClusterOS Deployment Test Suite
 # Tests both SLURM and K3s workloads on a live cluster
 #

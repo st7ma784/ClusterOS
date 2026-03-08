@@ -30,7 +30,7 @@ services:
       - NODE_K3S_ENABLED=true
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
-      - WIREGUARD_PORT=51820
+      # WIREGUARD_PORT removed — networking is Tailscale, not WireGuard
       - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
@@ -76,7 +76,7 @@ services:
       - NODE_JOIN=node1:7946
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
-      - WIREGUARD_PORT=51820
+      # WIREGUARD_PORT removed — networking is Tailscale, not WireGuard
       - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
@@ -116,7 +116,7 @@ services:
       - NODE_JOIN=node1:7946
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
-      - WIREGUARD_PORT=51820
+      # WIREGUARD_PORT removed — networking is Tailscale, not WireGuard
       - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
@@ -156,7 +156,7 @@ services:
       - NODE_JOIN=node1:7946
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
-      - WIREGUARD_PORT=51820
+      # WIREGUARD_PORT removed — networking is Tailscale, not WireGuard
       - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
@@ -196,7 +196,7 @@ services:
       - NODE_JOIN=node1:7946
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
-      - WIREGUARD_PORT=51820
+      # WIREGUARD_PORT removed — networking is Tailscale, not WireGuard
       - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:

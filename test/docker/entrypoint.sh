@@ -11,7 +11,7 @@ NODE_JOIN="${NODE_JOIN:-}"
 NODE_K3S_ENABLED="${NODE_K3S_ENABLED:-false}"
 SERF_BIND_PORT="${SERF_BIND_PORT:-7946}"
 RAFT_BIND_PORT="${RAFT_BIND_PORT:-7373}"
-WIREGUARD_PORT="${WIREGUARD_PORT:-51820}"
+# WIREGUARD_PORT removed — networking is handled by Tailscale, not WireGuard.
 CLUSTER_AUTH_KEY="${CLUSTER_AUTH_KEY:-}"
 
 echo "Node Name: $NODE_NAME"
@@ -19,22 +19,10 @@ echo "Bootstrap Mode: $NODE_BOOTSTRAP"
 echo "Join Address: ${NODE_JOIN:-none}"
 echo "K3S Enabled: $NODE_K3S_ENABLED"
 echo "Cluster Auth: ${CLUSTER_AUTH_KEY:0:16}..." # Show only first 16 chars for security
-
-# Verify wg and wg-quick commands are available
-if ! command -v wg &> /dev/null; then
-    echo "ERROR: wg command not found - wireguard-tools not installed"
-    exit 1
-fi
-
-if ! command -v wg-quick &> /dev/null; then
-    echo "ERROR: wg-quick command not found - wireguard-tools not installed"
-    exit 1
-fi
-
-echo "WireGuard tools verified"
+echo "Note: WireGuard not used in containers — Tailscale handles overlay networking on bare metal"
 
 # Create configuration directory if it doesn't exist
-mkdir -p /etc/cluster-os /var/lib/cluster-os /etc/wireguard
+mkdir -p /etc/cluster-os /var/lib/cluster-os
 
 # Generate node configuration
 cat > /etc/cluster-os/node.yaml <<EOF
@@ -51,8 +39,10 @@ discovery:
   encrypt_key: ""
 
 networking:
-  interface: wg0
-  listen_port: ${WIREGUARD_PORT}
+  # interface/listen_port not used — Tailscale handles overlay networking on bare metal.
+  # In container test mode, nodes communicate over the Docker bridge (cluster_net).
+  interface: ""
+  listen_port: 0
   subnet: "10.42.0.0/16"
   ipv6: false
   wifi:

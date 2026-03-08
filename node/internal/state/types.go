@@ -19,7 +19,9 @@ type Node struct {
 	LastSeen     time.Time         `json:"last_seen"`
 	JoinedAt     time.Time         `json:"joined_at"`
 
-	// Kept for identity compatibility
+	// Deprecated: WireGuard replaced by Tailscale. These fields are populated
+	// locally in daemon.go for bookkeeping only — never published to Serf tags
+	// and not used for cluster networking.
 	WireGuardPubKey string `json:"wireguard_pubkey,omitempty"`
 	WireGuardIP     net.IP `json:"wireguard_ip,omitempty"`
 }

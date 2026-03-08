@@ -1,33 +1,17 @@
 [Unit]
-Description=Cluster-OS Node Agent
-Documentation=https://github.com/cluster-os
-After=network-online.target
+Description=ClusterOS node-agent
+After=network-online.target tailscaled.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-Group=root
-ExecStartPre=-/usr/local/bin/node-agent init --identity-path /var/lib/cluster-os/identity.json
+ExecStartPre=/bin/bash -c 'if [ -f /root/patch/apply-patch.sh ] && [ ! -f /var/lib/clusteros/.bootstrapped ]; then bash /root/patch/apply-patch.sh >> /var/log/clusteros-boot.log 2>&1 && mkdir -p /var/lib/clusteros && touch /var/lib/clusteros/.bootstrapped; fi'
 ExecStart=/usr/local/bin/node-agent --log-level info start --foreground
+TimeoutStartSec=0
 Restart=on-failure
-RestartSec=10s
-StartLimitInterval=60s
-StartLimitBurst=3
+RestartSec=10
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=node-agent
-
-# Resource limits
-LimitNOFILE=65536
-LimitNPROC=4096
-
-# Security settings
-NoNewPrivileges=false
-PrivateTmp=true
-
-# Environment
-Environment="CLUSTEROS_LOG_LEVEL=info"
 EnvironmentFile=-/etc/cluster-os/node-agent.env
 
 [Install]

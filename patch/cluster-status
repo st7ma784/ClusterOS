@@ -1,4 +1,9 @@
 #!/bin/bash
+# DEPRECATED: cluster-status is superseded by the unified 'cluster' CLI.
+# Use: cluster status
+# This script is kept for backwards compatibility only and may be removed in a future release.
+echo "WARNING: cluster-status is deprecated. Use 'cluster status' instead." >&2
+
 # ClusterOS - Show cluster status
 # Usage: cluster-status
 

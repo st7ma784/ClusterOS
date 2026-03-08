@@ -36,8 +36,8 @@ packages:
   - jq
   - net-tools
   - iproute2
-  - wireguard
-  - wireguard-tools
+  # wireguard / wireguard-tools intentionally removed — overlay networking is provided by
+  # Tailscale (installed by provision.sh and managed by tailscale-auth / apply-patch.sh).
 
 write_files:
   - path: /etc/sysctl.d/99-clusteros.conf

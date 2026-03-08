@@ -326,9 +326,7 @@ if [ -f /tmp/clusteros-files/systemd/wifi-rfkill-unblock.service ]; then
     echo "  WiFi rfkill unblock service enabled"
 fi
 
-# WireGuard directory
-sudo mkdir -p /etc/wireguard
-sudo chmod 700 /etc/wireguard
+# WireGuard is replaced by Tailscale — no /etc/wireguard directory needed.
 
 # ------------------------------------------------------------------------------
 # Final setup
@@ -353,22 +351,15 @@ echo "  Installing ClusterOS commands..."
 if [ -d /tmp/clusteros-files/bin ]; then
     sudo cp /tmp/clusteros-files/bin/* /usr/local/bin/
     sudo chmod +x /usr/local/bin/cluster-*
-    sudo chmod +x /usr/local/bin/cluster-autostart 2>/dev/null || true
+    # cluster-autostart no longer exists — bootstrapping is in node-agent.service ExecStartPre.
     sudo chmod +x /usr/local/bin/cluster-wifi-setup 2>/dev/null || true
     sudo chmod +x /usr/local/bin/tailscale-auth 2>/dev/null || true
     sudo chmod +x /usr/local/bin/debug-tailscale 2>/dev/null || true
 fi
 
-# Install and enable cluster-autostart service
-echo "  Installing cluster auto-assembly service..."
-if [ -f /tmp/clusteros-files/systemd/cluster-autostart.service ]; then
-    sudo cp /tmp/clusteros-files/systemd/cluster-autostart.service /etc/systemd/system/
-    sudo systemctl daemon-reload
-    # DISABLED during build to prevent shutdown delays
-    # Will be enabled via post-processor
-    sudo systemctl disable cluster-autostart.service
-    echo "  Cluster auto-assembly installed (disabled during build)"
-fi
+# cluster-autostart.service was a legacy shim that has been replaced by
+# node-agent.service ExecStartPre (which runs apply-patch.sh on first boot).
+# No separate service file needed — node-agent.service handles bootstrapping.
 
 # SSH config - disable root login
 sudo sed -i 's/^#*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
@@ -413,7 +404,8 @@ echo "============================================"
 echo "node-agent:  $(node-agent --version 2>&1 || echo 'installed')"
 echo "k3s:         $(k3s --version 2>&1 | head -1 || echo 'installed')"
 echo "slurm:       $(sinfo --version 2>&1 || echo 'installed')"
-echo "wireguard:   $(wg --version 2>&1 | head -1 || echo 'installed')"
+echo "tailscale:   $(tailscale version 2>&1 | head -1 || echo 'installed')"
+# WireGuard replaced by Tailscale — wg binary not installed.
 echo ""
 echo "ClusterOS commands installed:"
 ls -1 /usr/local/bin/cluster-* 2>/dev/null || echo "  (none)"
@@ -421,7 +413,7 @@ echo ""
 echo "Enabled services:"
 systemctl list-unit-files | grep -E "node-agent|k3s|slurm|munge|tailscale|cluster-autostart|cluster-wifi" | head -20
 echo ""
-echo "WiFi configured: MANDER84"
+echo "WiFi configured: TALKTALK665317 (see images/ubuntu/files/netplan/99-clusteros.yaml)"
 echo ""
 echo "============================================"
 echo "Provisioning Complete"

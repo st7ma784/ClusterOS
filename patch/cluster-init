@@ -1,4 +1,11 @@
 #!/bin/bash
+# DEPRECATED: cluster-init is no longer needed.
+# Cluster initialisation is now automatic: node-agent.service ExecStartPre runs apply-patch.sh
+# on first boot, then node-agent handles discovery, election, and provisioning automatically.
+# This script is kept for reference only and may be removed in a future release.
+echo "WARNING: cluster-init is deprecated. Cluster init is now automatic via node-agent.service." >&2
+echo "         See: journalctl -u node-agent  and  cluster status" >&2
+
 # ClusterOS - Initialize a new cluster
 # Usage: cluster-init
 

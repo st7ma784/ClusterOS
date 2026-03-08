@@ -104,6 +104,9 @@ create_cloud_init() {
     log_info "Creating cloud-init config for node$node_num..."
 
     # User data
+    # Note: The old 'cluster.key' static auth is replaced by Tailscale mesh auth +
+    # Serf HMAC auth key distributed via the patch bundle (apply-patch.sh).
+    # No static WireGuard keys are needed — Tailscale handles secure overlay networking.
     cat > "$vm_dir/user-data" <<EOF
 #cloud-config
 hostname: cluster-node-$node_num
@@ -112,14 +115,9 @@ fqdn: cluster-node-$node_num.cluster.local
 # Preserve hostname
 preserve_hostname: false
 
-# Write cluster key
-write_files:
-  - path: /etc/cluster-os/cluster.key
-    content: $(cat "$SHARED_KEY" 2>/dev/null || echo "auto-generated-key-$(date +%s)")
-    permissions: '0600'
-    owner: root:root
-
 # Run on first boot
+# node-agent.service ExecStartPre will run apply-patch.sh if /root/patch/ exists.
+# Place a patch bundle there before booting (e.g. via second drive or NFS mount).
 runcmd:
   - systemctl daemon-reload
   - systemctl restart node-agent.service
@@ -128,7 +126,6 @@ runcmd:
 # Set timezone
 timezone: UTC
 
-# Disable cloud-init on subsequent boots
 final_message: "Cluster OS node$node_num is ready!"
 EOF
 

@@ -170,7 +170,7 @@ test-k3s: node
 test-full: node
 	@echo "=========================================="
 	@echo "Full Integration Test Suite"
-	@echo "Testing: WireGuard + SLURM + K3s"
+	@echo "Testing: SLURM + K3s + MPI"
 	@echo "=========================================="
 	@echo "Building and starting cluster..."
 	@./test/docker/start-cluster-direct.sh
@@ -275,6 +275,29 @@ patch: node
 		echo "Pause image already bundled (patch/pause-3.6.tar) — reusing"; \
 	fi
 	@chmod +x patch/cluster patch/apply-patch.sh
+	@# --- Bundle netplan (WiFi + wired DHCP config) ---
+	@if [ -f images/ubuntu/files/netplan/99-clusteros.yaml ]; then \
+		cp images/ubuntu/files/netplan/99-clusteros.yaml patch/99-clusteros.yaml; \
+		chmod 600 patch/99-clusteros.yaml; \
+		echo "  OK:      patch/99-clusteros.yaml  ($$(du -sh patch/99-clusteros.yaml | cut -f1))"; \
+	else \
+		echo "WARNING: images/ubuntu/files/netplan/99-clusteros.yaml missing — nodes may not get WiFi"; \
+	fi
+	@# --- Bundle Tailscale credentials + auth script ---
+	@if [ -f images/ubuntu/files/tailscale/tailscale.env ]; then \
+		cp images/ubuntu/files/tailscale/tailscale.env patch/tailscale.env; \
+		chmod 600 patch/tailscale.env; \
+		echo "  OK:      patch/tailscale.env  ($$(du -sh patch/tailscale.env | cut -f1))"; \
+	else \
+		echo "WARNING: images/ubuntu/files/tailscale/tailscale.env missing — new nodes won't auto-join Tailscale"; \
+	fi
+	@if [ -f images/ubuntu/files/bin/tailscale-auth ]; then \
+		cp images/ubuntu/files/bin/tailscale-auth patch/tailscale-auth; \
+		chmod 755 patch/tailscale-auth; \
+		echo "  OK:      patch/tailscale-auth  ($$(du -sh patch/tailscale-auth | cut -f1))"; \
+	else \
+		echo "WARNING: images/ubuntu/files/bin/tailscale-auth missing"; \
+	fi
 	@# --- Copy optional scripts (warn if missing, do not silently skip) ---
 	@for src in scripts/clear-stale-redirects.sh scripts/cluster-make-usb.sh scripts/create-usb-installer.sh; do \
 		if [ -f "$$src" ]; then \
@@ -343,9 +366,14 @@ SSH_USER ?= clusteros
 SSH_PASS ?= clusteros
 SSH_KEY  ?= $(HOME)/.ssh/cluster_key
 
-# Internal: build ssh/scp command prefix (sshpass + key or just key).
-_SSH_AUTH := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=no $(if $(SSH_KEY),-i $(SSH_KEY))
-_SCP_AUTH := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') scp -o StrictHostKeyChecking=no -o ConnectTimeout=5 $(if $(SSH_KEY),-i $(SSH_KEY))
+# Internal: build ssh/rsync/scp command prefixes.
+# rsync is used for uploads — it skips unchanged files (the 16 MB binary is only
+# re-sent when it actually changes), and compresses in-flight.  scp is the fallback.
+_SSH_OPTS := -o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=no -o ServerAliveInterval=15
+_SSH_AUTH  := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') ssh $(_SSH_OPTS) $(if $(SSH_KEY),-i $(SSH_KEY))
+_RSYNC_RSH := ssh $(_SSH_OPTS) $(if $(SSH_KEY),-i $(SSH_KEY))
+_RSYNC_AUTH := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') rsync -az --compress-level=6 --delete -e '$(_RSYNC_RSH)'
+_SCP_AUTH  := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') scp -o StrictHostKeyChecking=no -o ConnectTimeout=8 -C $(if $(SSH_KEY),-i $(SSH_KEY))
 
 deploy: patch
 	@echo "Deploying $(VERSION) ($(COMMIT))"
@@ -371,38 +399,59 @@ deploy: patch
 		echo "  Install Tailscale or pass nodes explicitly: make deploy NODES='IP1 IP2'"; \
 		exit 1; \
 	fi; \
-	_FAILED=""; _OK=""; _SKIPPED=""; \
+	_DEPLOY_TMP=$$(mktemp -d /tmp/clusteros-deploy-XXXXXX); \
+	_PIDS=""; \
 	for node in $$CANDIDATES; do \
-		echo ""; \
-		echo "==> $$node"; \
-		echo "    [probe] Testing SSH access ($(SSH_USER):$(SSH_PASS))..."; \
-		if ! $(_SSH_AUTH) $(SSH_USER)@$$node 'echo ssh-ok' 2>/dev/null | grep -q ssh-ok; then \
-			echo "    skipped — SSH not available with $(SSH_USER):$(SSH_PASS) (not a ClusterOS node, or node is down)"; \
-			_SKIPPED="$$_SKIPPED $$node"; \
-			continue; \
-		fi; \
-		echo "    [1/3] Stopping old node-agent"; \
-		$(_SSH_AUTH) $(SSH_USER)@$$node \
-			'sudo systemctl stop node-agent 2>/dev/null; \
-			 sudo pkill -KILL -f /usr/local/bin/node-agent 2>/dev/null; \
-			 sudo pkill -KILL -f /tmp/node-agent 2>/dev/null; \
-			 true' 2>/dev/null || true; \
-		echo "    [2/3] Uploading patch bundle"; \
-		$(_SSH_AUTH) $(SSH_USER)@$$node 'rm -rf ~/patch' 2>/dev/null || true; \
-		if ! $(_SCP_AUTH) -r patch $(SSH_USER)@$$node:~/; then \
-			echo "  !! FAILED: SCP to $$node"; \
-			_FAILED="$$_FAILED $$node(scp)"; \
-			continue; \
-		fi; \
-		echo "    [3/3] Running apply-patch.sh"; \
-		if ! $(_SSH_AUTH) $(SSH_USER)@$$node 'sudo bash ~/patch/apply-patch.sh'; then \
-			echo "  !! FAILED: apply-patch.sh on $$node exited non-zero (see output above)"; \
-			_FAILED="$$_FAILED $$node(patch)"; \
-			continue; \
-		fi; \
-		echo "  OK: $$node"; \
-		_OK="$$_OK $$node"; \
+		( \
+			echo "==> $$node"; \
+			echo "    [probe] Testing SSH access..."; \
+			if ! $(_SSH_AUTH) $(SSH_USER)@$$node 'echo ssh-ok' 2>/dev/null | grep -q ssh-ok; then \
+				echo "    skipped — SSH not available"; \
+				exit 2; \
+			fi; \
+			echo "    [1/3] Stopping old node-agent (combined)"; \
+			$(_SSH_AUTH) $(SSH_USER)@$$node \
+				'sudo systemctl stop node-agent 2>/dev/null || true; \
+				 sudo pkill -KILL -f /usr/local/bin/node-agent 2>/dev/null || true; \
+				 mkdir -p ~/patch' 2>/dev/null || true; \
+			echo "    [2/3] Syncing patch bundle (rsync — only changed files)"; \
+			if command -v rsync >/dev/null 2>&1; then \
+				if ! $(_RSYNC_AUTH) patch/ $(SSH_USER)@$$node:~/patch/; then \
+					echo "    rsync failed, falling back to scp"; \
+					$(_SSH_AUTH) $(SSH_USER)@$$node 'rm -rf ~/patch && mkdir -p ~/patch' 2>/dev/null || true; \
+					if ! $(_SCP_AUTH) -r patch $(SSH_USER)@$$node:~/; then \
+						echo "  !! FAILED: upload to $$node"; \
+						exit 1; \
+					fi; \
+				fi; \
+			else \
+				$(_SSH_AUTH) $(SSH_USER)@$$node 'rm -rf ~/patch' 2>/dev/null || true; \
+				if ! $(_SCP_AUTH) -r patch $(SSH_USER)@$$node:~/; then \
+					echo "  !! FAILED: scp to $$node (rsync not installed locally)"; \
+					exit 1; \
+				fi; \
+			fi; \
+			echo "    [3/3] Running apply-patch.sh"; \
+			if ! $(_SSH_AUTH) $(SSH_USER)@$$node 'sudo bash ~/patch/apply-patch.sh'; then \
+				echo "  !! FAILED: apply-patch.sh on $$node exited non-zero"; \
+				exit 1; \
+			fi; \
+			echo "  OK: $$node"; \
+		) > "$$_DEPLOY_TMP/$$node.log" 2>&1; \
+		echo "$$?" > "$$_DEPLOY_TMP/$$node.rc" & \
+		_PIDS="$$_PIDS $$!:$$node"; \
 	done; \
+	_FAILED=""; _OK=""; _SKIPPED=""; \
+	for _pid_node in $$_PIDS; do \
+		_pid=$${_pid_node%%:*}; _node=$${_pid_node#*:}; \
+		wait $$_pid 2>/dev/null || true; \
+		cat "$$_DEPLOY_TMP/$$_node.log"; \
+		_rc=$$(cat "$$_DEPLOY_TMP/$$_node.rc" 2>/dev/null || echo 1); \
+		if [ "$$_rc" = "2" ]; then _SKIPPED="$$_SKIPPED $$_node"; \
+		elif [ "$$_rc" = "0" ]; then _OK="$$_OK $$_node"; \
+		else _FAILED="$$_FAILED $$_node(patch)"; fi; \
+	done; \
+	rm -rf "$$_DEPLOY_TMP"; \
 	echo ""; \
 	echo "══════════════════════════════════════════"; \
 	echo " Deploy summary"; \

@@ -20,14 +20,17 @@ discovery:
   encrypt_key: ""
 
 # Networking settings
+# NOTE: WireGuard (interface/listen_port) is replaced by Tailscale for overlay networking.
+# These fields are parsed by config.go but the WireGuardManager is never instantiated
+# by the current node-agent. They are kept to avoid config parse errors.
 networking:
-  # WireGuard interface name
-  interface: wg0
+  # Legacy: WireGuard interface name (not used — Tailscale replaced WireGuard)
+  interface: ""
 
-  # WireGuard listen port
-  listen_port: 51820
+  # Legacy: WireGuard listen port (not used — Tailscale replaced WireGuard)
+  listen_port: 0
 
-  # WireGuard subnet (10.42.0.0/16)
+  # Subnet used for internal addressing reference
   subnet: "10.42.0.0/16"
 
   # Enable IPv6
@@ -55,7 +58,7 @@ roles:
   # All nodes can be SLURM controller or worker - Raft elects the leader
   # All nodes can be K3s server or agent - Raft elects the leader
   enabled:
-    - wireguard
+    # wireguard role removed — overlay networking is Tailscale, not WireGuard
     - k3s-server
     - k3s-agent
     - slurm-controller

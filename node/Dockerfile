@@ -6,6 +6,7 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Install systemd and required packages
+# wireguard-tools intentionally omitted: networking is Tailscale on bare metal; not needed in container tests.
 RUN apt-get update && apt-get install -y \
     systemd \
     systemd-sysv \
@@ -15,7 +16,6 @@ RUN apt-get update && apt-get install -y \
     curl \
     wget \
     ca-certificates \
-    wireguard-tools \
     iptables \
     net-tools \
     sudo \
@@ -89,8 +89,8 @@ RUN systemctl enable node-agent.service
 # Expose ports
 # 7946: Serf gossip (TCP/UDP)
 # 7373: Raft consensus
-# 51820: WireGuard VPN
-EXPOSE 7946/tcp 7946/udp 7373/tcp 51820/udp
+# Note: 51820/udp (WireGuard) no longer exposed — networking is Tailscale on bare metal.
+EXPOSE 7946/tcp 7946/udp 7373/tcp
 
 # Set entrypoint to run node-agent directly
 STOPSIGNAL SIGTERM

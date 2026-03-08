@@ -1,4 +1,11 @@
 #!/bin/bash
+# OBSOLETE: WireGuard has been replaced by Tailscale as the cluster overlay network.
+# This script set up a WireGuard host interface for testing, which is no longer needed.
+# To access QEMU test VMs, use SSH port forwarding (ssh -p 22XX clusteros@localhost)
+# or install Tailscale on the host and join the same tailnet as the VMs.
+echo "ERROR: WireGuard is no longer used in ClusterOS. Tailscale replaced it." >&2
+echo "       VM access: ssh -p 2222 clusteros@localhost (node1), -p 2223 (node2), etc." >&2
+exit 1
 
 # Add host to ClusterOS WireGuard network for VM access
 # This allows the build host to communicate with cluster VMs through WireGuard

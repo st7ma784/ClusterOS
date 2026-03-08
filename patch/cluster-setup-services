@@ -1,4 +1,11 @@
 #!/bin/bash
+# DEPRECATED: cluster-setup-services is superseded by the automatic DeployClusterServices()
+# call inside node-agent (triggered when the leader reaches phase=ready).
+# Run apply-patch.sh to re-deploy with the latest code, or use: cluster diag
+# This script is kept for manual recovery use only and may be removed in a future release.
+echo "WARNING: cluster-setup-services is deprecated. Services deploy automatically via node-agent." >&2
+echo "         For manual recovery: sudo bash apply-patch.sh" >&2
+
 # ClusterOS - Deploy cluster services to an existing K3s cluster
 #
 # Installs: Longhorn (storage), cert-manager, Rancher (management UI)

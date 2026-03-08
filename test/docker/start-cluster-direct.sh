@@ -1,6 +1,8 @@
 #!/bin/bash
 # Direct Docker container startup script for Cluster-OS test cluster
 # This bypasses docker-compose to use cgroupns=host which isn't supported in compose schema validation
+# Note: WIREGUARD_PORT is not passed — overlay networking is Tailscale on bare metal.
+#       Docker test containers communicate over the cluster_net bridge directly.
 
 set -e
 
@@ -60,7 +62,6 @@ docker run -d \
     -e NODE_ROLES=slurm-controller,k3s-server \
     -e SERF_BIND_PORT=7946 \
     -e RAFT_BIND_PORT=7373 \
-    -e WIREGUARD_PORT=51820 \
     -e CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s= \
     -p 7946:7946/tcp \
     -p 7946:7946/udp \
@@ -101,7 +102,6 @@ for i in 2 3 4 5; do
         -e NODE_ROLES=slurm-worker,k3s-agent \
         -e SERF_BIND_PORT=7946 \
         -e RAFT_BIND_PORT=7373 \
-        -e WIREGUARD_PORT=51820 \
         -e CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s= \
         cluster-os-node:latest
     sleep 2

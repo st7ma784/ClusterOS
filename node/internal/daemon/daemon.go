@@ -111,6 +111,11 @@ func (d *Daemon) Start() error {
 		d.logger.Infof("Using hostname-based node name: %s", nodeName)
 	}
 
+	// WireGuardPubKey is derived here for local state bookkeeping only.
+	// It is NOT published to Serf tags (see initSerf — wg_pubkey intentionally omitted)
+	// because WireGuard has been replaced by Tailscale for overlay networking.
+	// The field is retained in state.Node for compatibility with any code that reads it;
+	// it does not affect network connectivity.
 	wgPubKey, err := d.identity.WireGuardPublicKey()
 	if err != nil {
 		return fmt.Errorf("get WireGuard public key: %w", err)
@@ -127,7 +132,7 @@ func (d *Daemon) Start() error {
 			Arch: d.config.Roles.Capabilities.Arch,
 		},
 		Status:          state.StatusAlive,
-		WireGuardPubKey: wgPubKey,
+		WireGuardPubKey: wgPubKey, // legacy field — not used for networking (Tailscale handles overlay)
 	}
 	d.clusterState.AddNode(localNode)
 
@@ -331,6 +336,18 @@ func (d *Daemon) runProvisioning() error {
 		return fmt.Errorf("read k3s token: %w", err)
 	}
 
+	// Label this k8s node with its extra disk count so Longhorn registration
+	// can read it without needing SSH or Serf tag budget for path strings.
+	if paths := readExtraDiskPaths(); len(paths) > 0 {
+		hostname, _ := os.Hostname()
+		label := fmt.Sprintf("clusteros-ndisks=%d", len(paths))
+		if out, err := exec.Command("k3s", "kubectl", "label", "node", hostname, label, "--overwrite").CombinedOutput(); err != nil {
+			d.logger.Warnf("Could not label node with disk count: %v — %s", err, string(out))
+		} else {
+			d.logger.Infof("Labelled k8s node %s with %s", hostname, label)
+		}
+	}
+
 	serverURL := fmt.Sprintf("https://%s:6443", nodeIP)
 
 	// Record in cluster state so ondemand can find the K3s leader.
@@ -503,6 +520,21 @@ func (d *Daemon) runJoining() error {
 		d.logger.Warnf("k3s agent failed to start: %v — SLURM will still start", err)
 	} else {
 		d.roleManager.RegisterRole("k3s-agent", k3sAgent)
+		// Label this worker node with its extra disk count so the leader's Longhorn
+		// registration goroutine can read it from the k8s API without SSH.
+		if paths := readExtraDiskPaths(); len(paths) > 0 {
+			hostname, _ := os.Hostname()
+			label := fmt.Sprintf("clusteros-ndisks=%d", len(paths))
+			// Wait briefly for agent registration before labelling.
+			time.Sleep(30 * time.Second)
+			if out, err := exec.Command("k3s", "kubectl",
+				"--server", k3sServerURL,
+				"label", "node", hostname, label, "--overwrite").CombinedOutput(); err != nil {
+				d.logger.Warnf("Could not label worker node with disk count: %v — %s", err, string(out))
+			} else {
+				d.logger.Infof("Labelled worker k8s node %s with %s", hostname, label)
+			}
+		}
 	}
 
 	// --- SLURM worker ---
@@ -711,10 +743,19 @@ func (d *Daemon) buildWorkerList() []controller.WorkerInfo {
 		if wgip, ok := m.Tags["wgip"]; ok && wgip != "" {
 			nodeIP = wgip
 		}
+		// TmpDisk: derive from ndisks tag — standardised paths /mnt/clusteros/disk-N.
+		// Each extra disk contributes its usable space; SLURM uses this for job temp files.
+		tmpDisk := 0
+		if nstr, ok := m.Tags["ndisks"]; ok {
+			if n, err := strconv.Atoi(nstr); err == nil && n > 0 {
+				tmpDisk = extraDiskTotalMB(n)
+			}
+		}
 		workers = append(workers, controller.WorkerInfo{
-			Name: nodeIP, // must match slurmd's -N flag
-			Addr: nodeIP,
-			CPUs: cpu,
+			Name:    nodeIP, // must match slurmd's -N flag
+			Addr:    nodeIP,
+			CPUs:    cpu,
+			TmpDisk: tmpDisk,
 		})
 	}
 	return workers
@@ -861,6 +902,13 @@ func (d *Daemon) initDiscovery(localNode *state.Node, advertiseAddr string) erro
 	// pubkey (~55 bytes base64) needlessly consumes Serf's 512-byte MetaMaxSize budget.
 	tags := map[string]string{}
 
+	// Advertise the number of extra (non-boot) disks mounted by apply-patch.sh.
+	// The leader reads this from every member's Serf tags to register disk paths
+	// with Longhorn after the cluster reaches ready. Tag is tiny: "ndisks=2".
+	if diskPaths := readExtraDiskPaths(); len(diskPaths) > 0 {
+		tags["ndisks"] = strconv.Itoa(len(diskPaths))
+	}
+
 	// Always bind on 0.0.0.0 so we accept gossip from both LAN and Tailscale interfaces.
 	// Tailscale nodes that block port 7946 may still reach us via LAN, and vice versa.
 	discoveryCfg := &discovery.Config{
@@ -874,6 +922,7 @@ func (d *Daemon) initDiscovery(localNode *state.Node, advertiseAddr string) erro
 		ClusterAuthKey: d.config.Cluster.AuthKey,
 		Tags:           tags,
 		Logger:         d.logger,
+		LANDiscovery:   true, // probe local physical subnets for Serf peers
 	}
 
 	disc, err := discovery.New(discoveryCfg, d.clusterState, localNode)
@@ -1607,5 +1656,46 @@ func (d *Daemon) GetComprehensiveStatus() map[string]interface{} {
 	}
 	status["networking"] = netStatus
 	status["resources"] = d.getResourceUsage()
+
+	// Extra disk paths
+	if paths := readExtraDiskPaths(); len(paths) > 0 {
+		status["extra_disks"] = paths
+	}
+
 	return status
+}
+
+// readExtraDiskPaths reads /etc/clusteros/extra-disks written by apply-patch.sh.
+// Returns the list of mounted extra disk paths (e.g. ["/mnt/clusteros/disk-0"]).
+func readExtraDiskPaths() []string {
+	const manifest = "/etc/clusteros/extra-disks"
+	data, err := os.ReadFile(manifest)
+	if err != nil {
+		return nil
+	}
+	var paths []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			paths = append(paths, line)
+		}
+	}
+	return paths
+}
+
+// extraDiskTotalMB returns the total usable space in MB across n standardised
+// extra disk mount points (/mnt/clusteros/disk-0 … disk-N-1).
+// Used to populate SLURM's TmpDisk so the scheduler knows how much scratch
+// space is available on each node.
+func extraDiskTotalMB(n int) int {
+	totalMB := 0
+	for i := 0; i < n; i++ {
+		path := fmt.Sprintf("/mnt/clusteros/disk-%d", i)
+		var st syscall.Statfs_t
+		if err := syscall.Statfs(path, &st); err == nil {
+			mb := int(st.Bavail * uint64(st.Bsize) / (1024 * 1024))
+			totalMB += mb
+		}
+	}
+	return totalMB
 }

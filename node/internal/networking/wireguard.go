@@ -1,3 +1,8 @@
+// Deprecated: WireGuardManager and all types in this file are unused.
+// Overlay networking has been replaced by Tailscale (see tailscale.go).
+// This file is retained for reference but WireGuardManager is never instantiated
+// by the node-agent. It can be removed once the wireguard_pubkey field is
+// removed from state.Node and identity.DeriveWireGuardKey.
 package networking
 
 import (

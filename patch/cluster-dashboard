@@ -1,4 +1,9 @@
 #!/bin/bash
+# DEPRECATED: cluster-dashboard is superseded by the unified 'cluster' CLI.
+# Use: cluster dash [--once] [--interval N]
+# This script is kept for backwards compatibility only and may be removed in a future release.
+echo "WARNING: cluster-dashboard is deprecated. Use 'cluster dash' instead." >&2
+
 # ClusterOS - Real-Time Cluster Dashboard
 # Usage: cluster-dashboard [--once] [--interval N]
 #

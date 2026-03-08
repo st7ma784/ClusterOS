@@ -1,3 +1,5 @@
+// Deprecated: This package is unused. WireGuard has been replaced by Tailscale
+// as the cluster overlay network. Retained for reference only.
 package renderer
 
 import (

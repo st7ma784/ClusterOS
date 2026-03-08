@@ -21,9 +21,10 @@ import (
 
 // WorkerInfo describes a SLURM worker node for config generation.
 type WorkerInfo struct {
-	Name string
-	Addr string // Tailscale IP or LAN IP
-	CPUs int
+	Name    string
+	Addr    string // Tailscale IP or LAN IP
+	CPUs    int
+	TmpDisk int // scratch disk space in MB (0 = omit from NodeName line)
 }
 
 // SLURMController manages the slurmctld daemon on the elected leader node.
@@ -339,7 +340,7 @@ PrologFlags=Alloc
 # slurmd on the controller uses -N {{.ControllerNode}} to register with this exact NodeName.
 NodeName={{.ControllerNode}} NodeAddr={{.ControllerNode}} CPUs={{if le .ControllerCPUs 1}}1{{else}}{{.ControllerCPUs}}{{end}} RealMemory={{.ControllerMemMB}} State=UNKNOWN
 {{range .Workers}}
-NodeName={{.Name}} NodeAddr={{.Addr}} CPUs={{if le .CPUs 1}}1{{else}}{{.CPUs}}{{end}} RealMemory=4096 State=UNKNOWN
+NodeName={{.Name}} NodeAddr={{.Addr}} CPUs={{if le .CPUs 1}}1{{else}}{{.CPUs}}{{end}} RealMemory=4096{{if gt .TmpDisk 0}} TmpDisk={{.TmpDisk}}{{end}} State=UNKNOWN
 {{end}}
 
 PartitionName=all Nodes=ALL Default=YES MaxTime=INFINITE State=UP

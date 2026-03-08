@@ -666,7 +666,7 @@ cmd_ui() {
     echo    "  SLURM REST:    http://${ip}:30819"
     echo ""
     if ! $is_leader; then
-        echo -e "${DIM}Note: run 'cluster ui' on the leader (${leader_ip:-node-123-80}) for live MetalLB/ingress status.${NC}"
+        echo -e "${DIM}Note: run 'cluster ui' on the leader (${leader_ip:-<leader-ip>}) for live MetalLB/ingress status.${NC}"
     fi
     echo -e "${DIM}Note: services become available ~15 min after cluster reaches 'ready' phase.${NC}"
 }
@@ -1243,6 +1243,153 @@ cmd_diag() {
 # cluster help
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster leader
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_leader() {
+    local leader phase is_leader ts_ip
+    leader=$(status_field "leader" "")
+    phase=$(status_field "phase" "unknown")
+    is_leader=$(status_field "is_leader" "false")
+    ts_ip=$(tailscale ip -4 2>/dev/null || echo "N/A")
+
+    echo -e "${CYAN}${BOLD}═══ Elected Leader ═══${NC}"
+    echo ""
+    if [[ -z "$leader" || "$leader" = "N/A" ]]; then
+        echo -e "  ${YELLOW}No leader elected yet${NC}  (phase: $(phase_colour "$phase"))"
+        echo ""
+        echo "  Leader election happens during ELECTING phase."
+        echo "  Lowest lexicographic alive Tailscale IP wins."
+        return
+    fi
+
+    if [[ "$is_leader" = "true" ]]; then
+        echo -e "  Leader:  ${GREEN}${BOLD}$leader${NC}  ${GREEN}← this node${NC}"
+    else
+        echo -e "  Leader:  ${GREEN}${BOLD}$leader${NC}"
+    fi
+    echo    "  This node: $ts_ip"
+    echo -e "  Phase:   $(phase_colour "$phase")"
+    echo ""
+
+    # Show what the leader is running
+    if [[ "$is_leader" = "true" ]]; then
+        echo -e "${YELLOW}Leader services on this node:${NC}"
+        for svc in k3s slurmctld; do
+            echo -e "  $(svc_icon $svc) $svc"
+        done
+    else
+        echo -e "  Ping leader: ${CYAN}ssh clusteros@$leader${NC}"
+        echo -e "  Leader logs: ${CYAN}ssh clusteros@$leader journalctl -fu node-agent${NC}"
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster nodes
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_nodes() {
+    local leader is_leader phase
+    leader=$(status_field "leader" "")
+    is_leader=$(status_field "is_leader" "false")
+    phase=$(status_field "phase" "unknown")
+
+    echo -e "${CYAN}${BOLD}═══ Cluster Nodes ═══${NC}"
+    echo ""
+
+    # Tailscale peers (fastest live source)
+    if command -v tailscale &>/dev/null && tailscale status &>/dev/null 2>&1; then
+        local self_ip
+        self_ip=$(tailscale ip -4 2>/dev/null || echo "")
+        echo -e "${YELLOW}Tailscale peers:${NC}"
+        echo ""
+        tailscale status 2>/dev/null | grep -v "^#\|^\s*$" | while IFS= read -r line; do
+            local ip name status_str
+            ip=$(echo "$line" | awk '{print $1}')
+            name=$(echo "$line" | awk '{print $2}')
+            status_str=$(echo "$line" | awk '{$1=$2=""; print $0}' | xargs)
+            local role_tag=""
+            [[ "$ip" = "$leader" ]] && role_tag="${GREEN} [LEADER]${NC}"
+            [[ "$ip" = "$self_ip" ]] && role_tag="${role_tag}${CYAN} [this node]${NC}"
+            echo -e "  ${GREEN}●${NC} $ip  $name  ${DIM}$status_str${NC}${role_tag}"
+        done
+        echo ""
+    fi
+
+    # k3s nodes if available
+    if command -v kubectl &>/dev/null || command -v k3s &>/dev/null; then
+        local kubeconfig="/etc/rancher/k3s/k3s.yaml"
+        if [[ -f "$kubeconfig" ]]; then
+            echo -e "${YELLOW}Kubernetes nodes:${NC}"
+            KUBECONFIG="$kubeconfig" kubectl get nodes -o wide 2>/dev/null \
+                | sed 's/^/  /' || echo "  (kubectl unavailable)"
+            echo ""
+        fi
+    fi
+
+    # SLURM nodes if available
+    if command -v sinfo &>/dev/null; then
+        echo -e "${YELLOW}SLURM nodes:${NC}"
+        sinfo -N --noheader -o "  %N  %T  %C  %m" 2>/dev/null || echo "  (sinfo unavailable)"
+        echo ""
+    fi
+
+    echo -e "  Phase: $(phase_colour "$phase")   Leader: ${leader:-unknown}"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster info
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_info() {
+    echo -e "${CYAN}${BOLD}═══ Node Info ═══${NC}"
+    echo ""
+
+    # Binary versions
+    echo -e "${YELLOW}Binaries:${NC}"
+    echo -n "  node-agent:  "; node-agent --version 2>/dev/null || echo "not found"
+    echo -n "  k3s:         "; k3s --version 2>/dev/null | head -1 || echo "not found"
+    echo -n "  tailscale:   "; tailscale version 2>/dev/null | head -1 || echo "not found"
+    echo -n "  slurmd:      "; slurmd --version 2>/dev/null | head -1 || echo "not found"
+    echo ""
+
+    # Hardware
+    echo -e "${YELLOW}Hardware:${NC}"
+    echo "  CPU:     $(nproc) cores  $(grep 'model name' /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs)"
+    local mem_kb
+    mem_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
+    echo "  Memory:  $(( ${mem_kb:-0} / 1024 / 1024 )) GB total"
+    echo "  Disk:    $(df -h / 2>/dev/null | tail -1 | awk '{print $2" total, "$4" free"}')"
+    # GPU
+    if command -v nvidia-smi &>/dev/null; then
+        echo "  GPU:     $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -3 | sed 's/^/           /' | xargs)"
+    else
+        echo "  GPU:     none detected"
+    fi
+    echo ""
+
+    # Identity
+    echo -e "${YELLOW}Identity:${NC}"
+    echo "  Hostname:     $(hostname)"
+    echo "  Machine-ID:   $(cat /etc/machine-id 2>/dev/null | head -c 16)..."
+    echo "  Tailscale IP: $(tailscale ip -4 2>/dev/null || echo N/A)"
+    local node_id
+    node_id=$(status_field "node_id" "")
+    [[ -n "$node_id" ]] && echo "  Node ID:      ${node_id:0:24}..."
+    echo ""
+
+    # USB vs disk boot
+    local root_dev root_tran
+    root_dev=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/p\?[0-9]*$//' | head -1)
+    root_tran=$(lsblk -d -n -o TRAN "$root_dev" 2>/dev/null | head -1 | xargs)
+    if [[ "$root_tran" = "usb" ]]; then
+        echo -e "  Boot:         ${YELLOW}USB live mode${NC} — run ${CYAN}sudo cluster-os-install${NC} to install to disk"
+    else
+        echo -e "  Boot:         disk (${root_dev}  ${root_tran})"
+    fi
+}
+
 cmd_help() {
     echo -e "${CYAN}${BOLD}cluster — ClusterOS management tool${NC}"
     echo ""
@@ -1252,12 +1399,14 @@ cmd_help() {
     echo "  status                   Snapshot of node, cluster, and service state"
     echo "  dash [--interval N]      Live dashboard (default refresh: 5s)"
     echo "        [--once]           Print one snapshot and exit"
+    echo "  leader                   Show elected leader and its role"
+    echo "  nodes                    List all cluster nodes (Tailscale + k8s + SLURM)"
+    echo "  info                     This node's hardware, versions, and identity"
     echo "  test [all|slurm|k3s|mpi|quick]"
     echo "                           Run integration tests (default: all)"
     echo "  logs [service]           Tail logs: node-agent|k3s|slurm|slurmd|munge"
     echo "  diag                     Prerequisite and service diagnostics (run first if broken)"
     echo "  firewall                 Apply all firewall rules now (requires root)"
-    echo "                           Fixes: port 80/443→NodePort redirect, port 6444, etc."
     echo "  ui                       Print all web UI URLs"
     echo "  help                     This help text"
     echo ""
@@ -1285,6 +1434,9 @@ case "$CMD" in
     diag)      cmd_diag ;;
     ui)        cmd_ui ;;
     firewall)  cmd_firewall ;;
+    leader)    cmd_leader ;;
+    nodes)     cmd_nodes ;;
+    info)      cmd_info ;;
     help|-h|--help) cmd_help ;;
     *)
         echo -e "${RED}Unknown command: $CMD${NC}"

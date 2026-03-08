@@ -52,6 +52,16 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# --no-reboot flag: used by USB live boot (node-agent.service ExecStartPre) so that
+# apply-patch.sh does first-boot provisioning without rebooting back into the live USB.
+NO_REBOOT=0
+for _arg in "$@"; do [[ "$_arg" = "--no-reboot" ]] && NO_REBOOT=1; done
+
+# Also auto-detect USB boot: if root is on a USB device, skip the reboot.
+_ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/p\?[0-9]*$//' | head -1)
+_ROOT_TRAN=$(lsblk -d -n -o TRAN "$_ROOT_DEV" 2>/dev/null | head -1 || true)
+[[ "$_ROOT_TRAN" = "usb" ]] && NO_REBOOT=1 && warn "USB boot detected — reboot step will be skipped"
+
 # ── Print bundle version ───────────────────────────────────────────────────────
 if [ -f "$SCRIPT_DIR/VERSION" ]; then
     BUNDLE_VERSION=$(grep '^version=' "$SCRIPT_DIR/VERSION" | cut -d= -f2)
@@ -119,6 +129,30 @@ fi
 if [ -f "$SCRIPT_DIR/cluster" ]; then
     install -m 755 "$SCRIPT_DIR/cluster" /usr/local/bin/cluster
     ok "cluster CLI installed  →  /usr/local/bin/cluster"
+fi
+
+# tailscale-auth → installed as clusteros-tailscale-init (called later for Tailscale auth)
+if [ -f "$SCRIPT_DIR/tailscale-auth" ]; then
+    install -m 755 "$SCRIPT_DIR/tailscale-auth" /usr/local/bin/clusteros-tailscale-init
+    ok "clusteros-tailscale-init installed  →  /usr/local/bin/clusteros-tailscale-init"
+fi
+
+# ── Ensure clusteros user exists ────────────────────────────────────────────
+# cloud-init creates this user on Packer-built images; USB-installed nodes
+# bypass cloud-init so we create it here instead.  Idempotent: no-op if the
+# user already exists (e.g. on existing cluster nodes).
+if ! id clusteros &>/dev/null; then
+    useradd -m -s /bin/bash -G sudo,adm clusteros 2>/dev/null || true
+    echo 'clusteros:clusteros' | chpasswd 2>/dev/null || true
+    printf 'clusteros ALL=(ALL) NOPASSWD:ALL\n' > /etc/sudoers.d/clusteros
+    chmod 440 /etc/sudoers.d/clusteros
+    # Enable SSH password auth (cloud images disable it by default)
+    sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
+    sed -i 's/^#\?KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config 2>/dev/null || true
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+    ok "clusteros user created (password: clusteros, sudo NOPASSWD, SSH enabled)"
+else
+    ok "clusteros user already exists"
 fi
 
 # ── Verify all three critical binaries are now on disk ─────────────────────────
@@ -193,8 +227,14 @@ if [ -f "$SCRIPT_DIR/tailscale.env" ]; then
             ok "Tailscale already connected ($(tailscale ip -4 2>/dev/null))"
         else
             ok "Running Tailscale auth from bundled credentials..."
-            /usr/local/bin/clusteros-tailscale-init 2>/dev/null || \
-                warn "Tailscale auth failed — node may not appear on Tailscale until manually connected"
+            # Run with full output so errors appear in /var/log/clusteros-boot.log
+            # tailscale-auth waits up to 2 min for network then tries OAuth → tailscale up
+            if /usr/local/bin/clusteros-tailscale-init; then
+                ok "Tailscale connected ($(tailscale ip -4 2>/dev/null))"
+            else
+                warn "Tailscale auth failed — check /var/log/clusteros-boot.log for details"
+                warn "Manual fix: sudo tailscale up --authkey=<key>  or  sudo clusteros-tailscale-init"
+            fi
         fi
     else
         warn "Tailscale not installed — run 'make deploy' once node has internet to install it"
@@ -210,6 +250,20 @@ fi
 # ── Pre-flight: networking sanity ──────────────────────────────────────────────
 # Runs before ALL network operations (apt, k3s install, curl, containerd pulls).
 step "pre" "Networking pre-flight"
+
+# 0. Write universal netplan so physical hardware gets DHCP + WiFi on first boot.
+#    Cloud images default to virtual interface names (ens3); real hardware uses
+#    en*/eth*/wl*.  Without this, DHCP never runs → no network → nothing works.
+#    The netplan file is bundled from images/ubuntu/files/netplan/99-clusteros.yaml
+#    so WiFi credentials only need updating in that one file.
+mkdir -p /etc/netplan
+if [ -f "$SCRIPT_DIR/99-clusteros.yaml" ]; then
+    install -m 600 "$SCRIPT_DIR/99-clusteros.yaml" /etc/netplan/99-clusteros.yaml
+    ok "Netplan installed from bundle (wired DHCP + WiFi)"
+else
+    warn "99-clusteros.yaml not in bundle — netplan not updated (WiFi may not work)"
+fi
+netplan apply 2>/dev/null || true
 
 # 1. Force apt to IPv4.
 #    Cluster nodes typically have no IPv6 internet routing.  Without this, apt
@@ -251,6 +305,43 @@ _ts_set() {
     tailscale up "$@" 2>/dev/null
 }
 
+# Detect local physical subnets (non-loopback, non-Tailscale, /24 or smaller)
+# and advertise them as Tailscale subnet routes so peers without direct internet
+# can route through this node, and so wired-only nodes can be reached from Tailscale.
+_advertise_lan_subnets() {
+    local subnets=""
+    while IFS= read -r line; do
+        # ip addr show gives lines like: inet 192.168.1.10/24 brd ... scope global eth0
+        local iface cidr ip prefix
+        iface=$(echo "$line" | awk '{print $NF}')
+        cidr=$(echo "$line" | awk '{print $2}')
+        ip="${cidr%%/*}"
+        prefix="${cidr##*/}"
+        # Skip Tailscale/loopback/WireGuard interfaces
+        case "$iface" in tailscale*|lo|wg*|tun*) continue ;; esac
+        # Only /24 or smaller (prefix >= 24)
+        [ "$prefix" -ge 24 ] 2>/dev/null || continue
+        # Compute network address
+        local net
+        net=$(python3 -c "import ipaddress; print(ipaddress.ip_interface('$cidr').network.with_prefixlen)" 2>/dev/null) || continue
+        [ -n "$net" ] || continue
+        if [ -z "$subnets" ]; then
+            subnets="$net"
+        else
+            subnets="$subnets,$net"
+        fi
+    done < <(ip addr show 2>/dev/null | awk '/inet / && !/127\.0\.0\.1/ {print $2, $NF}' | \
+             while read cidr iface; do echo "inet $cidr brd . scope global $iface"; done)
+
+    if [ -n "$subnets" ]; then
+        if _ts_set --advertise-routes="$subnets" 2>/dev/null; then
+            ok "Advertising LAN subnets via Tailscale ($subnets) — wired peers reachable from mesh"
+        else
+            warn "Could not advertise LAN subnets ($subnets) — needs admin approval in Tailscale console"
+        fi
+    fi
+}
+
 _internet_ok() {
     # Quick dual-check: DNS resolution AND TCP port 443.
     # Both must succeed so a DNS-only or TCP-only outage is caught.
@@ -281,6 +372,9 @@ if command -v tailscale &>/dev/null; then
         else
             warn "Could not set --advertise-exit-node (may need admin approval on tailscale.com)"
         fi
+        # Also advertise local physical LAN subnets so wired-only peers are
+        # reachable from the Tailscale mesh and can share internet via this node.
+        _advertise_lan_subnets
         # Clear any previously selected exit node — we have direct internet.
         SPLIT_ROUTES=$(ip route show 2>/dev/null | grep -cE '^(0\.0\.0\.0/1|128\.0\.0\.0/1)' || true)
         if [ "${SPLIT_ROUTES:-0}" -gt 0 ]; then
@@ -524,6 +618,10 @@ command -v squeue  &>/dev/null || PKGS="$PKGS slurm-client"
 dpkg -s open-iscsi       &>/dev/null 2>&1 || PKGS="$PKGS open-iscsi"
 dpkg -s nfs-common       &>/dev/null 2>&1 || PKGS="$PKGS nfs-common"
 dpkg -s multipath-tools  &>/dev/null 2>&1 || PKGS="$PKGS multipath-tools"
+# WiFi support — wpasupplicant is required for netplan to connect to WPA2 networks
+dpkg -s wpasupplicant    &>/dev/null 2>&1 || PKGS="$PKGS wpasupplicant"
+# avahi-daemon — mDNS peer discovery so nodes find each other on the LAN
+dpkg -s avahi-daemon     &>/dev/null 2>&1 || PKGS="$PKGS avahi-daemon avahi-utils"
 
 if [ -n "$PKGS" ]; then
     apt-get -o Acquire::ForceIPv4=true update -qq
@@ -532,6 +630,60 @@ if [ -n "$PKGS" ]; then
     ok "Installed:$PKGS"
 else
     ok "All dependencies present"
+fi
+
+# avahi-daemon — advertise this node as a ClusterOS peer over mDNS so other
+# nodes on the same Ethernet segment discover it without Tailscale.
+# node-agent probes local subnets for Serf port 7946; avahi is an additional
+# fallback used by admins (avahi-browse -rtp _clusteros._tcp).
+if command -v avahi-daemon &>/dev/null; then
+    # Allow avahi on all interfaces including link-local (169.254.x.x, fe80::).
+    # This is what makes p2p Ethernet patches work with no DHCP server:
+    # avahi multicast runs over link-local so two directly-patched nodes find
+    # each other within seconds of link-up.
+    AVAHI_CONF=/etc/avahi/avahi-daemon.conf
+    if [ -f "$AVAHI_CONF" ]; then
+        # Enable IPv4 link-local and disable interface filtering
+        sed -i \
+            -e 's/^#*use-ipv4=.*/use-ipv4=yes/' \
+            -e 's/^#*use-ipv6=.*/use-ipv6=yes/' \
+            -e 's/^#*allow-interfaces=.*//' \
+            -e 's/^#*deny-interfaces=.*//' \
+            -e 's/^#*use-iff-running=.*/use-iff-running=no/' \
+            "$AVAHI_CONF" 2>/dev/null || true
+    fi
+
+    mkdir -p /etc/avahi/services
+    cat > /etc/avahi/services/clusteros.service <<'AVAHIEOF'
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<service-group>
+  <name replace-wildcards="yes">ClusterOS node %h</name>
+  <service>
+    <type>_clusteros._tcp</type>
+    <port>7946</port>
+  </service>
+</service-group>
+AVAHIEOF
+    systemctl enable --now avahi-daemon 2>/dev/null || true
+    systemctl reload-or-restart avahi-daemon 2>/dev/null || true
+    ok "avahi-daemon advertising _clusteros._tcp on all interfaces (incl. link-local — p2p patches work)"
+fi
+
+# Tailscale — install if not present (chroot may have failed to install it).
+# This is the critical step that lets new nodes join the mesh automatically.
+if ! command -v tailscale &>/dev/null; then
+    ok "Installing Tailscale..."
+    if curl -fsSL https://tailscale.com/install.sh | sh - 2>/dev/null; then
+        systemctl enable --now tailscaled 2>/dev/null || true
+        ok "Tailscale installed and enabled"
+    else
+        warn "Tailscale install failed — node will not auto-join mesh; connect manually after boot"
+    fi
+else
+    ok "Tailscale already installed ($(tailscale version 2>/dev/null | head -1))"
+    # Ensure tailscaled is running
+    systemctl start tailscaled 2>/dev/null || true
 fi
 
 # k3s — node-agent manages this directly; install binary only (no systemd service).
@@ -577,6 +729,101 @@ MPEOF
     ok "multipath.conf created"
 fi
 systemctl enable --now multipathd 2>/dev/null || true
+
+# ── 1d. Extra storage disks ───────────────────────────────────────────────────
+# Detect non-boot block devices, format (if unpartitioned), mount at
+# /mnt/clusteros/disk-N, persist via fstab, and write the path manifest to
+# /etc/clusteros/extra-disks so node-agent can advertise them to Longhorn
+# and SLURM (TmpDisk / scratch space).
+step "1d/10" "Extra storage disk detection and mounting"
+
+EXTRA_DISK_MANIFEST="/etc/clusteros/extra-disks"
+mkdir -p /etc/clusteros
+
+# Identify the root block device (strip partition suffix:
+#   /dev/sda2  → sda     /dev/nvme0n1p3 → nvme0n1)
+ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's|/dev/||')
+ROOT_DISK=$(echo "$ROOT_DEV" | sed -E 's/p?[0-9]+$//')
+
+DISK_IDX=0
+> "$EXTRA_DISK_MANIFEST"  # start fresh
+
+while IFS= read -r disk; do
+    [ -z "$disk" ] && continue
+    [ "$disk" = "$ROOT_DISK" ] && continue
+    DEV="/dev/$disk"
+    [ -b "$DEV" ] || continue
+
+    MOUNT_POINT="/mnt/clusteros/disk-$DISK_IDX"
+
+    # Already mounted at the expected location — just record it.
+    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        ok "Extra disk $DEV already mounted at $MOUNT_POINT"
+        echo "$MOUNT_POINT" >> "$EXTRA_DISK_MANIFEST"
+        DISK_IDX=$((DISK_IDX + 1))
+        continue
+    fi
+
+    # Mounted somewhere else — skip rather than double-mount.
+    if grep -q "^$DEV " /proc/mounts 2>/dev/null; then
+        warn "Extra disk $DEV already mounted elsewhere — skipping"
+        continue
+    fi
+
+    # Skip tiny devices (< 1 GiB) — likely card readers or virtual devices.
+    DISK_BYTES=$(lsblk -b -d -n -o SIZE "$DEV" 2>/dev/null || echo 0)
+    if [ "${DISK_BYTES:-0}" -lt 1073741824 ]; then
+        warn "Extra disk $DEV too small (<1 GiB) — skipping"
+        continue
+    fi
+
+    # Only format if completely empty (no filesystem signature).
+    FS_TYPE=$(blkid -o value -s TYPE "$DEV" 2>/dev/null)
+    if [ -z "$FS_TYPE" ]; then
+        ok "Formatting $DEV (ext4, unpartitioned disk, label=clusteros-disk-$DISK_IDX)..."
+        if ! mkfs.ext4 -L "clusteros-disk-$DISK_IDX" -m 1 -q "$DEV" 2>/dev/null; then
+            warn "mkfs.ext4 failed on $DEV — skipping"
+            continue
+        fi
+        FS_TYPE="ext4"
+    else
+        ok "Extra disk $DEV: existing $FS_TYPE filesystem detected (not reformatted)"
+    fi
+
+    mkdir -p "$MOUNT_POINT"
+    if ! mount "$DEV" "$MOUNT_POINT" 2>/dev/null; then
+        warn "mount $DEV → $MOUNT_POINT failed — skipping"
+        continue
+    fi
+
+    # Persist via fstab using UUID so renames (sda→sdb) don't break it.
+    UUID=$(blkid -o value -s UUID "$DEV" 2>/dev/null)
+    if [ -n "$UUID" ] && ! grep -q "$UUID" /etc/fstab 2>/dev/null; then
+        echo "UUID=$UUID  $MOUNT_POINT  $FS_TYPE  defaults,nofail,x-systemd.automount  0 2" >> /etc/fstab
+    fi
+
+    # Open permissions — Longhorn and SLURM jobs need write access.
+    chmod 1777 "$MOUNT_POINT" 2>/dev/null || true
+
+    DISK_SIZE=$(lsblk -d -n -o SIZE "$DEV" 2>/dev/null)
+    ok "Mounted extra disk $DEV ($DISK_SIZE) → $MOUNT_POINT"
+    echo "$MOUNT_POINT" >> "$EXTRA_DISK_MANIFEST"
+    DISK_IDX=$((DISK_IDX + 1))
+done < <(lsblk -d -n -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+
+if [ "$DISK_IDX" -gt 0 ]; then
+    # /scratch → first extra disk (SLURM job scratch + general large-file use)
+    FIRST_EXTRA=$(head -1 "$EXTRA_DISK_MANIFEST")
+    mkdir -p "$FIRST_EXTRA/scratch"
+    if [ ! -L /scratch ]; then
+        ln -sfn "$FIRST_EXTRA/scratch" /scratch
+        ok "/scratch → $FIRST_EXTRA/scratch (SLURM scratch space)"
+    fi
+    ok "Extra disks: $DISK_IDX found — paths in $EXTRA_DISK_MANIFEST"
+else
+    ok "No extra disks found — cluster will use root disk only"
+    rm -f "$EXTRA_DISK_MANIFEST"
+fi
 
 # ── 2. Unique node identity ────────────────────────────────────────────────────
 step "2/10" "Unique node identity"
@@ -1089,7 +1336,7 @@ chmod 755 /run/clusteros
 
 # Backup old binary
 mkdir -p /usr/local/bin/.clusteros-backup
-for f in node-agent cluster cluster-status cluster-test cluster-dashboard; do
+for f in node-agent cluster; do
     [ -f "/usr/local/bin/$f" ] && cp "/usr/local/bin/$f" "/usr/local/bin/.clusteros-backup/${f}.bak" 2>/dev/null || true
 done
 ok "Backed up previous binaries"
@@ -1116,13 +1363,29 @@ if [ -f "$SCRIPT_DIR/cluster" ]; then
     ok "cluster CLI installed  →  'cluster help' to get started"
 fi
 
-# Legacy scripts (kept for backwards compat, superseded by 'cluster')
-for script in cluster-status cluster-test cluster-dashboard cluster-init cluster-setup-services; do
-    if [ -f "$SCRIPT_DIR/$script" ]; then
-        install -m 755 "$SCRIPT_DIR/$script" "/usr/local/bin/$script"
-    fi
+# Legacy shim scripts — thin wrappers that delegate to 'cluster <subcommand>'
+# Written inline so they work even without the old script files in the bundle.
+for _cmd_map in \
+    "cluster-dashboard:dash" \
+    "cluster-status:status" \
+    "cluster-test:test" \
+    "cluster-init:help" \
+    "cluster-help:help"; do
+    _old="${_cmd_map%%:*}"
+    _new="${_cmd_map#*:}"
+    printf '#!/bin/bash\n# Superseded by: cluster %s\nexec cluster %s "$@"\n' "$_new" "$_new" \
+        > "/usr/local/bin/$_old"
+    chmod 755 "/usr/local/bin/$_old"
 done
-ok "Legacy helper scripts installed"
+# cluster-restart shim
+printf '#!/bin/bash\nif [[ $(id -u) -ne 0 ]]; then exec sudo "$0" "$@"; fi\nsystemctl restart node-agent\n' \
+    > /usr/local/bin/cluster-restart
+chmod 755 /usr/local/bin/cluster-restart
+# cluster-os-create-usb shim
+printf '#!/bin/bash\n# Superseded by: cluster-make-usb\nexec cluster-make-usb "$@"\n' \
+    > /usr/local/bin/cluster-os-create-usb
+chmod 755 /usr/local/bin/cluster-os-create-usb
+ok "Legacy shim scripts installed (cluster-dashboard, cluster-status, cluster-restart, etc.)"
 
 # cluster-make-usb — re-install in case the early-install above was skipped
 # (e.g. manual apply-patch.sh run from a partial bundle without cluster-make-usb.sh
@@ -1137,6 +1400,21 @@ fi
 mkdir -p /usr/local/lib/clusteros
 install -m 755 "$SCRIPT_DIR/apply-patch.sh" /usr/local/lib/clusteros/apply-patch.sh
 ok "apply-patch.sh persisted → /usr/local/lib/clusteros/apply-patch.sh"
+# Persist netplan so cluster-make-usb can bundle it into USB images
+if [ -f "$SCRIPT_DIR/99-clusteros.yaml" ]; then
+    install -m 600 "$SCRIPT_DIR/99-clusteros.yaml" /usr/local/lib/clusteros/99-clusteros.yaml
+fi
+
+# node-agent.service — always update to the version with apply-patch.sh in ExecStartPre.
+if [ -f "$SCRIPT_DIR/systemd/node-agent.service" ]; then
+    install -m 644 "$SCRIPT_DIR/systemd/node-agent.service" \
+        /etc/systemd/system/node-agent.service
+    mkdir -p /etc/systemd/system/multi-user.target.wants
+    ln -sf /etc/systemd/system/node-agent.service \
+        /etc/systemd/system/multi-user.target.wants/node-agent.service 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    ok "node-agent.service updated (apply-patch.sh in ExecStartPre)"
+fi
 
 # clusteros-make-usb systemd service (oneshot, triggered manually).
 if [ -f "$SCRIPT_DIR/systemd/clusteros-make-usb.service" ]; then
@@ -1161,16 +1439,28 @@ echo 'CLUSTEROS_SKIP_FIREWALL=1' > "$NODE_ENV_FILE"
 chmod 0644 "$NODE_ENV_FILE" || true
 ok "Temporarily set CLUSTEROS_SKIP_FIREWALL=1 → $NODE_ENV_FILE"
 
-systemctl start node-agent
-sleep 4
+# When apply-patch.sh runs as ExecStartPre inside node-agent.service, systemd
+# sets $INVOCATION_ID. Calling 'systemctl start node-agent' from within its own
+# ExecStartPre causes systemd to cancel the job — deadlock. Skip the explicit
+# start; ExecStart will run automatically once ExecStartPre returns 0.
+# Mark bootstrapped before starting node-agent so ExecStartPre does not
+# re-invoke apply-patch.sh (which would cause a systemd job cancellation).
+mkdir -p /var/lib/clusteros
+touch /var/lib/clusteros/.bootstrapped
 
-if ! systemctl is-active --quiet node-agent; then
-    err "node-agent failed to start"
-    echo ""
-    journalctl -u node-agent -n 30 --no-pager
-    exit 1
+if [ -n "${INVOCATION_ID:-}" ]; then
+    ok "Running as ExecStartPre — node-agent will start after this script"
+else
+    systemctl start node-agent
+    sleep 4
+    if ! systemctl is-active --quiet node-agent; then
+        err "node-agent failed to start"
+        echo ""
+        journalctl -u node-agent -n 30 --no-pager
+        exit 1
+    fi
+    ok "node-agent is running"
 fi
-ok "node-agent is running"
 
 # Wait up to 15 s for the status file to appear
 for i in $(seq 1 15); do
@@ -1277,22 +1567,27 @@ echo "  any join order gracefully once all nodes run the same version."
 # ── 10. Reboot ─────────────────────────────────────────────────────────────────
 step "10/10" "Scheduling reboot"
 
-# A reboot ensures:
-#   • iscsid / multipathd kernel modules are fully loaded (required by Longhorn)
-#   • machine-id change is picked up by DHCP / Tailscale
-#   • any stale K3s / Serf file locks are cleared
-#   • node-agent starts fresh with the new binary under systemd supervision
-echo ""
-echo -e "${CYAN}${BOLD}This node will reboot in 10 seconds.${NC}"
-echo "  Interrupt with Ctrl-C if you need to stay online, then reboot manually."
-echo ""
+if [[ "$NO_REBOOT" -eq 1 ]]; then
+    ok "Skipping reboot (USB live boot or --no-reboot flag)"
+    ok "Node is running — use 'cluster status' to verify"
+    ok "To install permanently to disk: sudo cluster-os-install"
+else
+    # A reboot ensures:
+    #   • iscsid / multipathd kernel modules are fully loaded (required by Longhorn)
+    #   • machine-id change is picked up by DHCP / Tailscale
+    #   • any stale K3s / Serf file locks are cleared
+    #   • node-agent starts fresh with the new binary under systemd supervision
+    echo ""
+    echo -e "${CYAN}${BOLD}This node will reboot in 10 seconds.${NC}"
+    echo "  Interrupt with Ctrl-C if you need to stay online, then reboot manually."
+    echo ""
 
-# Give the operator a brief window to cancel.
-REBOOT_DELAY=10
-for i in $(seq "$REBOOT_DELAY" -1 1); do
-    printf "\r  Rebooting in %2d s ...  (Ctrl-C to cancel)" "$i"
-    sleep 1
-done
-echo ""
-ok "Rebooting now"
-systemctl reboot
+    REBOOT_DELAY=10
+    for i in $(seq "$REBOOT_DELAY" -1 1); do
+        printf "\r  Rebooting in %2d s ...  (Ctrl-C to cancel)" "$i"
+        sleep 1
+    done
+    echo ""
+    ok "Rebooting now"
+    systemctl reboot
+fi

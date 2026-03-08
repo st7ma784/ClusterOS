@@ -37,8 +37,10 @@ func Generate() (*Identity, error) {
 	}, nil
 }
 
-// DeriveWireGuardKey derives a WireGuard private key from the identity
-// This ensures the WireGuard key is deterministic and tied to node identity
+// DeriveWireGuardKey derives a WireGuard private key from the identity.
+// Deprecated: WireGuard is replaced by Tailscale for overlay networking.
+// This method is only retained because daemon.go populates state.Node.WireGuardPubKey
+// for local bookkeeping. It is not published to Serf and does not affect connectivity.
 func (i *Identity) DeriveWireGuardKey() ([]byte, error) {
 	// Use BLAKE2b to derive a 32-byte WireGuard private key from the Ed25519 private key
 	hash, err := blake2b.New256(nil)
@@ -53,7 +55,8 @@ func (i *Identity) DeriveWireGuardKey() ([]byte, error) {
 	return hash.Sum(nil), nil
 }
 
-// WireGuardKeyString returns the WireGuard private key as a base64 string
+// WireGuardKeyString returns the WireGuard private key as a base64 string.
+// Deprecated: see DeriveWireGuardKey.
 func (i *Identity) WireGuardKeyString() (string, error) {
 	key, err := i.DeriveWireGuardKey()
 	if err != nil {
@@ -64,8 +67,9 @@ func (i *Identity) WireGuardKeyString() (string, error) {
 	return hex.EncodeToString(key), nil
 }
 
-// WireGuardPublicKey returns the WireGuard public key derived from the private key
-// The key is clamped per Curve25519 requirements and returned as base64
+// WireGuardPublicKey returns the WireGuard public key derived from the private key.
+// Deprecated: see DeriveWireGuardKey. Only called by daemon.go for state.Node.WireGuardPubKey bookkeeping.
+// The key is clamped per Curve25519 requirements and returned as base64.
 func (i *Identity) WireGuardPublicKey() (string, error) {
 	key, err := i.DeriveWireGuardKey()
 	if err != nil {

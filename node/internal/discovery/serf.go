@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cluster-os/node/internal/auth"
@@ -32,6 +33,7 @@ type SerfDiscovery struct {
 	clusterAuth              *auth.ClusterAuth
 	userEventHandlers        []UserEventHandler
 	membershipChangeHandlers []MembershipChangeHandler
+	lanMu                    sync.Mutex
 	lanDiscoveryEnabled      bool
 	lanDiscoveryLoop         context.CancelFunc
 }
@@ -130,20 +132,33 @@ func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node) (
 		clusterAuth: clusterAuth,
 	}
 
-	// Join bootstrap peers if provided
+	// Join explicit bootstrap peers if configured.
 	if len(cfg.BootstrapPeers) > 0 {
-		sd.logger.Infof("Joining cluster via peers: %v", cfg.BootstrapPeers)
+		sd.logger.Infof("Joining cluster via configured peers: %v", cfg.BootstrapPeers)
 		n, err := serfInstance.Join(cfg.BootstrapPeers, true)
 		if err != nil {
-			sd.logger.Warnf("Failed to join some peers: %v", err)
+			sd.logger.Warnf("Failed to join some bootstrap peers: %v", err)
 		} else {
-			sd.logger.Infof("Successfully joined %d peers", n)
+			sd.logger.Infof("Successfully joined %d bootstrap peer(s)", n)
 		}
-	} else {
-		sd.logger.Info("Bootstrap mode: no peers to join, waiting for Tailscale peer discovery")
 	}
 
 	go sd.handleEvents()
+
+	// Discovery context — cancelled by Shutdown().
+	discCtx, discCancel := context.WithCancel(context.Background())
+	sd.lanDiscoveryLoop = discCancel
+
+	// Tailscale peer discovery: probe all online Tailscale peers for Serf port 7946.
+	// This is the primary join mechanism when no bootstrap_peers are configured —
+	// nodes on the same Tailscale network find each other automatically.
+	sd.StartTailscalePeerDiscovery(discCtx)
+
+	// LAN peer discovery: probe local physical subnets + ARP neighbours + mDNS.
+	// Handles nodes on the same Ethernet segment with or without Tailscale.
+	if cfg.LANDiscovery {
+		sd.StartLANDiscovery(discCtx)
+	}
 
 	return sd, nil
 }
@@ -406,6 +421,9 @@ func (sd *SerfDiscovery) Leave() error {
 
 // Shutdown shuts down the discovery layer
 func (sd *SerfDiscovery) Shutdown() error {
+	if sd.lanDiscoveryLoop != nil {
+		sd.lanDiscoveryLoop()
+	}
 	close(sd.shutdownCh)
 	return sd.serf.Shutdown()
 }
