@@ -109,7 +109,7 @@ cmd_status() {
         echo -e "  k3s:          ${YELLOW}○ not running${NC}"
     fi
 
-    if pgrep -x slurmctld &>/dev/null; then
+    if pgrep -f 'slurmctld' &>/dev/null; then
         local jobs
         jobs=$(squeue --noheader 2>/dev/null | wc -l || echo "?")
         echo -e "  slurmctld:    ${GREEN}● ($jobs jobs)${NC}"
@@ -117,13 +117,13 @@ cmd_status() {
         echo -e "  slurmctld:    ${YELLOW}○ not running${NC}"
     fi
 
-    if pgrep -x slurmd &>/dev/null; then
+    if pgrep -f 'slurmd' &>/dev/null; then
         echo -e "  slurmd:       ${GREEN}●${NC}"
     else
         echo -e "  slurmd:       ${YELLOW}○ not running${NC}"
     fi
 
-    if pgrep -x munged &>/dev/null; then
+    if pgrep -f 'munged' &>/dev/null; then
         echo -e "  munged:       ${GREEN}●${NC}"
     else
         echo -e "  munged:       ${YELLOW}○ not running${NC}"
@@ -202,14 +202,14 @@ cmd_dash() {
         echo -e "\n${YELLOW}${BOLD} SLURM${NC}"
         local slurm_phase
         slurm_phase=$(status_field "phase" "unknown")
-        if pgrep -x slurmctld &>/dev/null; then
+        if pgrep -f 'slurmctld' &>/dev/null; then
             echo -e "  ${GREEN}● slurmctld${NC}"
             local squeue_out squeue_err
             squeue_out=$(squeue --noheader --format="  %-10i %-10u %-10j %-8T %-8r" 2>/tmp/.cluster_squeue_err | head -6)
             squeue_err=$(cat /tmp/.cluster_squeue_err 2>/dev/null | head -1 | sed 's/squeue: error: //')
             if [ -n "$squeue_err" ]; then
                 echo -e "  ${YELLOW}  ⚠ squeue: ${squeue_err}${NC}"
-                pgrep -x munged &>/dev/null \
+                pgrep -f munged &>/dev/null \
                     && echo -e "  ${DIM}  munged running — possible key mismatch; check 'cluster logs slurm'${NC}" \
                     || echo -e "  ${RED}  munged not running — munge auth will fail${NC}"
             elif [ -n "$squeue_out" ]; then
@@ -219,7 +219,7 @@ cmd_dash() {
             fi
             echo ""
             sinfo --format="  %-12P %-6D %-10T %-10C" 2>/dev/null | head -5 || true
-        elif pgrep -x slurmd &>/dev/null; then
+        elif pgrep -f 'slurmd' &>/dev/null; then
             echo -e "  ${GREEN}● slurmd${NC}  (worker)"
             local squeue_out squeue_err
             squeue_out=$(squeue --noheader --format="  %-10i %-10u %-10j %-8T %-8r" 2>/tmp/.cluster_squeue_err | head -6)

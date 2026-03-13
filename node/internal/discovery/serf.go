@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +54,54 @@ type Config struct {
 	Logger           *logrus.Logger
 	LANDiscovery     bool
 	LANDiscoveryScan time.Duration
+	// Version is the binary version (git commit hash). Published as a Serf tag
+	// so the election logic can exclude peers running a different/stale version.
+	Version string
+	// BuildTime is the binary build timestamp. For dirty builds (uncommitted changes),
+	// this is appended to Version so two dirty builds at different times are
+	// treated as different versions in the election — prevents old and new dirty
+	// builds from interoperating when the source changed between builds.
+	BuildTime string
+}
+
+// localGPUCount returns the number of GPUs visible on this node.
+// Detects NVIDIA GPUs via /dev/nvidia[0-9]* and AMD GPUs via
+// /sys/class/drm/renderD* with vendor ID 0x1002.
+func localGPUCount() int {
+	count := 0
+	if entries, err := filepath.Glob("/dev/nvidia[0-9]*"); err == nil {
+		count += len(entries)
+	}
+	if renders, err := filepath.Glob("/sys/class/drm/renderD*"); err == nil {
+		for _, r := range renders {
+			vendor, _ := os.ReadFile(filepath.Join(r, "device", "vendor"))
+			if strings.TrimSpace(string(vendor)) == "0x1002" {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// localMemMB returns the total physical RAM in MB, with a floor of 1024.
+func localMemMB() int {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 1024
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "MemTotal:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				kb, _ := strconv.ParseInt(fields[1], 10, 64)
+				if mb := int(kb / 1024); mb > 1024 {
+					return mb
+				}
+			}
+			break
+		}
+	}
+	return 1024
 }
 
 // New creates a new Serf discovery instance
@@ -94,9 +144,13 @@ func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node) (
 	serfConfig.ReconnectInterval = 10 * time.Second
 	serfConfig.ReconnectTimeout = 2 * time.Hour
 	serfConfig.MemberlistConfig.PushPullInterval = 15 * time.Second
-	serfConfig.MemberlistConfig.ProbeInterval = 3 * time.Second
-	serfConfig.MemberlistConfig.ProbeTimeout = 2 * time.Second
-	serfConfig.MemberlistConfig.SuspicionMult = 3
+	// Tailscale DERP relay can add 200-500ms of latency; tighten the probe
+	// timeouts would cause false "failed" marks leading to split-brain leadership.
+	// ProbeTimeout=5s tolerates one DERP relay round-trip with margin.
+	// SuspicionMult=8 requires 8 independent failures before marking dead (~40s).
+	serfConfig.MemberlistConfig.ProbeInterval = 5 * time.Second
+	serfConfig.MemberlistConfig.ProbeTimeout = 5 * time.Second
+	serfConfig.MemberlistConfig.SuspicionMult = 8
 	serfConfig.MemberlistConfig.GossipInterval = 300 * time.Millisecond
 
 	if len(cfg.EncryptKey) > 0 {
@@ -109,7 +163,19 @@ func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node) (
 	cfg.Tags["node_id"] = cfg.NodeID
 	cfg.Tags["roles"] = strings.Join(localNode.Roles, ",")
 	cfg.Tags["cpu"] = strconv.Itoa(localNode.Capabilities.CPU)
+	cfg.Tags["ram"] = strconv.Itoa(localMemMB())
+	cfg.Tags["gpu"] = strconv.Itoa(localGPUCount())
 	cfg.Tags["arch"] = localNode.Capabilities.Arch
+	if cfg.Version != "" {
+		ver := cfg.Version
+		// For dirty builds, append the build time so that binaries built from
+		// different source snapshots (same commit, different uncommitted changes)
+		// are treated as distinct versions during election.
+		if strings.Contains(ver, "-dirty") && cfg.BuildTime != "" {
+			ver = ver + "+" + cfg.BuildTime
+		}
+		cfg.Tags["ver"] = ver
+	}
 
 	// Compact auth token
 	joinToken := clusterAuth.CreateCompactJoinToken(cfg.NodeID)

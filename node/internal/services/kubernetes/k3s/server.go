@@ -108,6 +108,11 @@ func (ks *K3sServer) Start() error {
 			args = append(args, "--tls-san", lanIP)
 		}
 	}
+	// Force Flannel to use the Tailscale interface as the VXLAN endpoint.
+	// Without this, Flannel auto-detects the first non-loopback interface which
+	// may be a LAN interface (192.168.1.x) unreachable from other cluster nodes.
+	// The Tailscale interface provides stable connectivity across all network topologies.
+	args = append(args, "--flannel-iface", "tailscale0")
 
 	cmd := exec.Command("k3s", args...)
 	cmd.Stdout = os.Stdout
@@ -298,10 +303,47 @@ func (ks *K3sServer) ReadToken() (string, error) {
 	return "", fmt.Errorf("K3s token not available after 60s at %s", ks.tokenPath)
 }
 
+// ReadCACert returns the k3s cluster CA certificate PEM that the leader's server is using.
+// Workers install this before starting the k3s agent so they trust the leader's TLS cert
+// without needing the patch/k3s-ca.crt bundle (which may differ across installations).
+func (ks *K3sServer) ReadCACert() ([]byte, error) {
+	caPath := filepath.Join(ks.dataDir, "server/tls/server-ca.crt")
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(caPath); err == nil && len(data) > 0 {
+			ks.Logger().Infof("Read cluster CA cert (%d bytes) from %s", len(data), caPath)
+			return data, nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return nil, fmt.Errorf("cluster CA cert not available after 30s at %s", caPath)
+}
+
+// waitForAPIStable waits until the k3s API is consistently reachable (3 successes
+// with 2s gaps) before proceeding with deployment. This guards against a transient
+// "connection refused" that occurs when k3s restarts its API server internally ~5s
+// after startup (TLS handshake warm-up, etcd compaction, etc.).
+func (ks *K3sServer) waitForAPIStable() {
+	consec := 0
+	for consec < 3 {
+		if exec.Command("k3s", "kubectl", "get", "nodes", "--request-timeout=5s").Run() == nil {
+			consec++
+		} else {
+			consec = 0
+		}
+		time.Sleep(2 * time.Second)
+	}
+	ks.Logger().Info("k3s API stable — proceeding with service deployment")
+}
+
 // DeployClusterServices installs Longhorn, nginx-ingress, cert-manager, Rancher, slurmdbd,
 // and the SLURM REST API. Called as a goroutine from the phase machine after K3s API is ready.
 func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 	ks.Logger().Info("Starting cluster services deployment...")
+	// Wait for the API to be consistently reachable before deploying. k3s sometimes
+	// drops connections for ~5s after the first "ready" probe due to internal TLS
+	// handshake warm-up and etcd initialisation.
+	ks.waitForAPIStable()
 
 	if err := ks.deploySlurmdbd(mungeKey); err != nil {
 		ks.Logger().Warnf("Failed to deploy slurmdbd: %v", err)
@@ -311,17 +353,21 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 		ks.Logger().Warnf("MetalLB unavailable (%v) — services remain on NodePort", err)
 	}
 
-	// Ingress deployment is optional; skip automatic nginx-ingress DaemonSet
-	// to avoid binding host ports or adding NAT redirects on every node.
-	ks.Logger().Info("Skipping automatic nginx-ingress deployment (disabled)")
+	// Deploy nginx-ingress as a DaemonSet with hostNetwork so every node binds
+	// port 80/443 and NodePorts 30080/30443.  Rancher, Longhorn, and SLURM REST
+	// are all routed via this ingress controller.
+	if err := ks.deployIngressNginx(); err != nil {
+		ks.Logger().Warnf("nginx-ingress unavailable (%v) — Rancher/Longhorn ingress won't work", err)
+	}
 
 	// Deploy a ClusterOS landing page as the nginx default backend so that any
 	// unmatched request (e.g. http://IP:30080/) shows a useful page with service links
 	// instead of the bare nginx 404.
 	ks.deployClusterOSLandingPage()
 
-	// Wait briefly for nginx-ingress controller to be ready before deploying ingress resources.
-	time.Sleep(15 * time.Second)
+	// Wait for nginx-ingress controller to be ready before deploying ingress resources.
+	ks.Logger().Info("Waiting 30s for nginx-ingress to be ready before deploying ingress resources...")
+	time.Sleep(30 * time.Second)
 
 	if err := ks.deployLonghorn(); err != nil {
 		ks.Logger().Warnf("Failed to deploy Longhorn: %v", err)
@@ -343,7 +389,7 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 	// regardless of whether deployRancher succeeds or fails.
 	rancherHost := "rancher.cluster.local"
 	if ks.nodeIP != "" {
-		rancherHost = ks.nodeIP
+		rancherHost = ks.nodeIP + ".nip.io"
 	}
 
 	if err := ks.deployRancher(); err != nil {
@@ -435,7 +481,42 @@ func (ks *K3sServer) resetEtcdIfStale() error {
 // killExistingK3s kills any existing K3s/etcd processes and orphaned containerd.
 // K3s may bind etcd to its node IP rather than 127.0.0.1, so we check both.
 func (ks *K3sServer) killExistingK3s() {
-	// Always kill orphaned k3s-embedded containerd first.
+	// Kill any stale k3s agent processes first.
+	//
+	// When a node transitions from worker→leader (e.g. after re-election), the
+	// old k3s agent process may still be running and holding port 6444 (the k3s
+	// internal load balancer).  k3s server also binds 6444 — if the old agent
+	// still owns it, the new server fails immediately with "bind: address already
+	// in use" before we even get a chance to check port 2380.
+	// Kill all k3s agent/server processes unconditionally and wait for 6444 to
+	// be released before proceeding.
+	ks.Logger().Info("Killing any stale k3s agent/server processes before server start")
+	exec.Command("pkill", "-TERM", "-f", "k3s agent").Run()  //nolint:errcheck
+	exec.Command("pkill", "-TERM", "-f", "k3s server").Run() //nolint:errcheck
+	// Give them 3s to exit gracefully, then force-kill.
+	for i := 0; i < 3; i++ {
+		time.Sleep(1 * time.Second)
+		agentGone, _ := exec.Command("pgrep", "-f", "k3s agent").Output()
+		serverGone, _ := exec.Command("pgrep", "-f", "k3s server").Output()
+		if len(agentGone) == 0 && len(serverGone) == 0 {
+			break
+		}
+	}
+	exec.Command("pkill", "-KILL", "-f", "k3s agent").Run()  //nolint:errcheck
+	exec.Command("pkill", "-KILL", "-f", "k3s server").Run() //nolint:errcheck
+
+	// Wait for port 6444 (internal load balancer) to be released.
+	ks.Logger().Info("Waiting for port 6444 to be released...")
+	for i := 0; i < 10; i++ {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:6444", 500*time.Millisecond)
+		if err != nil {
+			break // port free
+		}
+		conn.Close()
+		time.Sleep(1 * time.Second)
+	}
+
+	// Always kill orphaned k3s-embedded containerd.
 	//
 	// When k3s is SIGKILLed (apply-patch.sh step 4, previous killExistingK3s,
 	// or OOM), its containerd child process is orphaned and keeps running with the
@@ -445,15 +526,13 @@ func (ks *K3sServer) killExistingK3s() {
 	// --pause-image registry.k8s.io/pause:3.6 on the command line.
 	// Kill it unconditionally so every Start() always gets a fresh containerd
 	// instance that reads the updated config.
-	if _, err := os.Stat("/run/k3s/containerd/containerd.sock"); err == nil {
-		ks.Logger().Info("Orphaned k3s containerd socket found — killing stale instance")
-		exec.Command("pkill", "-TERM", "-f", "/run/k3s/containerd/containerd").Run()
-		time.Sleep(1 * time.Second)
-		exec.Command("pkill", "-KILL", "-f", "/run/k3s/containerd/containerd").Run()
-		os.Remove("/run/k3s/containerd/containerd.sock")
-		ks.Logger().Info("Orphaned containerd killed — next k3s start gets fresh instance")
-	}
+	ks.Logger().Info("Killing any orphaned k3s containerd before server start")
+	exec.Command("pkill", "-TERM", "-f", "/run/k3s/containerd/containerd").Run() //nolint:errcheck
+	time.Sleep(1 * time.Second)
+	exec.Command("pkill", "-KILL", "-f", "/run/k3s/containerd/containerd").Run() //nolint:errcheck
+	os.Remove("/run/k3s/containerd/containerd.sock")                              //nolint:errcheck
 
+	// Check port 2380 (etcd) — run k3s-killall.sh if still bound.
 	addrs := []string{"127.0.0.1:2380"}
 	if ks.nodeIP != "" && ks.nodeIP != "127.0.0.1" {
 		addrs = append(addrs, ks.nodeIP+":2380")
@@ -472,7 +551,7 @@ func (ks *K3sServer) killExistingK3s() {
 		return
 	}
 
-	ks.Logger().Warn("Port 2380 in use — killing stale K3s/etcd processes")
+	ks.Logger().Warn("Port 2380 still in use — running k3s-killall.sh")
 	if _, err := os.Stat("/usr/local/bin/k3s-killall.sh"); err == nil {
 		exec.Command("/usr/local/bin/k3s-killall.sh").Run()
 	} else {
@@ -481,8 +560,6 @@ func (ks *K3sServer) killExistingK3s() {
 	}
 
 	// Wait for the port to actually be released rather than using a fixed sleep.
-	// The OS releases the TCP binding after the process dies, but it can take a
-	// moment for the socket to move out of TIME_WAIT/CLOSE_WAIT.
 	ks.Logger().Info("Waiting for port 2380 to be released...")
 	for i := 0; i < 15; i++ {
 		time.Sleep(1 * time.Second)
@@ -713,6 +790,22 @@ func (ks *K3sServer) deployMetalLB() error {
 		return fmt.Errorf("apply metallb manifest: %w: %s", err, out)
 	}
 
+	// Create the memberlist secret that MetalLB speakers require to form their gossip mesh.
+	// Without this, speakers stay in ContainerCreating indefinitely on fresh installs.
+	if exec.Command("k3s", "kubectl", "-n", "metallb-system", "get", "secret", "memberlist").Run() != nil {
+		keyBytes, err := exec.Command("openssl", "rand", "-base64", "128").Output()
+		if err != nil {
+			return fmt.Errorf("generate memberlist key: %w", err)
+		}
+		createCmd := exec.Command("k3s", "kubectl", "-n", "metallb-system", "create", "secret",
+			"generic", "memberlist", "--from-literal=secretkey="+strings.TrimSpace(string(keyBytes)))
+		if out, err := createCmd.CombinedOutput(); err != nil {
+			ks.Logger().Warnf("MetalLB memberlist secret creation failed: %v: %s (continuing)", err, out)
+		} else {
+			ks.Logger().Info("MetalLB memberlist secret created")
+		}
+	}
+
 	// Wait for controller Deployment to be ready (up to 3 min).
 	ks.Logger().Info("Waiting up to 3m for MetalLB controller to be ready...")
 	if out, err := exec.Command("k3s", "kubectl", "-n", "metallb-system",
@@ -897,7 +990,6 @@ spec:
         - --controller-class=k8s.io/ingress-nginx
         - --ingress-class=nginx
         - --configmap=$(POD_NAMESPACE)/ingress-nginx-controller
-        - --validating-webhook-configuration-name=ingress-nginx-admission
         env:
         - name: POD_NAME
           valueFrom:
@@ -966,6 +1058,10 @@ func (ks *K3sServer) deployIngressNginx() error {
 		return fmt.Errorf("apply nginx-ingress manifest: %w: %s", err, string(output))
 	}
 
+	// Clean up any admission Jobs stuck in CreateContainerError (e.g. corrupt image layers).
+	// The certgen Jobs are one-shot; deleting and re-applying the manifest recreates them.
+	ks.fixStuckAdmissionJobs()
+
 	// Wait for the upstream Deployment pod so we can read its exact image tag/digest.
 	exec.Command("k3s", "kubectl", "-n", "ingress-nginx",
 		"rollout", "status", "deployment/ingress-nginx-controller", "--timeout=3m").Run()
@@ -1005,6 +1101,48 @@ func (ks *K3sServer) deployIngressNginx() error {
 	// Upgrade to LoadBalancer type if MetalLB is ready.
 	ks.patchIngressForMetalLB()
 	return nil
+}
+
+// fixStuckAdmissionJobs detects ingress-nginx admission Jobs whose pods are stuck in
+// CreateContainerError (typically due to corrupt containerd image layers from a previous
+// failed pull). For each stuck Job it:
+//  1. Evicts the corrupt image from the containerd content store.
+//  2. Deletes the Job (k8s will not automatically recreate one-shot Jobs, so the
+//     manifest must be re-applied — the caller does that via the existing apply step).
+func (ks *K3sServer) fixStuckAdmissionJobs() {
+	// List all Jobs in ingress-nginx namespace.
+	out, err := exec.Command("k3s", "kubectl", "-n", "ingress-nginx",
+		"get", "jobs", "-o", "jsonpath={.items[*].metadata.name}").Output()
+	if err != nil {
+		return
+	}
+	for _, jobName := range strings.Fields(string(out)) {
+		// Find pods belonging to this Job.
+		podOut, _ := exec.Command("k3s", "kubectl", "-n", "ingress-nginx",
+			"get", "pods", "-l", "job-name="+jobName,
+			"-o", "jsonpath={range .items[*]}{.metadata.name}={.status.containerStatuses[0].state.waiting.reason}{\"\\n\"}{end}").Output()
+		stuck := false
+		for _, line := range strings.Split(string(podOut), "\n") {
+			if strings.Contains(line, "CreateContainerError") || strings.Contains(line, "ErrImagePull") || strings.Contains(line, "ImagePullBackOff") {
+				stuck = true
+				// Try to extract image from pod and evict from containerd.
+				parts := strings.SplitN(line, "=", 2)
+				podName := parts[0]
+				imgOut, _ := exec.Command("k3s", "kubectl", "-n", "ingress-nginx",
+					"get", "pod", podName,
+					"-o", "jsonpath={.spec.containers[0].image}").Output()
+				image := strings.TrimSpace(string(imgOut))
+				if image != "" {
+					ks.Logger().Infof("Evicting corrupt image %s from containerd for Job %s", image, jobName)
+					exec.Command("k3s", "ctr", "images", "rm", image).Run()
+				}
+			}
+		}
+		if stuck {
+			ks.Logger().Infof("Deleting stuck admission Job %s (will be recreated on next apply)", jobName)
+			exec.Command("k3s", "kubectl", "-n", "ingress-nginx", "delete", "job", jobName, "--ignore-not-found=true").Run()
+		}
+	}
 }
 
 // patchNginxHostNetwork ensures any existing nginx-ingress controller (DaemonSet or
@@ -1214,6 +1352,7 @@ metadata:
   namespace: longhorn-system
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/use-regex: "true"
     nginx.ingress.kubernetes.io/rewrite-target: /$2
 spec:
   ingressClassName: nginx
@@ -1362,9 +1501,11 @@ footer{{margin-top:20px;color:#334155;font-size:.75em}}
   <tbody>{tr}</tbody>
 </table>
 <footer>
-  Ingress (:30080 HTTP / :30443 HTTPS) &mdash;
+  Ingress (:30080 HTTP) &mdash;
   <a href='http://{NODE_IP}:30080/longhorn/'>/longhorn/</a> &nbsp;
-  <a href='http://{NODE_IP}:30080/slurm/'>/slurm/</a>
+  <a href='http://{NODE_IP}:30080/slurm/'>/slurm/</a> &nbsp;
+  <a href='http://{NODE_IP}:30080/rancher'>/rancher</a> &rarr;
+  <a href='https://{NODE_IP}:30444'>https:{NODE_IP}:30444</a> (Rancher UI)
 </footer>
 </body></html>"""
 
@@ -1448,7 +1589,8 @@ spec:
             path: /
             port: 8080
           initialDelaySeconds: 5
-          periodSeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 10
         volumeMounts:
         - name: script
           mountPath: /app
@@ -1466,20 +1608,21 @@ spec:
 		}
 	}
 
-	// Patch the nginx-ingress-controller to use the landing page as its global default
-	// backend — requests not matched by any Ingress rule hit the landing page instead
-	// of the built-in nginx 404. Only patched once; idempotency check runs every call.
+	// Patch the nginx-ingress-controller DaemonSet to use the landing page as its
+	// global default backend — requests not matched by any Ingress rule hit the landing
+	// page instead of the built-in nginx 404. Only patched once; idempotency check
+	// runs every call.
 	checkOut, _ := exec.Command("k3s", "kubectl", "-n", "ingress-nginx",
-		"get", "deployment", "ingress-nginx-controller",
+		"get", "daemonset", "ingress-nginx-controller",
 		"-o", `jsonpath={.spec.template.spec.containers[0].args}`).Output()
 	if !strings.Contains(string(checkOut), "default-backend-service") {
 		patch := `[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--default-backend-service=ingress-nginx/clusteros-landing"}]`
 		if out, err := exec.Command("k3s", "kubectl", "-n", "ingress-nginx",
-			"patch", "deployment", "ingress-nginx-controller",
+			"patch", "daemonset", "ingress-nginx-controller",
 			"--type=json", "-p", patch).CombinedOutput(); err != nil {
 			ks.Logger().Warnf("patch nginx-ingress default-backend-service: %v: %s", err, out)
 		} else {
-			ks.Logger().Info("nginx-ingress patched — ClusterOS landing page is now the default backend")
+			ks.Logger().Info("nginx-ingress DaemonSet patched — ClusterOS landing page is now the default backend")
 		}
 	}
 
@@ -1565,7 +1708,8 @@ spec:
         - sh
         - -c
         - |
-          apt-get update -qq && apt-get install -y -qq slurm-wlm 2>/dev/null
+          apt-get update -qq -o Acquire::ForceIPv4=true && \
+          apt-get install -y -qq -o Acquire::ForceIPv4=true slurm-wlm 2>/dev/null
           exec slurmrestd -f /etc/slurm/slurm.conf -a rest_auth/munge 0.0.0.0:6820
         volumeMounts:
         - name: munge-socket
@@ -1605,6 +1749,7 @@ metadata:
   name: slurmrestd-ingress
   namespace: slurm
   annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
     nginx.ingress.kubernetes.io/rewrite-target: /$2
     nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
 spec:
@@ -1655,12 +1800,12 @@ func (ks *K3sServer) deployRancher() error {
 	}
 	ks.Logger().Info("Installing Rancher management UI...")
 
-	// Use the node IP as the Rancher hostname so TLS SAN is correct.
-	// We also expose via NodePort 30444 so users can reach it directly without
-	// needing a DNS name (which ssl-passthrough requires for SNI routing).
+	// Use a nip.io DNS alias for the node IP so Rancher's helm chart gets a valid
+	// DNS hostname (Kubernetes rejects raw IP addresses in Ingress spec.rules[].host).
+	// nip.io is a public wildcard DNS: <ip>.nip.io resolves to <ip>.
 	rancherHost := "rancher.cluster.local"
 	if ks.nodeIP != "" {
-		rancherHost = ks.nodeIP
+		rancherHost = ks.nodeIP + ".nip.io"
 	}
 
 	helmPath := "/usr/local/bin/helm"
@@ -1723,7 +1868,37 @@ spec:
 	applyCmd.Stdin = strings.NewReader(rancherNPYAML)
 	applyCmd.Run()
 
-	ks.Logger().Infof("Rancher installed — https://%s:30444 (admin/admin)", rancherHost)
+	// Add a convenience /rancher redirect ingress so http://IP:30080/rancher → Rancher.
+	// Rancher can't serve at a subpath (it uses absolute redirects internally),
+	// so we issue a 302 redirect to the NodePort URL instead of proxying.
+	rancherRedirectYAML := fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rancher-path-redirect
+  namespace: cattle-system
+  annotations:
+    nginx.ingress.kubernetes.io/temporal-redirect: "https://%s:30444"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - http:
+      paths:
+      - path: /rancher
+        pathType: Prefix
+        backend:
+          service:
+            name: rancher
+            port:
+              number: 443
+`, rancherHost)
+	redirectCmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	redirectCmd.Stdin = strings.NewReader(rancherRedirectYAML)
+	if output, err := redirectCmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("rancher path redirect ingress: %v: %s", err, output)
+	}
+
+	ks.Logger().Infof("Rancher installed — https://%s:30444 (admin/admin) — /rancher redirects there", rancherHost)
 	return nil
 }
 
@@ -1790,9 +1965,19 @@ spec:
             port:
               number: 443
 `
-	cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
-	cmd.Stdin = strings.NewReader(ingressYAML)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		ks.Logger().Warnf("rancher catchall ingress: %v: %s", err, output)
+	// Retry up to 5 times with 15s backoff — the ingress-nginx admission webhook
+	// may not have endpoints ready immediately after nginx-ingress comes up.
+	for attempt := 1; attempt <= 5; attempt++ {
+		cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(ingressYAML)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			if attempt < 5 {
+				ks.Logger().Warnf("rancher catchall ingress (attempt %d/5): %v — retrying in 15s", attempt, err)
+				time.Sleep(15 * time.Second)
+				continue
+			}
+			ks.Logger().Warnf("rancher catchall ingress: %v: %s", err, output)
+		}
+		break
 	}
 }

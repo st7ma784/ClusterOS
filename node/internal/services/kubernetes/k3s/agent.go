@@ -144,6 +144,10 @@ func (ka *K3sAgent) Start() error {
 	if ka.nodeIP != "" {
 		args = append(args, "--node-ip", ka.nodeIP)
 	}
+	// Force Flannel to use the Tailscale interface as the VXLAN endpoint.
+	// This ensures cross-node pod traffic uses the stable Tailscale overlay
+	// rather than a potentially unreachable LAN IP.
+	args = append(args, "--flannel-iface", "tailscale0")
 
 	cmd := exec.Command("k3s", args...)
 

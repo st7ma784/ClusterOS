@@ -20,12 +20,14 @@ const (
 	maxSubnetHosts  = 254 // only scan /24 or smaller
 )
 
-// StartLANDiscovery begins periodic LAN subnet scanning.
-// It probes every host on local non-Tailscale /24-or-smaller subnets for the
-// Serf gossip port (7946).  Any responding IP is fed into sd.Join so the node
-// joins the Serf mesh over Ethernet even without Tailscale connectivity.
-// If one node has WiFi+Tailscale and others only have Ethernet, they discover
-// the WiFi node via LAN and then inherit the full Tailscale mesh from Serf tags.
+// StartLANDiscovery begins periodic LAN subnet scanning plus real-time ARP
+// neighbor watching via `ip monitor neigh`.
+//
+// When a new ethernet cable is plugged in, the kernel assigns an APIPA address
+// (169.254.x.x) and populates the ARP table within seconds.  The neighbor
+// monitor fires immediately on each new REACHABLE entry — no 60s wait needed.
+// The periodic scan remains as a backstop for peers already in the ARP table
+// before this daemon started.
 func (sd *SerfDiscovery) StartLANDiscovery(ctx context.Context) {
 	sd.lanMu.Lock()
 	if sd.lanDiscoveryEnabled {
@@ -35,9 +37,9 @@ func (sd *SerfDiscovery) StartLANDiscovery(ctx context.Context) {
 	sd.lanDiscoveryEnabled = true
 	sd.lanMu.Unlock()
 
+	// Periodic baseline scan.
 	go func() {
 		sd.logger.Info("[lan] LAN peer discovery enabled — scanning local subnets for Serf peers")
-		// Run immediately so first-boot convergence is fast.
 		sd.scanAndJoin()
 		ticker := time.NewTicker(lanScanInterval)
 		defer ticker.Stop()
@@ -51,6 +53,12 @@ func (sd *SerfDiscovery) StartLANDiscovery(ctx context.Context) {
 			}
 		}
 	}()
+
+	// Event-driven ARP neighbor watcher: `ip monitor neigh` writes a line whenever
+	// the kernel adds or updates a neighbour table entry.  On hot-plug ethernet (p2p
+	// cable or switch port up), the peer appears here within ~2 seconds — long before
+	// the 60s periodic scan would fire.
+	go sd.watchNeighbours(ctx)
 }
 
 // scanAndJoin discovers peer IPs on local subnets and Serf-joins them.
@@ -256,4 +264,79 @@ func probeSerfPort(ip string) bool {
 	}
 	conn.Close()
 	return true
+}
+
+// watchNeighbours runs `ip monitor neigh` and immediately probes any new
+// REACHABLE ARP entry for the Serf gossip port.  This enables sub-second
+// detection of a freshly plugged-in p2p Ethernet cable — the kernel adds the
+// peer to the ARP table within ~2s of link-up, and we join immediately rather
+// than waiting for the next 60s periodic scan.
+func (sd *SerfDiscovery) watchNeighbours(ctx context.Context) {
+	// Tailscale range — skip overlay IPs (they're handled by Tailscale discovery).
+	tailscaleRange := &net.IPNet{
+		IP:   net.ParseIP("100.64.0.0"),
+		Mask: net.CIDRMask(10, 32),
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		cmd := exec.CommandContext(ctx, "ip", "monitor", "neigh")
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if err := cmd.Start(); err != nil {
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			line := scanner.Text()
+			// `ip monitor neigh` lines look like:
+			//   169.254.23.45 dev eth1 lladdr aa:bb:cc:dd:ee:ff REACHABLE
+			//   192.168.1.50 dev eth0 lladdr ... STALE
+			// We act on REACHABLE and STALE (STALE entries are usually still reachable).
+			if !strings.Contains(line, "REACHABLE") && !strings.Contains(line, "STALE") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 1 {
+				continue
+			}
+			ip := net.ParseIP(fields[0])
+			if ip == nil || ip.IsLoopback() || ip.IsMulticast() {
+				continue
+			}
+			// Skip Tailscale overlay IPs — handled by Tailscale discovery.
+			if tailscaleRange.Contains(ip) {
+				continue
+			}
+			// Probe async so we don't block the monitor loop.
+			ipStr := fields[0]
+			go func() {
+				if probeSerfPort(ipStr) {
+					sd.logger.Infof("[lan-neigh] New neighbour %s has Serf port open — joining", ipStr)
+					if n, err := sd.Join([]string{fmt.Sprintf("%s:%d", ipStr, serfLANPort)}); err != nil {
+						sd.logger.Debugf("[lan-neigh] join %s: %d joined, err: %v", ipStr, n, err)
+					} else if n > 0 {
+						sd.logger.Infof("[lan-neigh] Joined cluster via new neighbour %s", ipStr)
+					}
+				}
+			}()
+		}
+		// Scanner ended (command exited or context cancelled) — restart.
+		cmd.Wait()
+		if ctx.Err() != nil {
+			return
+		}
+		sd.logger.Debug("[lan-neigh] ip monitor neigh exited — restarting")
+		time.Sleep(2 * time.Second)
+	}
 }

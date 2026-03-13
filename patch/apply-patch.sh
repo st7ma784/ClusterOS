@@ -317,10 +317,12 @@ _advertise_lan_subnets() {
         cidr=$(echo "$line" | awk '{print $2}')
         ip="${cidr%%/*}"
         prefix="${cidr##*/}"
-        # Skip Tailscale/loopback/WireGuard interfaces
-        case "$iface" in tailscale*|lo|wg*|tun*) continue ;; esac
+        # Skip Tailscale/loopback/WireGuard/CNI/Flannel interfaces
+        case "$iface" in tailscale*|lo|wg*|tun*|cni*|flannel*|veth*) continue ;; esac
         # Only /24 or smaller (prefix >= 24)
         [ "$prefix" -ge 24 ] 2>/dev/null || continue
+        # Skip Flannel pod CIDR (10.42.0.0/16) and service CIDR (10.43.0.0/16)
+        case "$ip" in 10.42.*|10.43.*) continue ;; esac
         # Compute network address
         local net
         net=$(python3 -c "import ipaddress; print(ipaddress.ip_interface('$cidr').network.with_prefixlen)" 2>/dev/null) || continue
@@ -622,6 +624,8 @@ dpkg -s multipath-tools  &>/dev/null 2>&1 || PKGS="$PKGS multipath-tools"
 dpkg -s wpasupplicant    &>/dev/null 2>&1 || PKGS="$PKGS wpasupplicant"
 # avahi-daemon — mDNS peer discovery so nodes find each other on the LAN
 dpkg -s avahi-daemon     &>/dev/null 2>&1 || PKGS="$PKGS avahi-daemon avahi-utils"
+# dnsmasq — DHCP server for p2p ethernet gateway (lets new nodes get internet via us)
+dpkg -s dnsmasq          &>/dev/null 2>&1 || PKGS="$PKGS dnsmasq"
 
 if [ -n "$PKGS" ]; then
     apt-get -o Acquire::ForceIPv4=true update -qq
@@ -1000,6 +1004,54 @@ rm -f /var/lib/rancher/k3s/.cluster-os-ip 2>/dev/null || true
 rm -f /etc/slurm/slurm.conf 2>/dev/null || true
 ok "Removed stale slurm.conf"
 
+# ---------------------------------------------------------------------------
+# GPU detection — write /etc/slurm/gres.conf so SLURM can schedule GPU jobs.
+# node-agent publishes the gpu= Serf tag on startup using the same detection
+# logic; gres.conf must list the same devices or slurmctld rejects the node.
+# ---------------------------------------------------------------------------
+GPU_GRES_LINES=""
+
+# NVIDIA: each GPU exposes /dev/nvidia0, /dev/nvidia1, …
+# Use AutoDetect=nvml when NVML (nvidia-smi / libcuda) is present — it reads
+# UUID, type, and topology automatically.  Fall back to manual /dev entries.
+NVIDIA_DEVS=( /dev/nvidia[0-9]* )
+if [ -e "${NVIDIA_DEVS[0]}" ]; then
+    if command -v nvidia-smi &>/dev/null; then
+        # AutoDetect=nvml covers all present GPUs; no per-device lines needed.
+        GPU_GRES_LINES="${GPU_GRES_LINES}AutoDetect=nvml\n"
+        ok "NVIDIA GPU(s) detected — gres.conf: AutoDetect=nvml (${#NVIDIA_DEVS[@]} device(s))"
+    else
+        # nvidia-smi not installed: list devices manually
+        for dev in "${NVIDIA_DEVS[@]}"; do
+            GPU_GRES_LINES="${GPU_GRES_LINES}Name=gpu Type=nvidia File=${dev}\n"
+        done
+        ok "NVIDIA GPU(s) detected — gres.conf: ${#NVIDIA_DEVS[@]} manual device(s)"
+    fi
+fi
+
+# AMD: renderD128, renderD129, … — vendor ID 0x1002
+AMD_COUNT=0
+for render in /sys/class/drm/renderD*; do
+    [ -f "$render/device/vendor" ] || continue
+    vendor=$(cat "$render/device/vendor" 2>/dev/null || true)
+    if [ "$vendor" = "0x1002" ]; then
+        dev_node="/dev/$(basename "$render")"
+        GPU_GRES_LINES="${GPU_GRES_LINES}Name=gpu Type=amd File=${dev_node}\n"
+        AMD_COUNT=$((AMD_COUNT + 1))
+    fi
+done
+[ "$AMD_COUNT" -gt 0 ] && ok "AMD GPU(s) detected — gres.conf: ${AMD_COUNT} device(s)"
+
+mkdir -p /etc/slurm
+if [ -n "$GPU_GRES_LINES" ]; then
+    printf "%b" "$GPU_GRES_LINES" > /etc/slurm/gres.conf
+    ok "Wrote /etc/slurm/gres.conf"
+else
+    # No GPUs — write an empty gres.conf so SLURM doesn't complain if
+    # a prior stale file listed devices that no longer exist.
+    printf "" > /etc/slurm/gres.conf
+fi
+
 # Serf status file — stale phase/leader values would confuse the new daemon
 rm -f /run/clusteros/status.json 2>/dev/null || true
 
@@ -1229,6 +1281,114 @@ for iface in flannel.1 cni0; do
 done
 ok "Pod CIDRs 10.42.0.0/16 + 10.43.0.0/16 allowed in FORWARD"
 
+# ── P2P Ethernet Gateway ──────────────────────────────────────────────────────────
+# When a new node is connected via a direct Ethernet cable (p2p) to this node, it
+# may have no direct internet path.  It needs internet to authenticate with Tailscale
+# before it can join the cluster.  This node acts as a NAT gateway:
+#   1. Assign 10.200.0.1/24 to any physical Ethernet interface that has no routable IP
+#      (link-local/APIPA only — meaning no DHCP server on that segment).
+#   2. Run dnsmasq DHCP on those interfaces so the new node gets 10.200.0.x + gateway.
+#   3. MASQUERADE (NAT) traffic from 10.200.0.0/24 → internet so Tailscale OAuth works.
+#
+# On the new node side: apply-patch.sh already sets dhcp4:true in netplan, so it will
+# automatically pick up the DHCP lease and get a default route via this node.
+if command -v dnsmasq &>/dev/null; then
+    # Always write base config FIRST so dnsmasq never tries to open port 53
+    # (which conflicts with systemd-resolved on 127.0.0.53).  This must be
+    # unconditional — if we only write it inside the p2p block, nodes without
+    # a p2p link leave dnsmasq in its default port-53 mode and it fails.
+    mkdir -p /etc/dnsmasq.d
+    cat > /etc/dnsmasq.d/clusteros-base.conf << 'BASE_EOF'
+# ClusterOS: DHCP-only mode — do not act as a DNS server
+# systemd-resolved already owns port 53 on this host.
+no-resolv
+port=0
+except-interface=lo
+BASE_EOF
+
+    # Stable per-node gateway IP using Tailscale last octet.
+    # Persisted so reboots work even when Tailscale isn't up yet at service start.
+    # Using unique /24 subnets avoids ARP conflicts when multiple Tailscale nodes
+    # share the same L2 ethernet segment.
+    GW_OCTET_FILE=/var/lib/clusteros/p2p-gateway-octet
+    if [ -f "$GW_OCTET_FILE" ] && [ -s "$GW_OCTET_FILE" ]; then
+        GW_OCTET=$(cat "$GW_OCTET_FILE")
+    else
+        GW_OCTET=$(tailscale ip -4 2>/dev/null | awk -F. '{print $4}' | head -1 | tr -d ' \n')
+        [ -z "$GW_OCTET" ] && GW_OCTET=$(hostname | cksum | awk '{print ($1 % 253) + 1}')
+        mkdir -p /var/lib/clusteros
+        printf '%s' "$GW_OCTET" > "$GW_OCTET_FILE"
+    fi
+    GW_IP="10.200.${GW_OCTET}.1"
+    GW_SUBNET="10.200.${GW_OCTET}.0/24"
+    DHCP_START="10.200.${GW_OCTET}.100"
+    DHCP_END="10.200.${GW_OCTET}.200"
+
+    P2P_IFACES=""
+    for iface in $(ls /sys/class/net/ 2>/dev/null); do
+        # Physical ethernet only — skip loopback, WiFi, tunnels, virtual, overlay
+        case "$iface" in lo|tailscale*|wg*|tun*|utun*|docker*|cni*|flannel*|veth*|br-*|dummy*) continue ;; esac
+        [ -d "/sys/class/net/$iface/wireless" ] && continue  # skip WiFi
+        [ "$(cat /sys/class/net/$iface/operstate 2>/dev/null)" = "up" ] || continue
+        # Skip if interface already has a routable (non-APIPA) IPv4 from DHCP/static.
+        # Routable = any address that's NOT 169.254.x.x, NOT a pod/overlay address, and
+        # NOT our own p2p gateway subnet (10.200.x.x) — otherwise second runs see our
+        # own gateway IP as "routable" and skip reconfiguration.
+        ROUTABLE=$(ip addr show dev "$iface" 2>/dev/null | \
+            grep -E 'inet ' | grep -v '169\.254\.\|10\.42\.\|10\.43\.\|10\.200\.\|127\.' | head -1)
+        if [ -z "$ROUTABLE" ]; then
+            # No routable IP — configure as p2p gateway interface
+            ip addr replace "${GW_IP}/24" dev "$iface" 2>/dev/null || true
+            P2P_IFACES="$P2P_IFACES $iface"
+        fi
+    done
+
+    if [ -n "$P2P_IFACES" ]; then
+        # Write dnsmasq config for DHCP on p2p interfaces
+        # Regenerate each time to stay in sync with current interface state
+        cat > /etc/dnsmasq.d/clusteros-p2p.conf << DNSMASQ_EOF
+# ClusterOS p2p gateway — auto-generated by apply-patch.sh
+# Serves DHCP on direct Ethernet links so new nodes can reach internet via this node
+
+# Only serve DHCP on p2p interfaces (not on LAN-connected interfaces with a router)
+$(for i in $P2P_IFACES; do echo "interface=$i"; done)
+bind-interfaces
+listen-address=${GW_IP}
+
+# DHCP pool: ${DHCP_START}-${DHCP_END}, lease 12h, subnet /24
+dhcp-range=${DHCP_START},${DHCP_END},255.255.255.0,12h
+
+# Default gateway is this node (${GW_IP})
+dhcp-option=option:router,${GW_IP}
+# DNS: use public resolvers so new nodes can reach login.tailscale.com
+dhcp-option=option:dns-server,8.8.8.8,1.1.1.1
+DNSMASQ_EOF
+
+        systemctl enable dnsmasq 2>/dev/null || true
+        systemctl restart dnsmasq 2>/dev/null && ok "dnsmasq DHCP gateway started on p2p interface(s):$P2P_IFACES (gateway ${GW_IP})" \
+            || warn "dnsmasq failed to start — check: journalctl -u dnsmasq"
+
+        # MASQUERADE: NAT traffic from p2p subnet to internet
+        iptables -t nat -C POSTROUTING -s "${GW_SUBNET}" -j MASQUERADE 2>/dev/null || \
+            iptables -t nat -A POSTROUTING -s "${GW_SUBNET}" -j MASQUERADE 2>/dev/null || true
+        iptables -C FORWARD -s "${GW_SUBNET}" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -s "${GW_SUBNET}" -j ACCEPT 2>/dev/null || true
+        iptables -C FORWARD -d "${GW_SUBNET}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 2 -d "${GW_SUBNET}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+        ok "P2P gateway NAT/MASQUERADE enabled for ${GW_SUBNET} — new nodes can reach internet via this node"
+    else
+        ok "All physical ethernet interfaces have routable IPs — p2p gateway not needed on this node"
+        # Clean up leftover p2p dhcp config (base config stays — keeps dnsmasq quiet)
+        rm -f /etc/dnsmasq.d/clusteros-p2p.conf 2>/dev/null || true
+        # Restart dnsmasq with base-only config so it doesn't fail on stale p2p conf
+        systemctl enable dnsmasq 2>/dev/null || true
+        systemctl restart dnsmasq 2>/dev/null || true
+    fi
+else
+    warn "dnsmasq not installed — p2p gateway unavailable (run: apt-get install dnsmasq)"
+fi
+# ─────────────────────────────────────────────────────────────────────────────────
+
 # Snapshot the clean iptables state after all our rules are in place.
 # iptables-persistent is disabled so this file won't be auto-loaded on boot,
 # but it acts as a safety net if someone re-enables the service later — they
@@ -1299,8 +1459,15 @@ pause-image: "registry.k8s.io/pause:3.6"
 # Use our reliable upstream DNS file so CoreDNS always has 8.8.8.8/1.1.1.1 as
 # forwarders — even if the node's /etc/resolv.conf is pointing to CoreDNS itself.
 resolv-conf: "/etc/clusteros/resolv.conf"
+# Force Flannel to use the Tailscale interface for VXLAN overlay.
+# Without this, Flannel may select the LAN interface (e.g. 192.168.1.x) as the
+# VTEP public-ip. Cross-node pod traffic would then be VXLAN-encapsulated to the
+# LAN IP, which may not be reachable from all nodes (especially wired-only nodes
+# or nodes on different subnets). Tailscale provides a stable, encrypted overlay
+# that reaches all nodes regardless of physical network topology.
+flannel-iface: "tailscale0"
 K3SCFG
-ok "k3s config.yaml written → pause-image + resolv-conf: /etc/clusteros/resolv.conf"
+ok "k3s config.yaml written → pause-image + resolv-conf + flannel-iface=tailscale0"
 
 # Layer 2: containerd rewrite rule — redirects pause image pulls at network level.
 # If containerd still requests "docker.io/rancher/mirrored-pause:3.6" (e.g. from a
@@ -1498,6 +1665,127 @@ if [ -f "$SCRIPT_DIR/scripts/clear-stale-redirects.sh" ]; then
         /usr/local/bin/clear-stale-redirects.sh || true
     fi
 fi
+
+# ── P2P Gateway Service (persistent across reboots) ──────────────────────────────
+# Install a systemd service that re-runs the p2p gateway setup on every boot,
+# AFTER network interfaces are up.  This ensures new nodes plugged in after reboot
+# still get DHCP + internet via this node without manual intervention.
+cat > /usr/local/sbin/clusteros-p2p-gateway.sh << 'P2P_SCRIPT_EOF'
+#!/bin/bash
+# Re-run at boot: assign per-node 10.200.X.1/24 to any unrouted physical ethernet
+# interface and (re)start dnsmasq DHCP so directly-connected new nodes can reach the
+# internet via this node's NAT.
+set -euo pipefail
+
+# Always ensure dnsmasq won't try to open port 53 (conflicts with systemd-resolved).
+# This base conf is written unconditionally so the service never starts in DNS mode.
+mkdir -p /etc/dnsmasq.d
+cat > /etc/dnsmasq.d/clusteros-base.conf << 'BASE'
+# ClusterOS: DHCP-only — do not act as a DNS server
+no-resolv
+port=0
+except-interface=lo
+BASE
+
+# Stable per-node gateway octet: persisted so reboots work before Tailscale comes up.
+# Using unique /24 subnets prevents ARP conflicts between multiple Tailscale nodes on
+# the same L2 ethernet segment.
+GW_OCTET_FILE=/var/lib/clusteros/p2p-gateway-octet
+if [ -f "$GW_OCTET_FILE" ] && [ -s "$GW_OCTET_FILE" ]; then
+    GW_OCTET=$(cat "$GW_OCTET_FILE")
+else
+    # || true: protect pipeline from set -euo pipefail when tailscale isn't up yet
+    GW_OCTET=$(tailscale ip -4 2>/dev/null | awk -F. '{print $4}' | head -1 | tr -d ' \n' || true)
+    [ -z "$GW_OCTET" ] && GW_OCTET=$(hostname | cksum | awk '{print ($1 % 253) + 1}')
+    mkdir -p /var/lib/clusteros
+    printf '%s' "$GW_OCTET" > "$GW_OCTET_FILE"
+fi
+GW_IP="10.200.${GW_OCTET}.1"
+GW_SUBNET="10.200.${GW_OCTET}.0/24"
+DHCP_START="10.200.${GW_OCTET}.100"
+DHCP_END="10.200.${GW_OCTET}.200"
+
+P2P_IFACES=""
+for iface in $(ls /sys/class/net/ 2>/dev/null); do
+    case "$iface" in lo|tailscale*|wg*|tun*|utun*|docker*|cni*|flannel*|veth*|br-*|dummy*) continue ;; esac
+    [ -d "/sys/class/net/$iface/wireless" ] && continue
+    [ "$(cat /sys/class/net/$iface/operstate 2>/dev/null)" = "up" ] || continue
+    # Exclude 10.200.x.x from "routable" so second runs don't mistake our own gateway
+    # IP for an existing routable address and skip reconfiguration.
+    # || true: grep exits 1 when no lines match; protect from set -euo pipefail.
+    ROUTABLE=$(ip addr show dev "$iface" 2>/dev/null | \
+        grep -E 'inet ' | grep -v '169\.254\.\|10\.42\.\|10\.43\.\|10\.200\.\|127\.' | head -1 || true)
+    if [ -z "$ROUTABLE" ]; then
+        ip addr replace "${GW_IP}/24" dev "$iface" 2>/dev/null || true
+        P2P_IFACES="$P2P_IFACES $iface"
+    fi
+done
+
+if [ -z "$P2P_IFACES" ]; then
+    rm -f /etc/dnsmasq.d/clusteros-p2p.conf
+    # Restart with base-only config (port=0) so dnsmasq stays quiet
+    systemctl restart dnsmasq 2>/dev/null || true
+    exit 0
+fi
+
+cat > /etc/dnsmasq.d/clusteros-p2p.conf << DNSMASQ
+# ClusterOS p2p gateway — auto-generated
+$(for i in $P2P_IFACES; do echo "interface=$i"; done)
+bind-interfaces
+listen-address=${GW_IP}
+dhcp-range=${DHCP_START},${DHCP_END},255.255.255.0,12h
+dhcp-option=option:router,${GW_IP}
+dhcp-option=option:dns-server,8.8.8.8,1.1.1.1
+DNSMASQ
+
+systemctl restart dnsmasq
+
+iptables -t nat -C POSTROUTING -s "${GW_SUBNET}" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -s "${GW_SUBNET}" -j MASQUERADE
+iptables -C FORWARD -s "${GW_SUBNET}" -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD 1 -s "${GW_SUBNET}" -j ACCEPT
+iptables -C FORWARD -d "${GW_SUBNET}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+    iptables -I FORWARD 2 -d "${GW_SUBNET}" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+logger "clusteros-p2p-gateway: NAT active on${P2P_IFACES} (${GW_SUBNET} via ${GW_IP})"
+P2P_SCRIPT_EOF
+chmod 755 /usr/local/sbin/clusteros-p2p-gateway.sh
+
+cat > /etc/systemd/system/clusteros-p2p-gateway.service << 'SVC_EOF'
+[Unit]
+Description=ClusterOS P2P Ethernet Gateway (DHCP+NAT for new nodes)
+After=network-online.target
+Wants=network-online.target
+# Re-run whenever a network interface state changes
+BindsTo=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/clusteros-p2p-gateway.sh
+# Also triggered by NetworkManager/networkd dispatcher when interfaces change
+ExecReload=/usr/local/sbin/clusteros-p2p-gateway.sh
+
+[Install]
+WantedBy=multi-user.target
+SVC_EOF
+
+systemctl daemon-reload
+systemctl enable clusteros-p2p-gateway.service 2>/dev/null || true
+systemctl start  clusteros-p2p-gateway.service 2>/dev/null && ok "clusteros-p2p-gateway service started" || true
+
+# Also trigger gateway setup when a new ethernet interface gets link-up via networkd-dispatcher
+if [ -d /etc/networkd-dispatcher/routable.d ]; then
+    cat > /etc/networkd-dispatcher/routable.d/clusteros-p2p-gateway << 'DISP_EOF'
+#!/bin/bash
+# Triggered by systemd-networkd when an interface becomes routable
+/usr/local/sbin/clusteros-p2p-gateway.sh &
+DISP_EOF
+    chmod 755 /etc/networkd-dispatcher/routable.d/clusteros-p2p-gateway
+    ok "networkd-dispatcher hook installed — gateway reconfigures on interface state changes"
+fi
+ok "P2P ethernet gateway service installed (DHCP 10.200.0.100-200 + NAT on unrouted eth interfaces)"
+# ─────────────────────────────────────────────────────────────────────────────────
 
 # ── Kubeconfig cleanup ─────────────────────────────────────────────────────────
 # k3s writes /etc/rancher/k3s/k3s.yaml as mode 0600 (root-only) by default.

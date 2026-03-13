@@ -39,7 +39,10 @@ func NewSerfLeaderElector(cfg *SerfElectionConfig) (*SerfLeaderElector, error) {
 	}, nil
 }
 
-// ComputeLeader returns the name of the current leader (lowest alive member name).
+// ComputeLeader returns the name of the current leader using lexicographic
+// ordering of alive member names. This is used as a fallback/simple reference;
+// the daemon's computeReachableLeader() uses Vivaldi RTT scoring for the
+// actual election when network coordinates are available.
 func (le *SerfLeaderElector) ComputeLeader() string {
 	var alive []serf.Member
 	for _, m := range le.serf.Members() {

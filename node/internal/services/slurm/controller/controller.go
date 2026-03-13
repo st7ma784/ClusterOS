@@ -24,6 +24,8 @@ type WorkerInfo struct {
 	Name    string
 	Addr    string // Tailscale IP or LAN IP
 	CPUs    int
+	MemMB   int // RAM in MB (0 = fall back to 4096)
+	GPUs    int // GPU count (0 = no GPU, omit Gres line)
 	TmpDisk int // scratch disk space in MB (0 = omit from NodeName line)
 }
 
@@ -245,11 +247,26 @@ func (sc *SLURMController) generateConfig() error {
 		controllerHostname = sc.controllerIP
 	}
 
+	controllerGPUs := localGPUCount()
+
+	// HasGPUs is true if any node in the cluster has at least one GPU.
+	// When true, slurm.conf must declare GresTypes=gpu and each GPU node
+	// gets a Gres=gpu:N entry on its NodeName line.
+	hasGPUs := controllerGPUs > 0
+	for _, w := range sc.workers {
+		if w.GPUs > 0 {
+			hasGPUs = true
+			break
+		}
+	}
+
 	data := struct {
 		ControllerNode        string
 		ControllerHostname    string
 		ControllerCPUs        int
 		ControllerMemMB       int
+		ControllerGPUs        int
+		HasGPUs               bool
 		Workers               []WorkerInfo
 		AccountingStorageHost string
 		AccountingStoragePort int
@@ -258,6 +275,8 @@ func (sc *SLURMController) generateConfig() error {
 		ControllerHostname:    controllerHostname,
 		ControllerCPUs:        runtime.NumCPU(),
 		ControllerMemMB:       controllerMemMB,
+		ControllerGPUs:        controllerGPUs,
+		HasGPUs:               hasGPUs,
 		Workers:               sc.workers,
 		AccountingStorageHost: acctHost,
 		AccountingStoragePort: acctPort,
@@ -287,6 +306,27 @@ func (sc *SLURMController) generateConfig() error {
 	}
 	sc.Logger().Infof("Generated slurm.conf (controller=%s, workers=%d)", sc.controllerIP, len(sc.workers))
 	return nil
+}
+
+// localGPUCount returns the number of GPUs visible on this node.
+// Detects NVIDIA GPUs via /dev/nvidia[0-9]* and AMD GPUs via
+// /sys/class/drm/renderD* with vendor ID 0x1002.
+func localGPUCount() int {
+	count := 0
+	// NVIDIA: each GPU exposes /dev/nvidia0, /dev/nvidia1, …
+	if entries, err := filepath.Glob("/dev/nvidia[0-9]*"); err == nil {
+		count += len(entries)
+	}
+	// AMD: renderD128, renderD129, … — filter by vendor ID
+	if renders, err := filepath.Glob("/sys/class/drm/renderD*"); err == nil {
+		for _, r := range renders {
+			vendor, _ := os.ReadFile(filepath.Join(r, "device", "vendor"))
+			if strings.TrimSpace(string(vendor)) == "0x1002" {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func isTCPReachable(host string, port int) bool {
@@ -320,6 +360,7 @@ AccountingStorageType=accounting_storage/none
 SchedulerType=sched/backfill
 SelectType=select/cons_tres
 SelectTypeParameters=CR_Core_Memory
+{{if .HasGPUs}}GresTypes=gpu{{end}}
 
 SlurmctldLogFile=/var/log/slurm/slurmctld.log
 SlurmdLogFile=/var/log/slurm/slurmd.log
@@ -338,9 +379,9 @@ PrologFlags=Alloc
 
 # Controller node — also participates as a compute node so jobs can run on it.
 # slurmd on the controller uses -N {{.ControllerNode}} to register with this exact NodeName.
-NodeName={{.ControllerNode}} NodeAddr={{.ControllerNode}} CPUs={{if le .ControllerCPUs 1}}1{{else}}{{.ControllerCPUs}}{{end}} RealMemory={{.ControllerMemMB}} State=UNKNOWN
+NodeName={{.ControllerNode}} NodeAddr={{.ControllerNode}} CPUs={{if le .ControllerCPUs 1}}1{{else}}{{.ControllerCPUs}}{{end}} RealMemory={{.ControllerMemMB}}{{if gt .ControllerGPUs 0}} Gres=gpu:{{.ControllerGPUs}}{{end}} State=UNKNOWN
 {{range .Workers}}
-NodeName={{.Name}} NodeAddr={{.Addr}} CPUs={{if le .CPUs 1}}1{{else}}{{.CPUs}}{{end}} RealMemory=4096{{if gt .TmpDisk 0}} TmpDisk={{.TmpDisk}}{{end}} State=UNKNOWN
+NodeName={{.Name}} NodeAddr={{.Addr}} CPUs={{if le .CPUs 1}}1{{else}}{{.CPUs}}{{end}} RealMemory={{if gt .MemMB 0}}{{.MemMB}}{{else}}4096{{end}}{{if gt .GPUs 0}} Gres=gpu:{{.GPUs}}{{end}}{{if gt .TmpDisk 0}} TmpDisk={{.TmpDisk}}{{end}} State=UNKNOWN
 {{end}}
 
 PartitionName=all Nodes=ALL Default=YES MaxTime=INFINITE State=UP

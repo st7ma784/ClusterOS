@@ -245,7 +245,8 @@ spec:
   type: ClusterIP
 
 ---
-# NodePort service for external access from non-K8s nodes
+# NodePort service for external access from non-K8s nodes (SLURM auth/accounting).
+# Uses 30820 to avoid conflict with slurmrestd REST API on NodePort 30819.
 apiVersion: v1
 kind: Service
 metadata:
@@ -257,6 +258,6 @@ spec:
   ports:
   - port: 6819
     targetPort: 6819
-    nodePort: 30819
+    nodePort: 30820
     name: slurmdbd
   type: NodePort

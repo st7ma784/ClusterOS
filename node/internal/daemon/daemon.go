@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"os/signal"
 	"runtime"
 	"sort"
@@ -53,6 +54,8 @@ type Daemon struct {
 	logger        *logrus.Logger
 	ctx           context.Context
 	cancel        context.CancelFunc
+	version       string // binary version string published as Serf tag "ver"
+	buildTime     string // binary build timestamp, appended for dirty builds
 
 	mu             sync.RWMutex
 	phase          ClusterPhase
@@ -68,6 +71,13 @@ type Config struct {
 	Config   *config.Config
 	Identity *identity.Identity
 	Logger   *logrus.Logger
+	// Version is the binary version string (git describe output). Published as a Serf
+	// tag so peers can exclude stale-version nodes from leader election.
+	Version string
+	// BuildTime is the binary build timestamp. For dirty builds it is appended to
+	// Version in the Serf tag so binaries built at different times are treated as
+	// distinct versions even when the commit hash is the same.
+	BuildTime string
 }
 
 // New creates a new daemon instance.
@@ -80,6 +90,8 @@ func New(cfg *Config) (*Daemon, error) {
 		config:          cfg.Config,
 		identity:        cfg.Identity,
 		logger:          cfg.Logger,
+		version:         cfg.Version,
+		buildTime:       cfg.BuildTime,
 		ctx:             ctx,
 		cancel:          cancel,
 		phase:           PhaseDiscovering,
@@ -140,9 +152,15 @@ func (d *Daemon) Start() error {
 	// Nodes binding Serf to 0.0.0.0 accept connections from any interface, but peers need
 	// to know which IP to contact us on; using the Tailscale IP routes through the encrypted
 	// overlay even when direct LAN port 7946 access is unavailable.
-	tsAdvertiseIP := d.detectTailscaleIP()
+	// Tailscale may still be authenticating (OAuth can take 10-30s after boot), so we retry
+	// for up to 45 seconds rather than giving up immediately.  A p2p-patched node without
+	// its own Tailscale connection will time out here and fall back to advertising its LAN IP
+	// (which is still correct — the gateway node handles routing for it).
+	tsAdvertiseIP := d.detectTailscaleIPWithRetry(45 * time.Second)
 	if tsAdvertiseIP != "" {
-		d.logger.Infof("Tailscale IP detected early: %s — using as Serf advertise address", tsAdvertiseIP)
+		d.logger.Infof("Tailscale IP detected: %s — using as Serf advertise address", tsAdvertiseIP)
+	} else {
+		d.logger.Warn("Tailscale IP not available at startup — advertising LAN IP; cluster may rely on a gateway node for routing")
 	}
 
 	if err := d.initDiscovery(localNode, tsAdvertiseIP); err != nil {
@@ -252,9 +270,21 @@ func (d *Daemon) runPhaseMachine() {
 			d.runElecting()
 		case PhaseProvisioning:
 			if err := d.runProvisioning(); err != nil {
-				d.logger.Errorf("Provisioning failed: %v — retrying in 30s", err)
-				time.Sleep(30 * time.Second)
-				d.setPhase(PhaseElecting)
+				if strings.Contains(err.Error(), "leadership lost") {
+					// We are no longer the elected leader — skip re-election and
+					// go straight to joining so we don't restart a competing k3s server.
+					d.logger.Warnf("Leadership lost during provisioning: %v — switching to joining", err)
+					d.mu.Lock()
+					d.isLeader = false
+					d.leaderName = d.leaderElector.ComputeLeader()
+					d.mu.Unlock()
+					time.Sleep(5 * time.Second)
+					d.setPhase(PhaseJoining)
+				} else {
+					d.logger.Errorf("Provisioning failed: %v — retrying in 30s", err)
+					time.Sleep(30 * time.Second)
+					d.setPhase(PhaseElecting)
+				}
 			}
 		case PhaseJoining:
 			if err := d.runJoining(); err != nil {
@@ -286,12 +316,74 @@ func (d *Daemon) runDiscovering() {
 }
 
 func (d *Daemon) runElecting() {
-	d.logger.Info("Electing leader...")
-	// Brief pause so gossip can stabilise before sorting member list.
-	time.Sleep(3 * time.Second)
+	// Clear stale provisioning tags from any previous session.  If this node was
+	// the k3s leader in a prior run and then rebooted, its Serf gossip state may
+	// still carry k3s-server / k3s-token / munge-key / phase=ready.  Other nodes
+	// check port 6443 on any member that has a k3s-server tag; if k3s hasn't
+	// started yet the probe fails and they exclude this node from the election —
+	// then they elect a different node that has no k3s state, producing a divergent
+	// cluster.  Clearing the tags before the election window prevents this.
+	staleTags := []string{"k3s-server", "k3s-token", "munge-key", "k3s-nodes"}
+	if err := d.discovery.DeleteTags(staleTags); err != nil {
+		d.logger.Debugf("clearStaleTags: %v (non-fatal)", err)
+	} else {
+		d.logger.Info("Cleared stale provisioning tags (k3s-server, k3s-token, munge-key, k3s-nodes)")
+	}
+	// Also reset phase to electing so other nodes don't see a stale phase=ready.
+	if err := d.discovery.UpdateTags(map[string]string{"phase": string(PhaseElecting)}); err != nil {
+		d.logger.Debugf("setPhaseTag(electing): %v (non-fatal)", err)
+	}
 
-	leader := d.leaderElector.ComputeLeader()
-	isLeader := d.leaderElector.IsLeader()
+	d.logger.Info("Electing leader — waiting for peer discovery to stabilise...")
+	// Wait for membership to stop growing for 10 consecutive seconds.
+	// This gives the Tailscale and LAN peer discovery goroutines time to probe
+	// and join all reachable nodes before we elect a leader on a partial view.
+	// Minimum: 15s (Tailscale probe runs immediately but TCP+push-pull takes time).
+	// Maximum: 30s (avoid blocking indefinitely if the cluster is genuinely small).
+	lastCount := 0
+	stable := 0
+	for start := time.Now(); time.Since(start) < 30*time.Second; {
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+		count := len(d.discovery.GetAliveMembers())
+		if count > lastCount {
+			lastCount = count
+			stable = 0
+			d.logger.Debugf("Election: membership growing (%d alive) — waiting for stability", count)
+		} else {
+			stable++
+			if stable >= 5 && time.Since(start) >= 15*time.Second {
+				// Stable for 10s AND at least 15s have elapsed — safe to elect.
+				break
+			}
+		}
+	}
+	d.logger.Infof("Election: proceeding with %d alive member(s)", len(d.discovery.GetAliveMembers()))
+
+	// If any alive member already has phase=ready AND a k3s-server URL, they ARE
+	// the current cluster leader. Adopt them and join as worker — don't re-elect
+	// based on lexicographic rank. This prevents a returning node with a lower
+	// hostname from disrupting an established cluster where k3s is already running.
+	if existingLeader := d.findRunningLeader(); existingLeader != "" {
+		d.logger.Infof("Cluster already has a running leader: %s — joining as worker", existingLeader)
+		d.mu.Lock()
+		d.isLeader = false
+		d.leaderName = existingLeader
+		d.mu.Unlock()
+		d.setPhase(PhaseJoining)
+		return
+	}
+
+	// Compute leader from a "reachable alive" set: alive Serf members that either
+	// have no k3s-server tag (fresh nodes) OR have a k3s-server URL that's TCP-reachable.
+	// This excludes ghost nodes running an old node-agent with stale phase=ready /
+	// k3s-server tags whose actual k3s server is gone (e.g. after a cluster wipe,
+	// or a node that was skipped during a rolling redeploy and is still on the LAN
+	// with its old Tailscale IP unreachable).
+	leader, isLeader := d.computeReachableLeader()
 
 	d.mu.Lock()
 	d.isLeader = isLeader
@@ -304,6 +396,176 @@ func (d *Daemon) runElecting() {
 	} else {
 		d.setPhase(PhaseJoining)
 	}
+}
+
+// computeReachableLeader builds a filtered alive-member list that excludes
+// nodes advertising an unreachable k3s-server endpoint (ghost / stale-tag nodes),
+// then picks the most network-central node as leader using Serf's Vivaldi
+// coordinate system.  The "most central" node has the lowest sum of estimated
+// RTTs to all other alive members — this naturally prefers a wired server-room
+// node over a laptop on mobile data, and works correctly across WAN/LAN/P2P
+// mixed topologies without any manual configuration.
+//
+// Scoring falls back to lexicographic order when coordinates are not yet
+// available (early cluster formation before Vivaldi has converged).
+//
+// Returns (leaderName, amILeader).
+func (d *Daemon) computeReachableLeader() (string, bool) {
+	myName := d.discovery.LocalMember().Name
+	aliveMembers := d.discovery.GetAliveMembers()
+
+	// Build the candidate set: self always included; peers included only if
+	// they do not advertise an unreachable k3s-server (ghost-node defence).
+	type candidate struct {
+		name string
+	}
+	candidates := []candidate{{name: myName}}
+
+	myVer := d.version
+	// Strip the "-dirty" suffix for version comparison — dirty builds are development
+	// snapshots of the same commit and should be treated as equivalent.
+	if idx := strings.Index(myVer, "-dirty"); idx >= 0 {
+		myVer = myVer[:idx]
+	}
+
+	for _, m := range aliveMembers {
+		if m.Name == myName {
+			continue
+		}
+		// Exclude peers running a different binary version from the leader election.
+		// A node running old code may have stale Serf tags or a missing k3s etcd wipe
+		// and should not be elected leader (it would produce a broken cluster or fail
+		// to reach phase=ready). We still allow them as WORKERS (joining is version-agnostic).
+		if myVer != "" {
+			peerVer := m.Tags["ver"]
+			if idx := strings.Index(peerVer, "-dirty"); idx >= 0 {
+				peerVer = peerVer[:idx]
+			}
+			if peerVer != "" && peerVer != myVer {
+				d.logger.Warnf("Election: excluding %s — version mismatch (peer=%s, local=%s)", m.Name, peerVer, myVer)
+				continue
+			}
+		}
+		if k3sURL := m.Tags["k3s-server"]; k3sURL != "" {
+			host := d.extractHost(k3sURL)
+			if !strings.Contains(host, ":") {
+				host = host + ":6443"
+			}
+			conn, err := net.DialTimeout("tcp", host, 2*time.Second)
+			if err != nil {
+				d.logger.Warnf("Election: excluding %s — k3s-server %s unreachable (%v)", m.Name, host, err)
+				continue
+			}
+			conn.Close()
+		}
+		candidates = append(candidates, candidate{name: m.Name})
+	}
+
+	// Use lexicographic ordering to pick the leader deterministically.
+	// Every node with the same candidate set will reach the same result regardless
+	// of when the election runs — this prevents circular deadlocks where node A
+	// elects node B and node B elects node A due to different RTT snapshots.
+	// Lexicographic is fast, O(n log n), and globally consistent across the cluster.
+	names := make([]string, len(candidates))
+	for i, c := range candidates {
+		names[i] = c.name
+	}
+	sort.Strings(names)
+	leader := names[0]
+	d.logger.Infof("Election: lexicographic winner %s (%d candidates)", leader, len(candidates))
+	return leader, leader == myName
+}
+
+// findRunningLeader returns the name of any alive Serf member that is acting as
+// the cluster leader — identified by having both phase=ready AND a non-empty
+// k3s-server tag (only the elected leader publishes that tag).
+// Workers also reach phase=ready but never publish k3s-server, so they are excluded.
+// Additionally confirms the candidate's k3s port (6443) is reachable so we don't
+// adopt a ghost leader whose Serf entry is still "alive" but the node is offline.
+// Returns "" if no active leader exists (fresh cluster formation).
+func (d *Daemon) findRunningLeader() string {
+	for _, m := range d.discovery.Members() {
+		if m.Status.String() != "alive" {
+			continue
+		}
+		if m.Tags["phase"] != string(PhaseReady) || m.Tags["k3s-server"] == "" {
+			continue
+		}
+		// Confirm the leader is actually reachable before adopting it.
+		// This prevents adopting a node whose Serf entry is still "alive" but
+		// the machine is offline (e.g. a node that rebooted and hasn't rejoined yet).
+		k3sURL := m.Tags["k3s-server"]
+		host := strings.TrimPrefix(k3sURL, "https://")
+		host = strings.TrimPrefix(host, "http://")
+		conn, err := net.DialTimeout("tcp", host, 2*time.Second)
+		if err != nil {
+			d.logger.Debugf("findRunningLeader: candidate %s k3s port unreachable (%v) — skipping", m.Name, err)
+			continue
+		}
+		conn.Close()
+		return m.Name
+	}
+	return ""
+}
+
+// findCompetingLeader returns the name of an alive Serf member that is ALSO
+// an established leader (phase=ready + k3s-server tag) to whom we should yield.
+// We yield to a competing leader if they have MORE k3s nodes registered (larger
+// cluster). Ties are broken by lexicographic name (lower name wins).
+// Returns "" if we are the sole/correct leader.
+func (d *Daemon) findCompetingLeader() string {
+	myName := d.discovery.LocalMember().Name
+	myK3sCount := d.countK3sNodes()
+
+	for _, m := range d.discovery.Members() {
+		if m.Name == myName {
+			continue
+		}
+		if m.Status.String() != "alive" {
+			continue
+		}
+		if m.Tags["phase"] != string(PhaseReady) || m.Tags["k3s-server"] == "" {
+			continue
+		}
+		// An established leader — compare cluster sizes.
+		theirCount, _ := strconv.Atoi(m.Tags["k3s-nodes"])
+		if theirCount > myK3sCount {
+			// Their cluster is larger — we should yield.
+			return m.Name
+		}
+		if theirCount == myK3sCount && m.Name < myName {
+			// Equal size — lower lexicographic name wins as tiebreaker.
+			return m.Name
+		}
+	}
+	return ""
+}
+
+// countK3sNodes returns the number of nodes registered in the local k3s API.
+// Returns 0 if k3s is not running or kubectl fails.
+func (d *Daemon) countK3sNodes() int {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "kubectl",
+		"--kubeconfig=/etc/rancher/k3s/k3s.yaml",
+		"get", "nodes", "--no-headers", "--ignore-not-found",
+	).Output()
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		return 0
+	}
+	return strings.Count(strings.TrimSpace(string(out)), "\n") + 1
+}
+
+// assertStillLeader returns an error if another node now ranks lower (lexicographically)
+// than us in the alive member list, meaning we should yield leadership.
+// This is called at slow checkpoints inside runProvisioning so we don't race to
+// start a k3s server when another node has already become the elected leader.
+func (d *Daemon) assertStillLeader() error {
+	if !d.leaderElector.IsLeader() {
+		newLeader := d.leaderElector.ComputeLeader()
+		return fmt.Errorf("leadership lost to %s — aborting provisioning", newLeader)
+	}
+	return nil
 }
 
 // runProvisioning is called on the leader only.
@@ -334,6 +596,19 @@ func (d *Daemon) runProvisioning() error {
 	token, err := k3sServer.ReadToken()
 	if err != nil {
 		return fmt.Errorf("read k3s token: %w", err)
+	}
+
+	// Distribute the actual running cluster CA cert via Serf user event.
+	// This eliminates the x509 "certificate signed by unknown authority" error
+	// when workers were patched with a different k3s-ca.crt than what the leader
+	// is actually using.  Workers install this cert before starting the k3s agent.
+	if caCert, err := k3sServer.ReadCACert(); err != nil {
+		d.logger.Warnf("Could not read cluster CA cert for distribution: %v", err)
+	} else if d.discovery != nil {
+		d.logger.Infof("Broadcasting cluster CA cert via Serf user event (%d bytes)", len(caCert))
+		if err := d.discovery.SendEvent("k3s-ca-cert", caCert, false); err != nil {
+			d.logger.Warnf("Failed to send k3s-ca-cert user event: %v", err)
+		}
 	}
 
 	// Label this k8s node with its extra disk count so Longhorn registration
@@ -511,6 +786,21 @@ func (d *Daemon) runJoining() error {
 	d.k3sServerURL = k3sServerURL
 	d.mu.Unlock()
 
+	// Wait for Tailscale before attempting to join k3s.
+	// The k3s server URL is a Tailscale IP (e.g. https://100.x.x.x:6443).
+	// On a freshly patched node, Tailscale OAuth can take 30-120s to authenticate.
+	// We waited 45s at startup; give it an additional 90s here (total ~2.5 min).
+	// If Tailscale is already up, this returns instantly.
+	if tsIP := d.detectTailscaleIPWithRetry(90 * time.Second); tsIP != "" {
+		d.logger.Infof("Tailscale ready (%s) — proceeding with k3s join", tsIP)
+		// Update wgip Serf tag so other nodes know our Tailscale IP.
+		_ = d.discovery.UpdateTags(map[string]string{"wgip": tsIP})
+		// Use Tailscale IP for SLURM (which registers by nodeIP with the controller).
+		nodeIP = tsIP
+	} else {
+		d.logger.Warn("Tailscale not available after 2.5min — attempting k3s join via LAN routing")
+	}
+
 	// --- K3s agent ---
 	// Non-fatal: if k3s agent fails (binary missing, version mismatch, TLS error),
 	// we log a warning and continue — SLURM must still start regardless.
@@ -570,33 +860,39 @@ func (d *Daemon) runReady() {
 		case <-d.ctx.Done():
 			return
 		case <-ticker.C:
-			nowLeader := d.leaderElector.IsLeader()
 			d.mu.RLock()
 			wasLeader := d.isLeader
 			joinedURL := d.k3sServerURL
 			d.mu.RUnlock()
 
-			if nowLeader != wasLeader {
-				d.logger.Infof("Leadership changed: was=%v now=%v", wasLeader, nowLeader)
-				d.mu.Lock()
-				d.isLeader = nowLeader
-				d.mu.Unlock()
+			if wasLeader {
+				// Publish current k3s node count so any competing leader in a merging
+				// Serf sub-cluster can compare cluster sizes and decide who yields.
+				if count := d.countK3sNodes(); count > 0 {
+					d.publishTag("k3s-nodes", strconv.Itoa(count))
+				}
 
-				if nowLeader {
-					d.logger.Info("Promoted to leader — re-provisioning")
-					d.setPhase(PhaseProvisioning)
+				// Split-brain merge: when Tailscale/LAN discovery joins two previously
+				// isolated Serf sub-clusters, both leaders suddenly see each other.
+				// The leader of the SMALLER cluster yields to the larger one so running
+				// workloads are preserved. Equal size → lower lexicographic name wins.
+				// We only yield to an *established* leader (phase=ready + k3s-server tag),
+				// never to a fresh node that merely has a lower name.
+				if competing := d.findCompetingLeader(); competing != "" {
+					myName := d.discovery.LocalMember().Name
+					d.logger.Warnf("Split-brain detected: competing leader %s (we are %s) has larger/preferred cluster — yielding", competing, myName)
+					d.mu.Lock()
+					d.isLeader = false
+					d.leaderName = competing
+					d.mu.Unlock()
+					// Remove our k3s-nodes leadership tag before stepping down.
+					d.discovery.DeleteTags([]string{"k3s-nodes"})
+					d.setPhase(PhaseJoining)
 					return
 				}
-				// Lost leadership — clear controller reference and re-join as worker.
-				d.logger.Info("Lost leadership — re-joining as worker")
-				d.mu.Lock()
-				d.slurmCtrl = nil
-				d.mu.Unlock()
-				d.setPhase(PhaseJoining)
-				return
 			}
 
-			if !nowLeader && joinedURL != "" {
+			if !wasLeader && joinedURL != "" {
 				// Check 1: URL change in Serf tags.
 				// Fires when the leader publishes a new k3s-server tag (new leader elected
 				// and Serf gossip has propagated the change).
@@ -676,7 +972,13 @@ func (d *Daemon) publishClusterReady(k3sServerURL, k3sToken string, mungeKey []b
 		"phase":      string(PhaseReady),
 	}
 	if err := d.discovery.UpdateTags(tags); err != nil {
-		return fmt.Errorf("serf update tags (hint: total tags must fit in %d bytes): %w", 512, err)
+		// A broadcast timeout means there are no other Serf members to ack the
+		// update yet — this is non-fatal. Our own local state IS updated (Serf
+		// persists tags locally before broadcasting). Workers that do a TCP
+		// push-pull via syncWithLeader() will receive the tags directly.
+		// Retry in the background so gossip propagates as more peers join.
+		d.logger.Warnf("publishClusterReady: UpdateTags broadcast timeout (%v) — continuing; will retry in background", err)
+		go d.retryPublishTags(tags)
 	}
 	d.mu.Lock()
 	d.phase = PhaseReady
@@ -685,11 +987,47 @@ func (d *Daemon) publishClusterReady(k3sServerURL, k3sToken string, mungeKey []b
 	return nil
 }
 
+// retryPublishTags keeps retrying UpdateTags until it succeeds or the context ends.
+// Called as a goroutine when publishClusterReady's first UpdateTags times out due to
+// no Serf peers being present yet. Once peers join, the retry will succeed and they
+// will receive the cluster tags via gossip.
+func (d *Daemon) retryPublishTags(tags map[string]string) {
+	for attempt := 1; ; attempt++ {
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-time.After(15 * time.Second):
+		}
+		if d.discovery == nil {
+			return
+		}
+		if err := d.discovery.UpdateTags(tags); err != nil {
+			d.logger.Debugf("retryPublishTags attempt %d: %v", attempt, err)
+			continue
+		}
+		d.logger.Infof("retryPublishTags: cluster tags published successfully on attempt %d", attempt)
+		return
+	}
+}
+
+// storedLeaderName returns the leader name that was explicitly stored during election
+// (either from findRunningLeader or ComputeLeader). This is the name workers should use
+// when looking up leader tags — not d.leaderElector.ComputeLeader(), which recomputes
+// from live Serf membership and can return a different node than the one we adopted.
+func (d *Daemon) storedLeaderName() string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.leaderName
+}
+
 // syncWithLeader forces an immediate TCP push-pull state exchange with the current leader.
 // This ensures that large tag values (munge-key, k3s-token) that may not fit in a UDP
 // gossip packet are fetched via TCP before we try to read them.
 func (d *Daemon) syncWithLeader() {
-	leaderName := d.leaderElector.ComputeLeader()
+	leaderName := d.storedLeaderName()
+	if leaderName == "" {
+		leaderName = d.leaderElector.ComputeLeader()
+	}
 	for _, m := range d.discovery.Members() {
 		if m.Name != leaderName {
 			continue
@@ -709,7 +1047,10 @@ func (d *Daemon) syncWithLeader() {
 
 // getLeaderTags returns all tags from the leader member for diagnostics.
 func (d *Daemon) getLeaderTags() map[string]string {
-	leaderName := d.leaderElector.ComputeLeader()
+	leaderName := d.storedLeaderName()
+	if leaderName == "" {
+		leaderName = d.leaderElector.ComputeLeader()
+	}
 	for _, m := range d.discovery.Members() {
 		if m.Name == leaderName {
 			return m.Tags
@@ -718,12 +1059,24 @@ func (d *Daemon) getLeaderTags() map[string]string {
 	return nil
 }
 
-// buildWorkerList returns the current list of alive non-leader Serf members as WorkerInfo.
+// buildWorkerList returns the current list of alive Serf members that should be
+// SLURM compute nodes, excluding only the controller's own IP.
+//
+// We do NOT exclude the Serf leader name — the Serf leader (lexicographic winner)
+// may be a different node from the k3s/SLURM controller.  Excluding the Serf leader
+// would remove a valid worker from slurm.conf, causing "lookup failure for node" errors.
+// The controller template already adds the controller's own IP, so we only skip localIP.
 func (d *Daemon) buildWorkerList() []controller.WorkerInfo {
-	leaderName := d.leaderElector.ComputeLeader()
+	localIP := d.getLocalIP()
 	var workers []controller.WorkerInfo
 	for _, m := range d.discovery.GetAliveMembers() {
-		if m.Name == leaderName {
+		// Exclude the local node — the controller template already registers this
+		// node's IP as a compute node in slurm.conf.
+		memberIP := m.Addr.String()
+		if wgip, ok := m.Tags["wgip"]; ok && wgip != "" {
+			memberIP = wgip
+		}
+		if memberIP == localIP {
 			continue
 		}
 		phase := m.Tags["phase"]
@@ -734,15 +1087,6 @@ func (d *Daemon) buildWorkerList() []controller.WorkerInfo {
 		if cpu < 1 {
 			cpu = 1
 		}
-		// Use the Tailscale IP as SLURM NodeName so it matches what slurmd registers as.
-		// slurmd is started with -N <nodeIP> (Tailscale IP) on every worker.
-		// m.Name is the Serf member name (original hostname at startup), which differs from
-		// the Tailscale IP — using m.Name here would cause slurmctld to reject every worker.
-		// m.Addr is the AdvertiseAddr set to the Tailscale IP; prefer the explicit wgip tag.
-		nodeIP := m.Addr.String()
-		if wgip, ok := m.Tags["wgip"]; ok && wgip != "" {
-			nodeIP = wgip
-		}
 		// TmpDisk: derive from ndisks tag — standardised paths /mnt/clusteros/disk-N.
 		// Each extra disk contributes its usable space; SLURM uses this for job temp files.
 		tmpDisk := 0
@@ -751,10 +1095,14 @@ func (d *Daemon) buildWorkerList() []controller.WorkerInfo {
 				tmpDisk = extraDiskTotalMB(n)
 			}
 		}
+		memMB, _ := strconv.Atoi(m.Tags["ram"])
+		gpus, _ := strconv.Atoi(m.Tags["gpu"])
 		workers = append(workers, controller.WorkerInfo{
-			Name:    nodeIP, // must match slurmd's -N flag
-			Addr:    nodeIP,
+			Name:    memberIP, // must match slurmd's -N flag (Tailscale IP)
+			Addr:    memberIP,
 			CPUs:    cpu,
+			MemMB:   memMB,
+			GPUs:    gpus,
 			TmpDisk: tmpDisk,
 		})
 	}
@@ -823,9 +1171,97 @@ func (d *Daemon) detectTailscaleIP() string {
 	return ip
 }
 
+// detectTailscaleIPWithRetry polls for a Tailscale IP until timeout.
+// Useful at startup when Tailscale may still be authenticating (OAuth takes ~10-30s).
+func (d *Daemon) detectTailscaleIPWithRetry(timeout time.Duration) string {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ip := d.detectTailscaleIP(); ip != "" {
+			return ip
+		}
+		select {
+		case <-d.ctx.Done():
+			return ""
+		case <-time.After(2 * time.Second):
+		}
+	}
+	return ""
+}
+
+// advertiseNewMemberSubnet is called when a Serf member joins with a non-Tailscale
+// LAN address.  If this node has Tailscale, it calls `tailscale set --advertise-routes`
+// to include the new member's /24 subnet so the rest of the mesh can reach it.
+// This handles nodes that are only reachable via a direct Ethernet patch.
+func (d *Daemon) advertiseNewMemberSubnet(memberAddr net.IP) {
+	if memberAddr == nil {
+		return
+	}
+	// Only act if this node has Tailscale.
+	if d.detectTailscaleIP() == "" {
+		return
+	}
+	// Skip Tailscale IPs (100.64.0.0/10) — they're already in the mesh.
+	tailscaleRange := &net.IPNet{
+		IP:   net.ParseIP("100.64.0.0"),
+		Mask: net.CIDRMask(10, 32),
+	}
+	if tailscaleRange.Contains(memberAddr) {
+		return
+	}
+	// Build a /24 covering the member's address.
+	b := memberAddr.To4()
+	if b == nil {
+		return // IPv6 address — skip (no /24 subnet to advertise)
+	}
+	subnet := fmt.Sprintf("%d.%d.%d.0/24", b[0], b[1], b[2])
+	d.logger.Infof("[lan-route] Advertising subnet %s via Tailscale for new p2p member %s", subnet, memberAddr)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// Collect existing advertised routes to merge (tailscale set replaces the full list).
+	existing := d.currentTailscaleRoutes()
+	routes := mergeRoute(existing, subnet)
+	args := []string{"set", "--advertise-routes=" + strings.Join(routes, ",")}
+	if out, err := exec.CommandContext(ctx, "tailscale", args...).CombinedOutput(); err != nil {
+		d.logger.Debugf("[lan-route] tailscale set --advertise-routes: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+}
+
+func (d *Daemon) currentTailscaleRoutes() []string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "tailscale", "status", "--json").Output()
+	if err != nil {
+		return nil
+	}
+	var status struct {
+		Self struct {
+			PrimaryRoutes []string `json:"PrimaryRoutes"`
+		} `json:"Self"`
+	}
+	if err := json.Unmarshal(out, &status); err != nil {
+		return nil
+	}
+	return status.Self.PrimaryRoutes
+}
+
+func mergeRoute(existing []string, newRoute string) []string {
+	for _, r := range existing {
+		if r == newRoute {
+			return existing
+		}
+	}
+	return append(existing, newRoute)
+}
+
 // getLeaderTag returns the value of a tag from the current leader's Serf member.
+// Uses d.leaderName (the explicitly adopted leader) rather than ComputeLeader()
+// (the lexicographic minimum alive member) to avoid a mismatch when the adopted
+// leader was found via findRunningLeader but is not the lexico-minimum.
 func (d *Daemon) getLeaderTag(key string) (string, bool) {
-	leaderName := d.leaderElector.ComputeLeader()
+	leaderName := d.storedLeaderName()
+	if leaderName == "" {
+		leaderName = d.leaderElector.ComputeLeader()
+	}
 	for _, m := range d.discovery.Members() {
 		if m.Name == leaderName {
 			val, ok := m.Tags[key]
@@ -837,8 +1273,13 @@ func (d *Daemon) getLeaderTag(key string) (string, bool) {
 
 // waitForLeaderTag polls until the leader has the tag set to a non-empty value.
 // If wantValue is non-empty, it waits until the tag equals that value exactly.
+// Every 30s it forces a TCP push-pull with the leader so stale gossip state
+// doesn't cause an indefinite wait.
 func (d *Daemon) waitForLeaderTag(key, wantValue string, timeout time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
+	// Force an immediate sync so we have fresh tags from the leader on first poll.
+	d.syncWithLeader()
+	lastSync := time.Now()
 	for time.Now().Before(deadline) {
 		select {
 		case <-d.ctx.Done():
@@ -849,6 +1290,16 @@ func (d *Daemon) waitForLeaderTag(key, wantValue string, timeout time.Duration) 
 			if wantValue == "" || val == wantValue {
 				return val, nil
 			}
+		}
+		// Periodically re-sync so freshly published tags propagate quickly.
+		if time.Since(lastSync) > 30*time.Second {
+			leader := d.storedLeaderName()
+			if leader == "" {
+				leader = d.leaderElector.ComputeLeader()
+			}
+			d.logger.Debugf("waitForLeaderTag(%q): still waiting, forcing sync with leader %s", key, leader)
+			d.syncWithLeader()
+			lastSync = time.Now()
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -923,6 +1374,8 @@ func (d *Daemon) initDiscovery(localNode *state.Node, advertiseAddr string) erro
 		Tags:           tags,
 		Logger:         d.logger,
 		LANDiscovery:   true, // probe local physical subnets for Serf peers
+		Version:        d.version,
+		BuildTime:      d.buildTime,
 	}
 
 	disc, err := discovery.New(discoveryCfg, d.clusterState, localNode)
@@ -934,6 +1387,34 @@ func (d *Daemon) initDiscovery(localNode *state.Node, advertiseAddr string) erro
 	// limited to ~512 bytes, so leaders may choose to broadcast the full
 	// munge key as a user event instead of relying solely on tags.  Handlers
 	// write the key to disk and start munged so workers can authenticate.
+	// Install k3s cluster CA cert when received from the leader.
+	// This fires on every node (including the leader itself, harmless) and writes
+	// the cert to the locations k3s agent reads before connecting to the server.
+	// Prevents "x509: certificate signed by unknown authority" when nodes were
+	// patched at different times and have different CA bundles.
+	d.discovery.RegisterUserEventHandler(func(name string, payload []byte) error {
+		if name != "k3s-ca-cert" {
+			return nil
+		}
+		d.logger.Infof("Received k3s-ca-cert user event (%d bytes) — installing", len(payload))
+		caPaths := []string{
+			"/var/lib/rancher/k3s/agent/server-ca.crt",
+			"/var/lib/rancher/k3s/server/tls/server-ca.crt",
+		}
+		for _, p := range caPaths {
+			if err := os.MkdirAll(filepath.Dir(p), 0755); err != nil {
+				d.logger.Warnf("mkdir %s: %v", filepath.Dir(p), err)
+				continue
+			}
+			if err := os.WriteFile(p, payload, 0644); err != nil {
+				d.logger.Warnf("Write k3s CA to %s: %v", p, err)
+			} else {
+				d.logger.Debugf("Installed k3s CA at %s", p)
+			}
+		}
+		return nil
+	})
+
 	d.discovery.RegisterUserEventHandler(func(name string, payload []byte) error {
 		if name != "munge-key" {
 			return nil
@@ -958,6 +1439,26 @@ func (d *Daemon) initDiscovery(localNode *state.Node, advertiseAddr string) erro
 		d.logger.Info("Munge key applied from user event and munged started")
 		return nil
 	})
+	// When a new member joins via LAN (non-Tailscale IP), advertise their subnet
+	// via Tailscale so the rest of the mesh can route to them.  This handles
+	// nodes connected via a direct Ethernet patch to this node (p2p) that have
+	// no Tailscale of their own — they rely on us as a gateway.
+	d.discovery.RegisterMembershipChangeHandler(func() error {
+		tailscaleRange := &net.IPNet{
+			IP:   net.ParseIP("100.64.0.0"),
+			Mask: net.CIDRMask(10, 32),
+		}
+		for _, m := range d.discovery.GetAliveMembers() {
+			if m.Addr == nil {
+				continue
+			}
+			if !tailscaleRange.Contains(m.Addr) && !m.Addr.IsLoopback() {
+				go d.advertiseNewMemberSubnet(m.Addr)
+			}
+		}
+		return nil
+	})
+
 	d.logger.Infof("Discovery initialised (cluster size: %d)", disc.GetClusterSize())
 	return nil
 }
@@ -1468,6 +1969,26 @@ func (d *Daemon) setupFirewallRules() error {
 		}
 		if exec.Command("iptables", "-C", "FORWARD", "-s", cidr, "-j", "ACCEPT").Run() != nil {
 			exec.Command("iptables", "-I", "FORWARD", "1", "-s", cidr, "-j", "ACCEPT").Run()
+		}
+	}
+
+	// Ingress NodePort aliases: redirect incoming :30080 → :80 and :30443 → :443.
+	// ingress-nginx runs with hostNetwork=true and binds directly to ports 80/443.
+	// kube-proxy's NodePort DNAT doesn't apply to hostNetwork pods, so we add
+	// explicit PREROUTING REDIRECT rules so external traffic on 30080/30443 reaches nginx.
+	for _, pair := range [][2]string{{"30080", "80"}, {"30443", "443"}} {
+		from, to := pair[0], pair[1]
+		if exec.Command("iptables", "-t", "nat", "-C", "PREROUTING",
+			"-p", "tcp", "--dport", from, "-j", "REDIRECT", "--to-ports", to).Run() != nil {
+			exec.Command("iptables", "-t", "nat", "-A", "PREROUTING", //nolint:errcheck
+				"-p", "tcp", "--dport", from, "-j", "REDIRECT", "--to-ports", to).Run()
+			d.logger.Infof("Added PREROUTING REDIRECT :%s → :%s (ingress NodePort alias)", from, to)
+		}
+		// Also handle loopback (OUTPUT chain) so curl http://localhost:30080 works.
+		if exec.Command("iptables", "-t", "nat", "-C", "OUTPUT",
+			"-p", "tcp", "--dport", from, "-j", "REDIRECT", "--to-ports", to).Run() != nil {
+			exec.Command("iptables", "-t", "nat", "-A", "OUTPUT", //nolint:errcheck
+				"-p", "tcp", "--dport", from, "-j", "REDIRECT", "--to-ports", to).Run()
 		}
 	}
 

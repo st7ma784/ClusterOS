@@ -170,7 +170,7 @@ test-k3s: node
 test-full: node
 	@echo "=========================================="
 	@echo "Full Integration Test Suite"
-	@echo "Testing: SLURM + K3s + MPI"
+	@echo "Testing: WireGuard + SLURM + K3s"
 	@echo "=========================================="
 	@echo "Building and starting cluster..."
 	@./test/docker/start-cluster-direct.sh
@@ -275,66 +275,19 @@ patch: node
 		echo "Pause image already bundled (patch/pause-3.6.tar) — reusing"; \
 	fi
 	@chmod +x patch/cluster patch/apply-patch.sh
-	@# --- Bundle netplan (WiFi + wired DHCP config) ---
-	@if [ -f images/ubuntu/files/netplan/99-clusteros.yaml ]; then \
-		cp images/ubuntu/files/netplan/99-clusteros.yaml patch/99-clusteros.yaml; \
-		chmod 600 patch/99-clusteros.yaml; \
-		echo "  OK:      patch/99-clusteros.yaml  ($$(du -sh patch/99-clusteros.yaml | cut -f1))"; \
-	else \
-		echo "WARNING: images/ubuntu/files/netplan/99-clusteros.yaml missing — nodes may not get WiFi"; \
-	fi
-	@# --- Bundle Tailscale credentials + auth script ---
-	@if [ -f images/ubuntu/files/tailscale/tailscale.env ]; then \
-		cp images/ubuntu/files/tailscale/tailscale.env patch/tailscale.env; \
-		chmod 600 patch/tailscale.env; \
-		echo "  OK:      patch/tailscale.env  ($$(du -sh patch/tailscale.env | cut -f1))"; \
-	else \
-		echo "WARNING: images/ubuntu/files/tailscale/tailscale.env missing — new nodes won't auto-join Tailscale"; \
-	fi
-	@if [ -f images/ubuntu/files/bin/tailscale-auth ]; then \
-		cp images/ubuntu/files/bin/tailscale-auth patch/tailscale-auth; \
-		chmod 755 patch/tailscale-auth; \
-		echo "  OK:      patch/tailscale-auth  ($$(du -sh patch/tailscale-auth | cut -f1))"; \
-	else \
-		echo "WARNING: images/ubuntu/files/bin/tailscale-auth missing"; \
-	fi
-	@# --- Copy optional scripts (warn if missing, do not silently skip) ---
-	@for src in scripts/clear-stale-redirects.sh scripts/cluster-make-usb.sh scripts/create-usb-installer.sh; do \
-		if [ -f "$$src" ]; then \
-			cp -f "$$src" patch/ && chmod +x "patch/$$(basename $$src)"; \
-		else \
-			echo "WARNING: $$src not found — it will be absent from the bundle"; \
-		fi; \
-	done
+	@# One-time iptables cleanup script + service
+	@cp -f scripts/clear-stale-redirects.sh patch/ 2>/dev/null || true
+	@# cluster-make-usb: on-node USB installer builder (runs on any cluster node)
+	@cp -f scripts/cluster-make-usb.sh patch/ 2>/dev/null || true
+	@chmod +x patch/cluster-make-usb.sh 2>/dev/null || true
+	@# Legacy dev-machine USB creator (still useful for building from Packer images)
+	@cp -f scripts/create-usb-installer.sh patch/ 2>/dev/null || true
 	@mkdir -p patch/systemd
-	@for src in systemd/clear-stale-redirects.service systemd/clusteros-make-usb.service node/systemd/node-agent.service; do \
-		if [ -f "$$src" ]; then \
-			cp -f "$$src" patch/systemd/; \
-		else \
-			echo "WARNING: $$src not found — skipping"; \
-		fi; \
-	done
-	@# --- Verify required bundle files are present before declaring success ---
+	@cp -f systemd/clear-stale-redirects.service patch/systemd/ 2>/dev/null || true
+	@cp -f systemd/clusteros-make-usb.service patch/systemd/ 2>/dev/null || true
+	@chmod +x patch/create-usb-installer.sh 2>/dev/null || true
 	@echo ""
-	@echo "Verifying bundle..."
-	@_MISSING=""; \
-	for f in patch/node-agent patch/apply-patch.sh patch/cluster patch/cluster-make-usb.sh \
-	          patch/munge.key patch/k3s-ca.crt patch/k3s-ca.key; do \
-		if [ ! -f "$$f" ]; then \
-			echo "  MISSING: $$f"; \
-			_MISSING="$$_MISSING $$f"; \
-		else \
-			echo "  OK:      $$f  ($$(du -sh $$f | cut -f1))"; \
-		fi; \
-	done; \
-	if [ -n "$$_MISSING" ]; then \
-		echo ""; \
-		echo "FATAL: required bundle files missing:$$_MISSING"; \
-		echo "Fix the above and re-run 'make patch'."; \
-		exit 1; \
-	fi
-	@echo ""
-	@echo "Patch staged (full listing):"
+	@echo "Patch staged:"
 	@ls -lh patch/
 	@echo ""
 	@echo "Deploy with:  make deploy NODES='100.x.x.1 100.x.x.2'"
@@ -357,119 +310,52 @@ patch-cross:
 #   SSH_KEY=~/.ssh/id_rsa     — key-based auth (default; tries ~/.ssh/id_rsa and cluster_key)
 #   SSH_PASS=clusteros        — password auth via sshpass (default password from cloud-init)
 #   Set SSH_KEY="" to disable key auth and fall back to SSH_PASS only.
-# NODES: explicit list, or auto-discovered from active Tailscale peers.
-# Auto-discovery probes every online peer with SSH (clusteros:clusteros);
-# peers that don't accept those credentials are silently skipped — this
-# filters out the non-ClusterOS machines on the same Tailscale network.
-NODES    ?=
+NODES ?= $(shell tailscale status --json 2>/dev/null | \
+	python3 -c "import sys,json; peers=json.load(sys.stdin).get('Peer',{}); \
+	[print(p['TailscaleIPs'][0]) for p in peers.values() if p.get('Online') and p.get('TailscaleIPs')]" 2>/dev/null)
 SSH_USER ?= clusteros
 SSH_PASS ?= clusteros
 SSH_KEY  ?= $(HOME)/.ssh/cluster_key
 
-# Internal: build ssh/rsync/scp command prefixes.
-# rsync is used for uploads — it skips unchanged files (the 16 MB binary is only
-# re-sent when it actually changes), and compresses in-flight.  scp is the fallback.
-_SSH_OPTS := -o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=no -o ServerAliveInterval=15
-_SSH_AUTH  := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') ssh $(_SSH_OPTS) $(if $(SSH_KEY),-i $(SSH_KEY))
-_RSYNC_RSH := ssh $(_SSH_OPTS) $(if $(SSH_KEY),-i $(SSH_KEY))
-_RSYNC_AUTH := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') rsync -az --compress-level=6 --delete -e '$(_RSYNC_RSH)'
-_SCP_AUTH  := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') scp -o StrictHostKeyChecking=no -o ConnectTimeout=8 -C $(if $(SSH_KEY),-i $(SSH_KEY))
+# Internal: build ssh/scp command prefix (sshpass + key or just key).
+_SSH_AUTH := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $(if $(SSH_KEY),-i $(SSH_KEY))
+_SCP_AUTH := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') scp -o StrictHostKeyChecking=no $(if $(SSH_KEY),-i $(SSH_KEY))
 
 deploy: patch
-	@echo "Deploying $(VERSION) ($(COMMIT))"
+	@if [ -z "$(NODES)" ]; then \
+		echo "Error: No nodes specified. Use: make deploy NODES='IP1 IP2 IP3'"; \
+		echo "Or ensure tailscale is running so peers are auto-detected."; \
+		exit 1; \
+	fi
+	@echo "Deploying $(VERSION) ($(COMMIT)) to: $(NODES)"
 	@echo "SSH user: $(SSH_USER)  key: $(SSH_KEY)  pass: $(if $(SSH_PASS),set,unset)"
-	@# Build candidate list: use explicit NODES, or every online Tailscale peer.
-	@if [ -n "$(NODES)" ]; then \
-		CANDIDATES="$(NODES)"; \
-		echo "Using explicit node list: $$CANDIDATES"; \
-	elif command -v tailscale >/dev/null 2>&1; then \
-		CANDIDATES=$$(tailscale status --json 2>/dev/null | \
-			python3 -c "import sys,json; peers=json.load(sys.stdin).get('Peer',{}); \
-			[print(p['TailscaleIPs'][0]) for p in peers.values() \
-			 if p.get('Online') and p.get('TailscaleIPs')]" 2>/dev/null); \
-		if [ -z "$$CANDIDATES" ]; then \
-			echo "ERROR: Tailscale found no online peers."; \
-			echo "  Is Tailscale running?  Try: tailscale status"; \
-			echo "  Or pass nodes explicitly: make deploy NODES='IP1 IP2'"; \
-			exit 1; \
-		fi; \
-		echo "Tailscale peers to probe: $$(echo $$CANDIDATES | tr '\n' ' ')"; \
-	else \
-		echo "ERROR: NODES not set and tailscale not found."; \
-		echo "  Install Tailscale or pass nodes explicitly: make deploy NODES='IP1 IP2'"; \
-		exit 1; \
-	fi; \
-	_DEPLOY_TMP=$$(mktemp -d /tmp/clusteros-deploy-XXXXXX); \
-	_PIDS=""; \
-	for node in $$CANDIDATES; do \
-		( \
-			echo "==> $$node"; \
-			echo "    [probe] Testing SSH access..."; \
-			if ! $(_SSH_AUTH) $(SSH_USER)@$$node 'echo ssh-ok' 2>/dev/null | grep -q ssh-ok; then \
-				echo "    skipped — SSH not available"; \
-				exit 2; \
-			fi; \
-			echo "    [1/3] Stopping old node-agent (combined)"; \
-			$(_SSH_AUTH) $(SSH_USER)@$$node \
-				'sudo systemctl stop node-agent 2>/dev/null || true; \
-				 sudo pkill -KILL -f /usr/local/bin/node-agent 2>/dev/null || true; \
-				 mkdir -p ~/patch' 2>/dev/null || true; \
-			echo "    [2/3] Syncing patch bundle (rsync — only changed files)"; \
-			if command -v rsync >/dev/null 2>&1; then \
-				if ! $(_RSYNC_AUTH) patch/ $(SSH_USER)@$$node:~/patch/; then \
-					echo "    rsync failed, falling back to scp"; \
-					$(_SSH_AUTH) $(SSH_USER)@$$node 'rm -rf ~/patch && mkdir -p ~/patch' 2>/dev/null || true; \
-					if ! $(_SCP_AUTH) -r patch $(SSH_USER)@$$node:~/; then \
-						echo "  !! FAILED: upload to $$node"; \
-						exit 1; \
-					fi; \
-				fi; \
-			else \
-				$(_SSH_AUTH) $(SSH_USER)@$$node 'rm -rf ~/patch' 2>/dev/null || true; \
-				if ! $(_SCP_AUTH) -r patch $(SSH_USER)@$$node:~/; then \
-					echo "  !! FAILED: scp to $$node (rsync not installed locally)"; \
-					exit 1; \
-				fi; \
-			fi; \
-			echo "    [3/3] Running apply-patch.sh"; \
-			if ! $(_SSH_AUTH) $(SSH_USER)@$$node 'sudo bash ~/patch/apply-patch.sh'; then \
-				echo "  !! FAILED: apply-patch.sh on $$node exited non-zero"; \
-				exit 1; \
-			fi; \
-			echo "  OK: $$node"; \
-		) > "$$_DEPLOY_TMP/$$node.log" 2>&1; \
-		echo "$$?" > "$$_DEPLOY_TMP/$$node.rc" & \
-		_PIDS="$$_PIDS $$!:$$node"; \
-	done; \
-	_FAILED=""; _OK=""; _SKIPPED=""; \
-	for _pid_node in $$_PIDS; do \
-		_pid=$${_pid_node%%:*}; _node=$${_pid_node#*:}; \
-		wait $$_pid 2>/dev/null || true; \
-		cat "$$_DEPLOY_TMP/$$_node.log"; \
-		_rc=$$(cat "$$_DEPLOY_TMP/$$_node.rc" 2>/dev/null || echo 1); \
-		if [ "$$_rc" = "2" ]; then _SKIPPED="$$_SKIPPED $$_node"; \
-		elif [ "$$_rc" = "0" ]; then _OK="$$_OK $$_node"; \
-		else _FAILED="$$_FAILED $$_node(patch)"; fi; \
-	done; \
-	rm -rf "$$_DEPLOY_TMP"; \
-	echo ""; \
-	echo "══════════════════════════════════════════"; \
-	echo " Deploy summary"; \
-	echo "══════════════════════════════════════════"; \
-	for n in $$_OK;      do echo "  ✓  $$n"; done; \
-	for n in $$_SKIPPED; do echo "  -  $$n (skipped — not ClusterOS or down)"; done; \
-	for n in $$_FAILED;  do echo "  ✗  $$n"; done; \
-	echo "══════════════════════════════════════════"; \
-	if [ -n "$$_FAILED" ]; then \
-		echo "Some nodes FAILED. Retry with:"; \
-		echo "  make deploy NODES='$$(echo $$_FAILED | tr ' ' '\n' | sed 's/(.*//' | tr '\n' ' ')'"; \
-		exit 1; \
-	fi; \
-	if [ -z "$$_OK" ]; then \
-		echo "No nodes were updated. Check Tailscale connectivity and SSH credentials."; \
-		exit 1; \
-	fi; \
-	echo "All ClusterOS nodes updated successfully."
+	@for node in $(NODES); do \
+		echo ""; \
+		echo "==> $$node"; \
+		echo "    [1/4] Stopping old node-agent (prevents stale REDIRECT rule re-injection during upload)"; \
+		$(_SSH_AUTH) $(SSH_USER)@$$node \
+			'sudo systemctl stop node-agent 2>/dev/null; \
+			 sudo pkill -KILL -f /usr/local/bin/node-agent 2>/dev/null; \
+			 sudo pkill -KILL -f /tmp/node-agent 2>/dev/null; \
+			 true' 2>/dev/null || true; \
+		echo "    [2/4] Uploading patch bundle"; \
+		$(_SCP_AUTH) -r patch/ $(SSH_USER)@$$node:~/patch/ \
+			|| { echo "WARNING: SCP to $$node failed — skipping"; continue; }; \
+		echo "    [3/4] Running apply-patch.sh"; \
+		$(_SSH_AUTH) $(SSH_USER)@$$node 'sudo bash ~/patch/apply-patch.sh' \
+			|| echo "WARNING: apply-patch.sh on $$node exited non-zero (check output above)"; \
+		echo "    [4/4] Installing cluster-make-usb (direct, apply-patch.sh-independent)"; \
+		$(_SSH_AUTH) $(SSH_USER)@$$node \
+			'if [ -f ~/patch/cluster-make-usb.sh ]; then \
+			   sudo install -m 755 ~/patch/cluster-make-usb.sh /usr/local/bin/cluster-make-usb && \
+			   echo "      cluster-make-usb installed ok"; \
+			 else \
+			   echo "      WARNING: ~/patch/cluster-make-usb.sh missing on node — SCP may have failed"; \
+			 fi' \
+			|| echo "WARNING: cluster-make-usb install step failed on $$node"; \
+	done
+	@echo ""
+	@echo "Deploy complete. Check: make deploy-status"
 
 # setup-ssh-keys — copy this machine's public key to all nodes (one-time setup).
 # After this, deploy works without passwords.
@@ -493,6 +379,10 @@ setup-ssh-keys:
 	echo "Done. Future deploys will use key auth (no password needed)."
 
 # deploy-status — quick status check across all nodes after deploy.
+check-services:
+	@echo "Checking service visibility across all cluster nodes..."
+	@bash scripts/check-service-visibility.sh
+
 deploy-status:
 	@if [ -z "$(NODES)" ]; then echo "No nodes (set NODES=...)"; exit 1; fi
 	@for node in $(NODES); do \

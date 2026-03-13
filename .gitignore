@@ -68,12 +68,12 @@ temp/
 cloud-init-output.log
 
 # Secrets
-.env
+*.env
 .env.*
 !.env.example
 credentials.json
 secrets/
-
+/home/user/ClusterOS/patch/tailscale.env
 # WireGuard
 wg*.conf
 *.wg
