@@ -1581,6 +1581,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.headers.get("X-Forwarded-Host")
             or self.headers.get("Host", NODE_IP)
         ).split(":")[0]
+        path = self.path.split("?")[0].rstrip("/")
+        # /rancher redirect — bounce the browser to Rancher's NodePort using
+        # the same IP the client used to reach us, so the redirect works
+        # regardless of whether the user is on LAN or Tailscale.
+        if path in ("/rancher", "/rancher/"):
+            location = f"https://{req_host}:30444"
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         try:
             body = build_page(req_host).encode("utf-8")
             code = 200
@@ -2120,12 +2131,13 @@ func (ks *K3sServer) deployRancher() error {
 	if !alreadyInstalled {
 	ks.Logger().Info("Installing Rancher management UI...")
 
-	// Use a nip.io DNS alias for the node IP so Rancher's helm chart gets a valid
-	// DNS hostname (Kubernetes rejects raw IP addresses in Ingress spec.rules[].host).
-	// nip.io is a public wildcard DNS: <ip>.nip.io resolves to <ip>.
+	// Use the node IP directly as the Rancher hostname.
+	// Rancher generates a self-signed TLS cert with the IP in the SAN, so
+	// https://IP:30444 works without any DNS dependency.  Using .nip.io was
+	// unnecessary and caused confusing .nip.io references in Rancher's own UI.
 	rancherHost := "rancher.cluster.local"
 	if ks.nodeIP != "" {
-		rancherHost = ks.nodeIP + ".nip.io"
+		rancherHost = ks.nodeIP
 	}
 
 	helmPath := "/usr/local/bin/helm"
