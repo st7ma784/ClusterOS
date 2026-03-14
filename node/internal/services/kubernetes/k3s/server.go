@@ -2115,9 +2115,9 @@ func (ks *K3sServer) deployCertManager() error {
 }
 
 func (ks *K3sServer) deployRancher() error {
-	if exec.Command("k3s", "kubectl", "-n", "cattle-system", "get", "deployment", "rancher").Run() == nil {
-		return nil
-	}
+	alreadyInstalled := exec.Command("k3s", "kubectl", "-n", "cattle-system", "get", "deployment", "rancher").Run() == nil
+
+	if !alreadyInstalled {
 	ks.Logger().Info("Installing Rancher management UI...")
 
 	// Use a nip.io DNS alias for the node IP so Rancher's helm chart gets a valid
@@ -2167,6 +2167,10 @@ func (ks *K3sServer) deployRancher() error {
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("helm install rancher: %w: %s", err, string(output))
 	}
+	} // end if !alreadyInstalled
+
+	// Always (re-)apply the NodePort service and redirect ingress so they survive
+	// node-agent restarts where Rancher is already installed.
 
 	// Expose Rancher via NodePort 30444 (HTTPS direct access by IP — no hostname needed).
 	rancherNPYAML := `apiVersion: v1
@@ -2221,7 +2225,7 @@ spec:
 		ks.Logger().Warnf("rancher path redirect ingress: %v: %s", err, output)
 	}
 
-	ks.Logger().Infof("Rancher installed — https://%s:30444 (admin/admin) — /rancher redirects there", rancherHost)
+	ks.Logger().Infof("Rancher NodePort 30444 and /rancher redirect applied (admin/admin)")
 	return nil
 }
 
