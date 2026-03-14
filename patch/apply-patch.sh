@@ -1870,12 +1870,16 @@ else
     echo "  Interrupt with Ctrl-C if you need to stay online, then reboot manually."
     echo ""
 
-    REBOOT_DELAY=10
+    REBOOT_DELAY=5
     for i in $(seq "$REBOOT_DELAY" -1 1); do
         printf "\r  Rebooting in %2d s ...  (Ctrl-C to cancel)" "$i"
         sleep 1
     done
     echo ""
     ok "Rebooting now"
-    systemctl reboot
+    # Background the reboot with a 1s delay so this script (and the SSH session
+    # that invoked it) can exit cleanly before the node goes down.  Without this
+    # the SSH process in 'make deploy' hangs until the TCP connection drops.
+    (sleep 1 && systemctl reboot) &>/dev/null &
+    exit 0
 fi

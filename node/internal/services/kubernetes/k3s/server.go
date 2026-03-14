@@ -32,6 +32,7 @@ type K3sServer struct {
 	slurmdbdDeployed    bool
 	slurmRestDeployed   bool
 	servicesDeployed    bool
+	startCount          int // number of times Start() has been called
 }
 
 // NewK3sServerRole creates a K3sServer for health monitoring (implements roles.Role).
@@ -55,7 +56,8 @@ func (ks *K3sServer) Start() error {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 
-	ks.killExistingK3s()
+	ks.startCount++
+	ks.killExistingK3s(ks.startCount == 1)
 
 	if ks.nodeIP != "" {
 		ks.Logger().Infof("Waiting for node IP %s to be bound...", ks.nodeIP)
@@ -108,11 +110,8 @@ func (ks *K3sServer) Start() error {
 			args = append(args, "--tls-san", lanIP)
 		}
 	}
-	// Force Flannel to use the Tailscale interface as the VXLAN endpoint.
-	// Without this, Flannel auto-detects the first non-loopback interface which
-	// may be a LAN interface (192.168.1.x) unreachable from other cluster nodes.
-	// The Tailscale interface provides stable connectivity across all network topologies.
-	args = append(args, "--flannel-iface", "tailscale0")
+	// Note: --flannel-iface tailscale0 is set via /etc/rancher/k3s/config.yaml
+	// (written by apply-patch.sh). Do NOT add it here to avoid duplicate flags.
 
 	cmd := exec.Command("k3s", args...)
 	cmd.Stdout = os.Stdout
@@ -376,6 +375,10 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 		// We wait briefly for the Longhorn node controller to create Node resources.
 		go ks.registerAllNodesExtraDisks()
 	}
+	// Always ensure the Longhorn ingress exists — deployLonghorn() returns early when
+	// Longhorn is already installed, so createLonghornIngress() would be skipped on
+	// restarts without this unconditional call.
+	ks.createLonghornIngress()
 
 	if err := ks.deployCertManager(); err != nil {
 		ks.Logger().Warnf("Failed to deploy cert-manager: %v (skipping Rancher)", err)
@@ -385,21 +388,20 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 		return
 	}
 
-	// Compute rancherHost here so we can schedule the catchall ingress goroutine
-	// regardless of whether deployRancher succeeds or fails.
-	rancherHost := "rancher.cluster.local"
-	if ks.nodeIP != "" {
-		rancherHost = ks.nodeIP + ".nip.io"
-	}
-
 	if err := ks.deployRancher(); err != nil {
 		ks.Logger().Warnf("Failed to deploy Rancher: %v", err)
 	}
 
-	// Always schedule the catchall ingress. createRancherCatchallIngress waits for
-	// Rancher pods to be ready before creating the rule, so it won't serve 502.
-	// If Rancher never becomes ready, the landing page continues as fallback.
-	go ks.createRancherCatchallIngress(rancherHost)
+	// NOTE: we deliberately do NOT deploy a path:/ catchall Rancher ingress here.
+	// The landing page is already wired as the nginx --default-backend-service, so
+	// unmatched routes return the auto-discovery page.  A path:/ Rancher catchall
+	// would swallow every request (including /longhorn, /slurm) and return 504
+	// whenever Rancher is slow or unhealthy.  Rancher stays accessible via /rancher
+	// (redirect → $host:30444) and directly at https://NODE_IP:30444.
+	//
+	// Delete the catchall if it was deployed by a previous version of node-agent.
+	exec.Command("k3s", "kubectl", "-n", "cattle-system", "delete", "ingress",
+		"rancher-catchall", "--ignore-not-found=true").Run()
 
 	ks.deploySLURMRestAPI(mungeKey)
 
@@ -478,9 +480,13 @@ func (ks *K3sServer) resetEtcdIfStale() error {
 	return os.WriteFile(markerFile, []byte(ks.nodeIP), 0644)
 }
 
-// killExistingK3s kills any existing K3s/etcd processes and orphaned containerd.
-// K3s may bind etcd to its node IP rather than 127.0.0.1, so we check both.
-func (ks *K3sServer) killExistingK3s() {
+// killExistingK3s kills any existing K3s/etcd processes and optionally orphaned containerd.
+// killContainerd should be true only on the first start — on HealthCheck restarts we must
+// NOT kill containerd because k3s will reuse the already-running instance and avoid the
+// slow re-initialization.  If containerd is killed on restart, k3s starts it fresh and
+// needs >75 s for it to become ready — longer than k3s's internal CRD registration timeout
+// — causing a fatal crash loop.
+func (ks *K3sServer) killExistingK3s(killContainerd bool) {
 	// Kill any stale k3s agent processes first.
 	//
 	// When a node transitions from worker→leader (e.g. after re-election), the
@@ -516,21 +522,28 @@ func (ks *K3sServer) killExistingK3s() {
 		time.Sleep(1 * time.Second)
 	}
 
-	// Always kill orphaned k3s-embedded containerd.
+	// Only kill orphaned containerd on the FIRST start (killContainerd==true).
 	//
-	// When k3s is SIGKILLed (apply-patch.sh step 4, previous killExistingK3s,
-	// or OOM), its containerd child process is orphaned and keeps running with the
-	// OLD in-memory config — including sandbox_image="rancher/mirrored-pause:3.6".
-	// The new k3s start detects /run/k3s/containerd/containerd.sock, reuses the
-	// running containerd, and inherits the stale config even though we pass
-	// --pause-image registry.k8s.io/pause:3.6 on the command line.
-	// Kill it unconditionally so every Start() always gets a fresh containerd
-	// instance that reads the updated config.
-	ks.Logger().Info("Killing any orphaned k3s containerd before server start")
-	exec.Command("pkill", "-TERM", "-f", "/run/k3s/containerd/containerd").Run() //nolint:errcheck
-	time.Sleep(1 * time.Second)
-	exec.Command("pkill", "-KILL", "-f", "/run/k3s/containerd/containerd").Run() //nolint:errcheck
-	os.Remove("/run/k3s/containerd/containerd.sock")                              //nolint:errcheck
+	// On first start, an orphaned containerd from a prior k3s run may have a stale
+	// in-memory config (wrong sandbox_image, old pause alias).  Killing it forces k3s
+	// to start a fresh containerd that reads the current config.
+	//
+	// On HealthCheck restarts (killContainerd==false) we must NOT kill containerd.
+	// When k3s exits with a fatal error it orphans its containerd child.  If we kill
+	// that containerd too, k3s must re-initialize it from scratch on restart — a
+	// process that takes >75 s (image store indexing etc.).  k3s's internal CRD
+	// registration timeout is ~75 s, so the registration always fails → crash loop.
+	// Leaving the already-warm containerd running lets k3s reconnect instantly and
+	// complete CRD registration well within the timeout.
+	if killContainerd {
+		ks.Logger().Info("Killing any orphaned k3s containerd before first start")
+		exec.Command("pkill", "-TERM", "-f", "/run/k3s/containerd/containerd").Run() //nolint:errcheck
+		time.Sleep(1 * time.Second)
+		exec.Command("pkill", "-KILL", "-f", "/run/k3s/containerd/containerd").Run() //nolint:errcheck
+		os.Remove("/run/k3s/containerd/containerd.sock")                              //nolint:errcheck
+	} else {
+		ks.Logger().Info("Skipping containerd kill on restart — reusing running containerd instance")
+	}
 
 	// Check port 2380 (etcd) — run k3s-killall.sh if still bound.
 	addrs := []string{"127.0.0.1:2380"}
@@ -1340,9 +1353,6 @@ spec:
 }
 
 func (ks *K3sServer) createLonghornIngress() {
-	if exec.Command("k3s", "kubectl", "-n", "longhorn-system", "get", "ingress", "longhorn-ingress").Run() == nil {
-		return
-	}
 	// rewrite-target strips the /longhorn prefix before forwarding to the Longhorn UI,
 	// which serves its assets from /, not from /longhorn.
 	ingressYAML := `apiVersion: networking.k8s.io/v1
@@ -1377,9 +1387,8 @@ spec:
 // a ClusterRole so it can list services across all namespaces.  The page auto-refreshes
 // every 20 s, so new services appear automatically as the cluster converges.
 func (ks *K3sServer) deployClusterOSLandingPage() {
-	if exec.Command("k3s", "kubectl", "-n", "ingress-nginx", "get", "deployment", "clusteros-landing").Run() == nil {
-		return
-	}
+	// Always re-apply the ConfigMap so script changes take effect on existing clusters.
+	// The Deployment and RBAC are idempotent (kubectl apply is a no-op when unchanged).
 	ks.Logger().Info("Deploying ClusterOS dynamic landing page (auto-discovers all NodePort services)...")
 
 	// RBAC — ServiceAccount + ClusterRole + ClusterRoleBinding.
@@ -1396,6 +1405,9 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["services"]
+  verbs: ["get", "list"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
   verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -1421,7 +1433,16 @@ import http.server, json, ssl, urllib.request, os
 TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 CACERT_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 API_BASE    = "https://kubernetes.default.svc"
-NODE_IP     = os.environ.get("NODE_IP", "localhost")
+NODE_IP     = os.environ.get("NODE_IP", "localhost")  # fallback only
+
+# Human-readable labels for known ingress paths.
+INGRESS_LABELS = {
+    "/longhorn":  ("Longhorn Storage",     "Storage UI"),
+    "/rancher":   ("Rancher",              "K8s Management UI"),
+    "/slurm":     ("SLURM Monitor",        "Job Queue & Nodes"),
+    "/slurm/api": ("SLURM REST API",       "REST / JSON"),
+    "/jupyter":   ("JupyterHub",           "Notebook UI"),
+}
 
 
 def k8s_get(path):
@@ -1435,12 +1456,36 @@ def k8s_get(path):
         return json.loads(r.read())
 
 
-def collect_nodeports():
+def collect_ingresses():
+    """Return list of (path, label, desc) for every ingress rule."""
+    try:
+        items = k8s_get("/apis/networking.k8s.io/v1/ingresses").get("items", [])
+    except Exception:
+        return []
+    seen, rows = set(), []
+    for ing in items:
+        for rule in ing.get("spec", {}).get("rules", []):
+            for po in rule.get("http", {}).get("paths", []):
+                raw = po.get("path", "/")
+                # strip regex suffixes like (/|$)(.*) to get the clean prefix
+                clean = raw.split("(")[0].rstrip("/") or "/"
+                if clean in seen:
+                    continue
+                seen.add(clean)
+                label, desc = INGRESS_LABELS.get(clean, (clean, "Web service"))
+                rows.append((clean, label, desc))
+    rows.sort()
+    return rows
+
+
+def collect_nodeports(req_host):
     try:
         items   = k8s_get("/api/v1/services").get("items", [])
         api_err = None
     except Exception as exc:
         items, api_err = [], str(exc)
+    # Skip services that already have a dedicated ingress entry above.
+    SKIP_NP = {30819}  # slurmrestd REST — exposed via /slurm/api ingress
     rows = []
     for svc in items:
         ns   = svc["metadata"]["namespace"]
@@ -1449,71 +1494,95 @@ def collect_nodeports():
             continue
         for p in svc.get("spec", {}).get("ports", []):
             np = p.get("nodePort")
-            if not np:
+            if not np or np in SKIP_NP:
                 continue
             scheme = "https" if np in (30443, 30444) else "http"
-            rows.append((ns, name, np, p.get("name", ""), f"{scheme}://{NODE_IP}:{np}"))
+            rows.append((ns, name, np, p.get("name", ""), f"{scheme}://{req_host}:{np}"))
     rows.sort()
     return rows, api_err
 
 
-def build_page():
-    rows, api_err = collect_nodeports()
-    tr = ""
-    for ns, name, np, pn, url in rows:
+def build_page(req_host):
+    ingresses         = collect_ingresses()
+    nodeports, np_err = collect_nodeports(req_host)
+
+    # Web interfaces section (ingress-based).
+    ing_rows = ""
+    for path, label, desc in ingresses:
+        ing_rows += (
+            f"<tr>"
+            f"<td><b><a href='{path}' target='_blank'>{label}</a></b></td>"
+            f"<td><span class='desc'>{desc}</span></td>"
+            f"<td><a href='{path}' target='_blank'>{path}</a></td>"
+            f"</tr>"
+        )
+    if not ing_rows:
+        ing_rows = "<tr><td colspan='3' class='empty'>No ingress services yet — cluster may still be provisioning</td></tr>"
+
+    # NodePort direct-access section.
+    np_rows = ""
+    for ns, name, np, pn, url in nodeports:
         label = f"{name} / {pn}" if pn else name
-        tr += (
+        np_rows += (
             f"<tr>"
             f"<td><span class='ns'>{ns}</span></td>"
             f"<td><b>{label}</b></td>"
             f"<td><a href='{url}' target='_blank'>:{np}</a></td>"
             f"</tr>"
         )
-    if not tr:
-        tr = "<tr><td colspan='3' class='empty'>No NodePort services yet — cluster may still be provisioning</td></tr>"
-    err = f"<div class='err'>Kubernetes API: {api_err}</div>" if api_err else ""
+    if not np_rows:
+        np_rows = "<tr><td colspan='3' class='empty'>No additional NodePort services</td></tr>"
+
+    err = f"<div class='err'>Kubernetes API: {np_err}</div>" if np_err else ""
     return f"""<!DOCTYPE html>
 <html lang='en'><head><meta charset='utf-8'>
 <meta http-equiv='refresh' content='20'>
 <title>ClusterOS</title><style>
 *{{box-sizing:border-box}}
-body{{font-family:monospace;background:#0f172a;color:#cbd5e1;max-width:900px;margin:48px auto;padding:0 20px}}
+body{{font-family:monospace;background:#0f172a;color:#cbd5e1;max-width:960px;margin:48px auto;padding:0 20px}}
 h1{{color:#34d399;margin:0 0 4px}}
+h2{{color:#60a5fa;font-size:.9em;letter-spacing:.08em;text-transform:uppercase;margin:28px 0 8px;border-bottom:1px solid #1e293b;padding-bottom:6px}}
 .sub{{color:#64748b;font-size:.85em;margin-bottom:28px}}
-table{{width:100%;border-collapse:collapse}}
+table{{width:100%;border-collapse:collapse;margin-bottom:8px}}
 th{{text-align:left;padding:8px 14px;background:#1e293b;color:#60a5fa;
     font-size:.8em;letter-spacing:.05em;text-transform:uppercase;border-bottom:2px solid #334155}}
 td{{padding:9px 14px;border-bottom:1px solid #1e293b;vertical-align:middle}}
 tr:hover td{{background:#1e293b}}
 a{{color:#34d399;text-decoration:none}}a:hover{{text-decoration:underline}}
 .ns{{color:#64748b;font-size:.8em}}
+.desc{{color:#94a3b8;font-size:.85em}}
 .err{{background:#450a0a;border:1px solid #7f1d1d;border-radius:6px;
       padding:12px 16px;margin:16px 0;color:#fca5a5;font-size:.9em}}
 .empty{{color:#475569;font-style:italic;padding:16px 14px}}
-footer{{margin-top:20px;color:#334155;font-size:.75em}}
 </style></head>
 <body>
 <h1>ClusterOS</h1>
-<div class='sub'>Node: <b>{NODE_IP}</b> &mdash; auto-refreshes every 20&nbsp;s</div>
+<div class='sub'>Node: <b>{req_host}</b> &mdash; auto-refreshes every 20&nbsp;s</div>
 {err}
+<h2>Web Interfaces</h2>
 <table>
-  <thead><tr><th>Namespace</th><th>Service</th><th>NodePort</th></tr></thead>
-  <tbody>{tr}</tbody>
+  <thead><tr><th>Service</th><th>Type</th><th>Path</th></tr></thead>
+  <tbody>{ing_rows}</tbody>
 </table>
-<footer>
-  Ingress (:30080 HTTP) &mdash;
-  <a href='http://{NODE_IP}:30080/longhorn/'>/longhorn/</a> &nbsp;
-  <a href='http://{NODE_IP}:30080/slurm/'>/slurm/</a> &nbsp;
-  <a href='http://{NODE_IP}:30080/rancher'>/rancher</a> &rarr;
-  <a href='https://{NODE_IP}:30444'>https:{NODE_IP}:30444</a> (Rancher UI)
-</footer>
+<h2>Direct NodePort Access</h2>
+<table>
+  <thead><tr><th>Namespace</th><th>Service</th><th>Port</th></tr></thead>
+  <tbody>{np_rows}</tbody>
+</table>
 </body></html>"""
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        # Use X-Forwarded-Host (set by nginx-ingress) or Host header to determine
+        # which IP/hostname the browser used.  This ensures generated links work
+        # whether the user accessed via LAN IP, Tailscale IP, or a hostname.
+        req_host = (
+            self.headers.get("X-Forwarded-Host")
+            or self.headers.get("Host", NODE_IP)
+        ).split(":")[0]
         try:
-            body = build_page().encode("utf-8")
+            body = build_page(req_host).encode("utf-8")
             code = 200
         except Exception as exc:
             body = f"<pre>{exc}</pre>".encode()
@@ -1607,6 +1676,10 @@ spec:
 			ks.Logger().Warnf("landing page manifest: %v: %s", err, out)
 		}
 	}
+
+	// Restart the landing page pod so it picks up any ConfigMap script changes.
+	exec.Command("k3s", "kubectl", "-n", "ingress-nginx", "rollout", "restart",
+		"deployment/clusteros-landing").Run()
 
 	// Patch the nginx-ingress-controller DaemonSet to use the landing page as its
 	// global default backend — requests not matched by any Ingress rule hit the landing
@@ -1742,7 +1815,7 @@ spec:
 		return
 	}
 
-	// Add ingress rule for /slurm → slurmrestd.
+	// Ingress for slurmrestd REST API at /slurm/api/ (browser-facing UI is at /slurm/).
 	const slurmIngressYAML = `apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -1757,7 +1830,7 @@ spec:
   rules:
   - http:
       paths:
-      - path: /slurm(/|$)(.*)
+      - path: /slurm/api(/|$)(.*)
         pathType: ImplementationSpecific
         backend:
           service:
@@ -1771,8 +1844,255 @@ spec:
 		ks.Logger().Warnf("slurmrestd ingress: %v: %s", err, output)
 	}
 
+	ks.deploySLURMWebDash(mungeKey)
+
 	ks.slurmRestDeployed = true
-	ks.Logger().Info("SLURM REST API deployed — NodePort 30819, ingress /slurm")
+	ks.Logger().Info("SLURM deployed — REST API NodePort 30819 + /slurm/api, web dashboard /slurm")
+}
+
+// deploySLURMWebDash deploys a lightweight Python web dashboard at /slurm/ that
+// shows the live job queue (squeue) and node status (sinfo) as HTML.  It runs
+// with hostNetwork so it can reach the local slurmctld, and mounts the host
+// munge socket and slurm.conf just like slurmrestd does.
+func (ks *K3sServer) deploySLURMWebDash(mungeKey []byte) {
+	_ = mungeKey // reserved for future munge-token injection
+
+	const script = `#!/usr/bin/env python3
+"""ClusterOS SLURM web dashboard — job queue and node status."""
+import http.server, json, os, subprocess
+
+def run_json(cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None, r.stderr.strip()
+    try:
+        return json.loads(r.stdout), None
+    except Exception as e:
+        return None, str(e)
+
+def state_color(s):
+    c = {"RUNNING":"#34d399","PENDING":"#fbbf24","FAILED":"#f87171",
+         "CANCELLED":"#f87171","COMPLETED":"#60a5fa"}.get(s,"#94a3b8")
+    return f"<span style='color:{c}'>{s}</span>"
+
+def build_page():
+    jobs_data, jobs_err = run_json(["squeue","--json"])
+    nodes_data, nodes_err = run_json(["sinfo","--json"])
+
+    jobs = (jobs_data or {}).get("jobs", [])
+    job_rows = ""
+    for j in jobs:
+        jid   = j.get("job_id", "-")
+        name  = j.get("name", "-")
+        user  = j.get("user_name", "-")
+        state = j.get("job_state", "-")
+        nodes = j.get("nodes", "-")
+        t     = j.get("run_time", {})
+        secs  = t.get("number", 0) if isinstance(t, dict) else 0
+        tstr  = f"{secs//3600}h{(secs%3600)//60}m{secs%60}s" if secs else "-"
+        job_rows += f"<tr><td>{jid}</td><td>{name}</td><td>{user}</td><td>{state_color(state)}</td><td>{nodes}</td><td>{tstr}</td></tr>"
+    if not job_rows:
+        msg = jobs_err or "Queue is empty"
+        job_rows = f"<tr><td colspan='6' class='empty'>{msg}</td></tr>"
+
+    sinfo = (nodes_data or {}).get("sinfo", [])
+    node_rows = ""
+    for n in sinfo:
+        nm = n.get("nodes", {})
+        nm = nm.get("list", ["-"])[0] if isinstance(nm, dict) else str(nm)
+        st = n.get("node", {}).get("state", ["-"])
+        st = " ".join(st) if isinstance(st, list) else str(st)
+        part = n.get("partition", "-")
+        cpus = n.get("cpus", {})
+        if isinstance(cpus, dict):
+            cpus_s = f"{cpus.get('idle','-')}/{cpus.get('total','-')} idle"
+        else:
+            cpus_s = str(cpus)
+        mem = n.get("memory", {})
+        if isinstance(mem, dict):
+            mem_s = f"{mem.get('free','-')}/{mem.get('total','-')} MiB free"
+        else:
+            mem_s = str(mem)
+        node_rows += f"<tr><td>{nm}</td><td>{part}</td><td>{state_color(st)}</td><td>{cpus_s}</td><td>{mem_s}</td></tr>"
+    if not node_rows:
+        msg = nodes_err or "No node data"
+        node_rows = f"<tr><td colspan='5' class='empty'>{msg}</td></tr>"
+
+    return f"""<!DOCTYPE html>
+<html lang='en'><head><meta charset='utf-8'><meta http-equiv='refresh' content='15'>
+<title>ClusterOS SLURM</title><style>
+*{{box-sizing:border-box}}
+body{{font-family:monospace;background:#0f172a;color:#cbd5e1;max-width:1100px;margin:48px auto;padding:0 20px}}
+h1{{color:#34d399;margin:0 0 4px}}h2{{color:#60a5fa;font-size:.9em;letter-spacing:.08em;text-transform:uppercase;margin:28px 0 8px;border-bottom:1px solid #1e293b;padding-bottom:6px}}
+.sub{{color:#64748b;font-size:.85em;margin-bottom:28px}}
+table{{width:100%;border-collapse:collapse;margin-bottom:8px}}
+th{{text-align:left;padding:8px 14px;background:#1e293b;color:#60a5fa;font-size:.8em;letter-spacing:.05em;text-transform:uppercase;border-bottom:2px solid #334155}}
+td{{padding:9px 14px;border-bottom:1px solid #1e293b;vertical-align:middle}}
+tr:hover td{{background:#1e293b}}a{{color:#34d399;text-decoration:none}}
+.empty{{color:#475569;font-style:italic;padding:16px 14px}}
+</style></head><body>
+<h1>ClusterOS SLURM</h1>
+<div class='sub'>auto-refreshes every 15&nbsp;s &mdash; <a href='/'>&#8592; home</a> &mdash; <a href='/slurm/api/'>REST API</a></div>
+<h2>Job Queue</h2>
+<table>
+  <thead><tr><th>ID</th><th>Name</th><th>User</th><th>State</th><th>Nodes</th><th>Runtime</th></tr></thead>
+  <tbody>{job_rows}</tbody>
+</table>
+<h2>Cluster Nodes</h2>
+<table>
+  <thead><tr><th>Node</th><th>Partition</th><th>State</th><th>CPUs</th><th>Memory</th></tr></thead>
+  <tbody>{node_rows}</tbody>
+</table>
+</body></html>"""
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            body = build_page().encode("utf-8")
+            code = 200
+        except Exception as exc:
+            body = f"<pre>Error: {exc}</pre>".encode()
+            code = 500
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+print("SLURM dashboard listening on :8090", flush=True)
+http.server.HTTPServer(("", 8090), Handler).serve_forever()`
+
+	// ConfigMap + Deployment + Service + Ingress.
+	var indented strings.Builder
+	for _, line := range strings.Split(script, "\n") {
+		if line == "" {
+			indented.WriteString("\n")
+		} else {
+			indented.WriteString("    " + line + "\n")
+		}
+	}
+	cmYAML := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n" +
+		"  name: slurmweb-script\n  namespace: slurm\n" +
+		"data:\n  server.py: |\n" + indented.String()
+
+	const slurmwebYAML = `apiVersion: v1
+kind: Service
+metadata:
+  name: slurmweb
+  namespace: slurm
+spec:
+  selector:
+    app: slurmweb
+  ports:
+  - port: 80
+    targetPort: 8090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slurmweb
+  namespace: slurm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slurmweb
+  template:
+    metadata:
+      labels:
+        app: slurmweb
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+      - operator: Exists
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      volumes:
+      - name: munge-socket
+        hostPath:
+          path: /var/run/munge
+          type: DirectoryOrCreate
+      - name: slurm-conf
+        hostPath:
+          path: /etc/slurm
+          type: DirectoryOrCreate
+      - name: script
+        configMap:
+          name: slurmweb-script
+      initContainers:
+      - name: wait-munge
+        image: busybox:latest
+        command: ['sh', '-c', 'until [ -S /var/run/munge/munge.socket.2 ]; do sleep 2; done']
+        volumeMounts:
+        - name: munge-socket
+          mountPath: /var/run/munge
+      containers:
+      - name: slurmweb
+        image: ubuntu:22.04
+        command:
+        - sh
+        - -c
+        - |
+          apt-get update -qq -o Acquire::ForceIPv4=true && \
+          apt-get install -y -qq -o Acquire::ForceIPv4=true python3 slurm-client munge 2>/dev/null
+          exec python3 /app/server.py
+        volumeMounts:
+        - name: munge-socket
+          mountPath: /var/run/munge
+        - name: slurm-conf
+          mountPath: /etc/slurm
+          readOnly: true
+        - name: script
+          mountPath: /app
+          readOnly: true
+        ports:
+        - containerPort: 8090
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8090
+          initialDelaySeconds: 60
+          periodSeconds: 15
+          timeoutSeconds: 10
+          failureThreshold: 12
+`
+	const slurmwebIngressYAML = `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: slurmweb-ingress
+  namespace: slurm
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+  - http:
+      paths:
+      - path: /slurm(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: slurmweb
+            port:
+              number: 80
+`
+	for _, manifest := range []string{cmYAML, slurmwebYAML, slurmwebIngressYAML} {
+		cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(manifest)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			ks.Logger().Warnf("slurmweb manifest: %v: %s", err, out)
+		}
+	}
+	// Delete the old slurmrestd-only ingress at /slurm/ if it predates this split.
+	exec.Command("k3s", "kubectl", "-n", "slurm", "delete", "ingress",
+		"slurmrestd-ingress", "--ignore-not-found=true").Run()
+
+	ks.Logger().Info("SLURM web dashboard deployed — /slurm/ (HTML) /slurm/api/ (REST)")
 }
 
 func (ks *K3sServer) deployCertManager() error {
@@ -1871,13 +2191,16 @@ spec:
 	// Add a convenience /rancher redirect ingress so http://IP:30080/rancher → Rancher.
 	// Rancher can't serve at a subpath (it uses absolute redirects internally),
 	// so we issue a 302 redirect to the NodePort URL instead of proxying.
-	rancherRedirectYAML := fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+	// Use nginx $host variable so the redirect target matches whichever IP the
+	// client used to reach the cluster (LAN IP, Tailscale IP, or hostname) —
+	// the same $host is always reachable by the browser making the request.
+	rancherRedirectYAML := `apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: rancher-path-redirect
   namespace: cattle-system
   annotations:
-    nginx.ingress.kubernetes.io/temporal-redirect: "https://%s:30444"
+    nginx.ingress.kubernetes.io/temporal-redirect: "https://$host:30444"
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
 spec:
   ingressClassName: nginx
@@ -1891,7 +2214,7 @@ spec:
             name: rancher
             port:
               number: 443
-`, rancherHost)
+`
 	redirectCmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
 	redirectCmd.Stdin = strings.NewReader(rancherRedirectYAML)
 	if output, err := redirectCmd.CombinedOutput(); err != nil {
