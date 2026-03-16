@@ -38,6 +38,7 @@ const (
 	PhaseDiscovering  ClusterPhase = "discovering"
 	PhaseElecting     ClusterPhase = "electing"
 	PhaseProvisioning ClusterPhase = "provisioning"
+	PhaseJoiningCP    ClusterPhase = "joining-cp" // secondary control-plane server
 	PhaseJoining      ClusterPhase = "joining"
 	PhaseReady        ClusterPhase = "ready"
 )
@@ -60,10 +61,12 @@ type Daemon struct {
 	mu             sync.RWMutex
 	phase          ClusterPhase
 	isLeader       bool
+	isCPServer     bool     // true if this node is running k3s server (leader OR secondary CP)
 	leaderName     string
+	cpServers      []string // IPs of all CP servers (from cp-servers Serf tag)
 	slurmCtrl      *controller.SLURMController // non-nil only on leader
 	failedPeerCache *peerFailCache
-	k3sServerURL   string // URL this worker joined with; empty on leader nodes
+	k3sServerURL   string // URL this worker joined with; empty on leader/CP nodes
 }
 
 // Config contains configuration for creating a daemon.
@@ -286,6 +289,12 @@ func (d *Daemon) runPhaseMachine() {
 					d.setPhase(PhaseElecting)
 				}
 			}
+		case PhaseJoiningCP:
+			if err := d.runJoiningCP(); err != nil {
+				d.logger.Errorf("JoiningCP failed: %v — retrying in 15s", err)
+				time.Sleep(15 * time.Second)
+				d.setPhase(PhaseElecting)
+			}
 		case PhaseJoining:
 			if err := d.runJoining(); err != nil {
 				d.logger.Errorf("Joining failed: %v — retrying in 15s", err)
@@ -323,11 +332,11 @@ func (d *Daemon) runElecting() {
 	// started yet the probe fails and they exclude this node from the election —
 	// then they elect a different node that has no k3s state, producing a divergent
 	// cluster.  Clearing the tags before the election window prevents this.
-	staleTags := []string{"k3s-server", "k3s-token", "munge-key", "k3s-nodes"}
+	staleTags := []string{"k3s-server", "k3s-token", "munge-key", "k3s-nodes", "cp-servers"}
 	if err := d.discovery.DeleteTags(staleTags); err != nil {
 		d.logger.Debugf("clearStaleTags: %v (non-fatal)", err)
 	} else {
-		d.logger.Info("Cleared stale provisioning tags (k3s-server, k3s-token, munge-key, k3s-nodes)")
+		d.logger.Info("Cleared stale provisioning tags (k3s-server, k3s-token, munge-key, k3s-nodes, cp-servers)")
 	}
 	// Also reset phase to electing so other nodes don't see a stale phase=ready.
 	if err := d.discovery.UpdateTags(map[string]string{"phase": string(PhaseElecting)}); err != nil {
@@ -364,16 +373,21 @@ func (d *Daemon) runElecting() {
 	d.logger.Infof("Election: proceeding with %d alive member(s)", len(d.discovery.GetAliveMembers()))
 
 	// If any alive member already has phase=ready AND a k3s-server URL, they ARE
-	// the current cluster leader. Adopt them and join as worker — don't re-elect
-	// based on lexicographic rank. This prevents a returning node with a lower
-	// hostname from disrupting an established cluster where k3s is already running.
+	// the current cluster leader. Adopt them and decide whether to join as a
+	// secondary control-plane server (if our IP is in their cp-servers tag) or
+	// as a pure k3s agent worker.
 	if existingLeader := d.findRunningLeader(); existingLeader != "" {
-		d.logger.Infof("Cluster already has a running leader: %s — joining as worker", existingLeader)
 		d.mu.Lock()
 		d.isLeader = false
 		d.leaderName = existingLeader
 		d.mu.Unlock()
-		d.setPhase(PhaseJoining)
+		if d.isInCPList() {
+			d.logger.Infof("Cluster already has a running leader: %s — joining as secondary CP server", existingLeader)
+			d.setPhase(PhaseJoiningCP)
+		} else {
+			d.logger.Infof("Cluster already has a running leader: %s — joining as worker", existingLeader)
+			d.setPhase(PhaseJoining)
+		}
 		return
 	}
 
@@ -696,12 +710,21 @@ func (d *Daemon) runProvisioning() error {
 	// slurmctld needs NodeName entries to schedule jobs — we populate them dynamically.
 	go d.watchWorkersAndReconfigureSLURM()
 
+	// Select which nodes should run k3s server (up to 3, deterministic).
+	cpIPs := d.selectCPServers()
+	d.mu.Lock()
+	d.cpServers = cpIPs
+	d.isCPServer = true // leader is always a CP server
+	d.mu.Unlock()
+	cpServersTag := strings.Join(cpIPs, ",")
+	d.logger.Infof("CP servers selected: %v", cpIPs)
+
 	// Publish ALL cluster tags in a single atomic UpdateTags call alongside phase=ready.
 	// This is critical: because Serf gossip is asynchronous, workers that see phase=ready
 	// via gossip must have all other cluster tags in the SAME member-state snapshot.
 	// Publishing them separately would allow a worker to see phase=ready without munge-key
 	// if the two gossip messages arrived via different peers or were in different UDP batches.
-	if err := d.publishClusterReady(serverURL, token, mungeKey); err != nil {
+	if err := d.publishClusterReady(serverURL, token, cpServersTag, mungeKey); err != nil {
 		return fmt.Errorf("publish cluster ready state: %w", err)
 	}
 
@@ -745,6 +768,34 @@ func (d *Daemon) runJoining() error {
 	// solely on periodic push-pull (every 15s) which could be slow or blocked on some
 	// Tailscale configurations. The direct TCP connection forces a full state exchange.
 	d.syncWithLeader()
+
+	// After syncing, check if the leader has designated this node as a secondary
+	// control-plane server. Workers commit to PhaseJoining before the leader publishes
+	// cp-servers (race at cluster formation), so we re-check here with the full tag set.
+	if d.isInCPList() {
+		d.logger.Info("Leader has designated this node as a secondary CP server — switching to joining-cp")
+		d.setPhase(PhaseJoiningCP)
+		return nil
+	}
+
+	// Guard: if the stored leader is a CP server (not the Serf k3s leader), it won't
+	// have the k3s-server tag and we'll block forever in waitForLeaderTag below.
+	// This happens when computeReachableLeader() excluded the real leader at election
+	// time (stale k3s-server tag during startup). Detect this and re-point at whoever
+	// currently has the k3s-server tag.
+	if tag, ok := d.getLeaderTag("k3s-server"); !ok || tag == "" {
+		if actual := d.findRunningLeader(); actual != "" {
+			d.logger.Infof("Stored leader %s has no k3s-server tag — re-adopting actual leader %s",
+				d.storedLeaderName(), actual)
+			d.mu.Lock()
+			d.leaderName = actual
+			d.mu.Unlock()
+			d.syncWithLeader()
+		} else {
+			// No leader with k3s-server found yet — back to electing.
+			return fmt.Errorf("no node with k3s-server tag found — cluster not ready yet")
+		}
+	}
 
 	// All cluster tags are published atomically with phase=ready.
 	// Use a 5-minute timeout per tag as insurance against slow gossip propagation.
@@ -840,6 +891,93 @@ func (d *Daemon) runJoining() error {
 	return nil
 }
 
+// runJoiningCP is called on non-leader nodes that appear in the leader's cp-servers list.
+// It starts k3s server in joining mode (--server URL --token TOKEN), contributing to the
+// embedded etcd cluster for quorum. The node continues to run SLURM worker and schedule
+// workloads (--disable-agent=false is the k3s default).
+func (d *Daemon) runJoiningCP() error {
+	d.logger.Info("Joining as secondary control-plane server")
+
+	// Clear any stale pure-worker roles from a previous term.
+	d.roleManager.UnregisterRole("k3s-agent")
+	d.roleManager.UnregisterRole("slurm-controller")
+
+	// Wait for leader to reach ready phase and sync all tags via TCP push-pull.
+	d.logger.Info("Waiting for leader to reach ready phase...")
+	if _, err := d.waitForLeaderTag("phase", "ready", 10*time.Minute); err != nil {
+		return fmt.Errorf("wait for leader ready: %w", err)
+	}
+	d.syncWithLeader()
+
+	k3sServerURL, err := d.waitForLeaderTag("k3s-server", "", 5*time.Minute)
+	if err != nil {
+		return fmt.Errorf("read k3s-server tag: %w", err)
+	}
+	k3sToken, err := d.waitForLeaderTag("k3s-token", "", 5*time.Minute)
+	if err != nil {
+		return fmt.Errorf("read k3s-token tag: %w", err)
+	}
+	var mungeKey []byte
+	mungeKeyB64, err := d.waitForLeaderTag("munge-key", "", 5*time.Minute)
+	if err != nil {
+		mungeManager := slurmauth.NewMungeKeyManager(d.logger)
+		if k, err2 := mungeManager.ReadMungeKey(); err2 == nil {
+			mungeKey = k
+		} else {
+			return fmt.Errorf("read munge-key tag: %w", err)
+		}
+	} else {
+		mungeKey, err = base64.StdEncoding.DecodeString(mungeKeyB64)
+		if err != nil {
+			return fmt.Errorf("decode munge key: %w", err)
+		}
+	}
+
+	nodeIP := d.getLocalIP()
+	if tsIP := d.detectTailscaleIPWithRetry(90 * time.Second); tsIP != "" {
+		d.logger.Infof("Tailscale ready (%s) — proceeding with CP join", tsIP)
+		_ = d.discovery.UpdateTags(map[string]string{"wgip": tsIP})
+		nodeIP = tsIP
+	}
+
+	controllerIP := d.extractHost(k3sServerURL)
+
+	d.logger.Infof("Starting k3s server in joining mode → %s", k3sServerURL)
+	k3sServer := k3s.NewK3sServerRoleJoining(nodeIP, k3sServerURL, k3sToken, d.logger)
+	if err := k3sServer.Start(); err != nil {
+		return fmt.Errorf("start secondary k3s server: %w", err)
+	}
+	d.roleManager.RegisterRole("k3s-server", k3sServer)
+	d.mu.Lock()
+	d.isCPServer = true
+	d.mu.Unlock()
+
+	d.logger.Info("Waiting for local k3s API to be ready...")
+	if err := k3sServer.WaitForAPIReady(5 * time.Minute); err != nil {
+		return fmt.Errorf("secondary k3s API ready: %w", err)
+	}
+
+	// Label this node's extra disks in k8s.
+	if paths := readExtraDiskPaths(); len(paths) > 0 {
+		hostname, _ := os.Hostname()
+		label := fmt.Sprintf("clusteros-ndisks=%d", len(paths))
+		if out, lErr := exec.Command("k3s", "kubectl", "label", "node", hostname, label, "--overwrite").CombinedOutput(); lErr != nil {
+			d.logger.Warnf("Could not label CP node with disk count: %v — %s", lErr, string(out))
+		}
+	}
+
+	// Start SLURM worker — CP nodes participate in compute just like pure agents.
+	d.logger.Infof("Starting SLURM worker on CP node (controller=%s)", controllerIP)
+	slurmWorker := worker.NewSLURMWorkerRole(controllerIP, mungeKey, nodeIP, d.logger)
+	if err := slurmWorker.Start(); err != nil {
+		d.logger.Warnf("SLURM worker on CP node failed to start: %v — will retry via HealthCheck", err)
+	}
+	d.roleManager.RegisterRole("slurm-worker", slurmWorker)
+
+	d.setPhase(PhaseReady)
+	return nil
+}
+
 // runReady loops, monitoring for leadership changes and remote k3s server availability.
 func (d *Daemon) runReady() {
 	d.logger.Info("Cluster ready — monitoring leadership")
@@ -862,6 +1000,7 @@ func (d *Daemon) runReady() {
 		case <-ticker.C:
 			d.mu.RLock()
 			wasLeader := d.isLeader
+			isCPServer := d.isCPServer
 			joinedURL := d.k3sServerURL
 			d.mu.RUnlock()
 
@@ -892,7 +1031,9 @@ func (d *Daemon) runReady() {
 				}
 			}
 
-			if !wasLeader && joinedURL != "" {
+			// CP servers run their own k3s server and participate in etcd quorum —
+			// they must NOT re-join when the leader's URL changes.
+			if !wasLeader && !isCPServer && joinedURL != "" {
 				// Check 1: URL change in Serf tags.
 				// Fires when the leader publishes a new k3s-server tag (new leader elected
 				// and Serf gossip has propagated the change).
@@ -948,7 +1089,8 @@ func (d *Daemon) publishTag(key, value string) {
 // atomic Serf SetTags call.  Because gossip messages carry a full member-state snapshot,
 // workers that see phase=ready will always see the k3s-server/token/munge-key in the
 // same snapshot — eliminating the race where phase=ready arrived before munge-key.
-func (d *Daemon) publishClusterReady(k3sServerURL, k3sToken string, mungeKey []byte) error {
+// cpServers is a comma-separated list of Tailscale IPs that should run k3s server.
+func (d *Daemon) publishClusterReady(k3sServerURL, k3sToken, cpServers string, mungeKey []byte) error {
 	if d.discovery == nil {
 		return fmt.Errorf("discovery not initialised")
 	}
@@ -969,6 +1111,7 @@ func (d *Daemon) publishClusterReady(k3sServerURL, k3sToken string, mungeKey []b
 		"k3s-server": k3sServerURL,
 		"k3s-token":  k3sToken,
 		"munge-key":  mungeKeyB64,
+		"cp-servers": cpServers,
 		"phase":      string(PhaseReady),
 	}
 	if err := d.discovery.UpdateTags(tags); err != nil {
@@ -1057,6 +1200,64 @@ func (d *Daemon) getLeaderTags() map[string]string {
 		}
 	}
 	return nil
+}
+
+// selectCPServers picks up to 3 nodes to run k3s server (control-plane).
+// The leader is always first; remaining slots are filled from alive same-version
+// members sorted lexicographically by Tailscale IP for determinism.
+func (d *Daemon) selectCPServers() []string {
+	myIP := d.getLocalIP()
+	result := []string{myIP}
+
+	myVer := d.version
+	if idx := strings.Index(myVer, "-dirty"); idx >= 0 {
+		myVer = myVer[:idx]
+	}
+
+	var extras []string
+	for _, m := range d.discovery.GetAliveMembers() {
+		if m.Name == d.discovery.LocalMember().Name {
+			continue
+		}
+		if myVer != "" {
+			peerVer := m.Tags["ver"]
+			if idx := strings.Index(peerVer, "-dirty"); idx >= 0 {
+				peerVer = peerVer[:idx]
+			}
+			if peerVer != "" && peerVer != myVer {
+				continue
+			}
+		}
+		memberIP := m.Addr.String()
+		if wgip := m.Tags["wgip"]; wgip != "" {
+			memberIP = wgip
+		}
+		extras = append(extras, memberIP)
+	}
+	sort.Strings(extras)
+	for _, ip := range extras {
+		if len(result) >= 3 {
+			break
+		}
+		result = append(result, ip)
+	}
+	return result
+}
+
+// isInCPList reports whether this node's local IP appears in the cp-servers tag
+// published by the current cluster leader.
+func (d *Daemon) isInCPList() bool {
+	tag, ok := d.getLeaderTag("cp-servers")
+	if !ok || tag == "" {
+		return false
+	}
+	localIP := d.getLocalIP()
+	for _, ip := range strings.Split(tag, ",") {
+		if strings.TrimSpace(ip) == localIP {
+			return true
+		}
+	}
+	return false
 }
 
 // buildWorkerList returns the current list of alive Serf members that should be

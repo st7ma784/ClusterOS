@@ -161,7 +161,9 @@ func New(cfg *Config, clusterState *state.ClusterState, localNode *state.Node) (
 		cfg.Tags = make(map[string]string)
 	}
 	cfg.Tags["node_id"] = cfg.NodeID
-	cfg.Tags["roles"] = strings.Join(localNode.Roles, ",")
+	// "roles" tag removed — no cluster logic depends on it, and Serf's 512-byte
+	// tag budget is already tight. Removing ~27 bytes prevents overflow when
+	// cp-servers + k3s-nodes are published simultaneously on the leader.
 	cfg.Tags["cpu"] = strconv.Itoa(localNode.Capabilities.CPU)
 	cfg.Tags["ram"] = strconv.Itoa(localMemMB())
 	cfg.Tags["gpu"] = strconv.Itoa(localGPUCount())
@@ -350,7 +352,7 @@ func (sd *SerfDiscovery) memberToNode(member serf.Member) *state.Node {
 	return &state.Node{
 		ID:      nodeID,
 		Name:    member.Name,
-		Roles:   strings.Split(member.Tags["roles"], ","),
+		Roles:   nil, // roles tag removed from Serf to stay under 512-byte budget
 		Address: member.Addr.String(),
 		Capabilities: state.Capabilities{
 			CPU:  cpu,

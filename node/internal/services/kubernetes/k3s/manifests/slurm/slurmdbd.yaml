@@ -1,4 +1,21 @@
 ---
+# Longhorn StorageClass with 2 replicas and Retain policy.
+# 2 replicas: tolerates 1 node failure while avoiding the 0-fault-tolerance of 3/3.
+# Retain: PVs survive Pod/PVC deletion so accounting data is not accidentally wiped.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: longhorn-ha
+provisioner: driver.longhorn.io
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+parameters:
+  numberOfReplicas: "2"
+  staleReplicaTimeout: "30"
+  fromBackup: ""
+
+---
 # SLURM Database Daemon (slurmdbd) running in Kubernetes
 # This provides HA for SLURM's job accounting and user database
 # The slurmdbd is deployed as a Kubernetes service, making it highly available
@@ -118,6 +135,7 @@ spec:
       name: mysql-data
     spec:
       accessModes: ["ReadWriteOnce"]
+      storageClassName: longhorn-ha
       resources:
         requests:
           storage: 5Gi
@@ -245,7 +263,8 @@ spec:
           path: /var/run/munge
           type: DirectoryOrCreate
       - name: slurm-log
-        emptyDir: {}
+        persistentVolumeClaim:
+          claimName: slurmdbd-log
       - name: host-usr
         hostPath:
           path: /usr
@@ -265,6 +284,20 @@ spec:
     targetPort: 6819
     name: slurmdbd
   type: ClusterIP
+
+---
+# Persistent log volume for slurmdbd — survives pod rescheduling across nodes.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: slurmdbd-log
+  namespace: slurm
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn-ha
+  resources:
+    requests:
+      storage: 1Gi
 
 ---
 # NodePort service for external access from non-K8s nodes (SLURM auth/accounting).

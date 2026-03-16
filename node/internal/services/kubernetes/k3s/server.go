@@ -25,6 +25,8 @@ var slurmdbdManifest []byte
 type K3sServer struct {
 	*roles.BaseRole
 	nodeIP              string
+	serverURL           string // non-empty = joining mode (--server URL); empty = leader (--cluster-init)
+	joinToken           string // join token for joining mode
 	dataDir             string
 	tokenPath           string
 	k3sCmd              *exec.Cmd
@@ -35,7 +37,7 @@ type K3sServer struct {
 	startCount          int // number of times Start() has been called
 }
 
-// NewK3sServerRole creates a K3sServer for health monitoring (implements roles.Role).
+// NewK3sServerRole creates a K3sServer for the cluster leader (--cluster-init).
 // The nodeIP is the Tailscale/LAN IP to bind to.
 func NewK3sServerRole(nodeIP string, logger *logrus.Logger) *K3sServer {
 	return &K3sServer{
@@ -47,10 +49,31 @@ func NewK3sServerRole(nodeIP string, logger *logrus.Logger) *K3sServer {
 	}
 }
 
-// Start starts k3s server as the cluster leader with --cluster-init.
-// This is called once by the phase machine, not by leadership callbacks.
+// NewK3sServerRoleJoining creates a K3sServer for a secondary control-plane node.
+// It joins an existing k3s cluster (embedded etcd) instead of initialising one.
+// The node runs both the k3s server AND kubelet/kube-proxy (--disable-agent=false
+// is the k3s default), so it continues to schedule workloads alongside CP duties.
+func NewK3sServerRoleJoining(nodeIP, serverURL, joinToken string, logger *logrus.Logger) *K3sServer {
+	return &K3sServer{
+		BaseRole:     roles.NewBaseRole("k3s-server", logger),
+		nodeIP:       nodeIP,
+		serverURL:    serverURL,
+		joinToken:    joinToken,
+		dataDir:      "/var/lib/rancher/k3s",
+		tokenPath:    "/var/lib/rancher/k3s/server/token",
+		manifestsDir: "/var/lib/cluster-os/k8s-manifests",
+	}
+}
+
+// Start starts k3s server either as the cluster leader (--cluster-init) or as a
+// secondary control-plane node (--server URL --token TOKEN), depending on whether
+// serverURL is set. Called once by the phase machine per leadership/CP term.
 func (ks *K3sServer) Start() error {
-	ks.Logger().Info("Starting k3s server (leader)")
+	if ks.serverURL != "" {
+		ks.Logger().Infof("Starting k3s server (secondary CP, joining %s)", ks.serverURL)
+	} else {
+		ks.Logger().Info("Starting k3s server (leader, --cluster-init)")
+	}
 
 	if err := os.MkdirAll(ks.dataDir, 0755); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
@@ -81,7 +104,6 @@ func (ks *K3sServer) Start() error {
 	args := []string{
 		"server",
 		"--data-dir", ks.dataDir,
-		"--cluster-init",  // leader always initialises the cluster
 		"--disable", "servicelb",
 		"--disable", "traefik",
 		"--snapshotter", "native",
@@ -102,6 +124,30 @@ func (ks *K3sServer) Start() error {
 		"--bind-address", "0.0.0.0",
 		"--tls-san", advertiseAddr,
 		"--tls-san", "127.0.0.1",
+	}
+
+	// Leader initialises the embedded etcd cluster; secondary CP servers join it.
+	if ks.serverURL != "" {
+		// Wipe stale server-side state from a previous leadership term.
+		// k3s refuses to start in joining mode if local TLS/cred files are
+		// newer than the remote datastore, producing a fatal "could cause a
+		// cluster outage" error. Removing them here lets k3s re-fetch from
+		// the existing etcd cluster, which is always safe on a CP join.
+		for _, dir := range []string{
+			filepath.Join(ks.dataDir, "server/tls"),
+			filepath.Join(ks.dataDir, "server/cred"),
+			filepath.Join(ks.dataDir, "server/db"),
+		} {
+			if _, err := os.Stat(dir); err == nil {
+				ks.Logger().Infof("Removing stale server state before CP join: %s", dir)
+				if err := os.RemoveAll(dir); err != nil {
+					ks.Logger().Warnf("Failed to remove %s: %v", dir, err)
+				}
+			}
+		}
+		args = append(args, "--server", ks.serverURL, "--token", ks.joinToken)
+	} else {
+		args = append(args, "--cluster-init")
 	}
 
 	if ks.nodeIP != "" {
@@ -2171,6 +2217,35 @@ func (ks *K3sServer) deployRancher() error {
 	if !alreadyInstalled {
 	ks.Logger().Info("Installing Rancher management UI...")
 
+	// Pre-create cattle-system namespace and rancher-data PVC so Rancher's
+	// embedded SQLite DB survives pod rescheduling to a different node.
+	// The PVC uses longhorn-ha (2 Longhorn replicas, Retain) so data is
+	// preserved even when the node that hosted the Rancher pod is lost.
+	rancherNSAndPVC := `apiVersion: v1
+kind: Namespace
+metadata:
+  name: cattle-system
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rancher-data
+  namespace: cattle-system
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn-ha
+  resources:
+    requests:
+      storage: 5Gi
+`
+	applyPVCCmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	applyPVCCmd.Stdin = strings.NewReader(rancherNSAndPVC)
+	if out, err := applyPVCCmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("rancher-data PVC pre-create: %v — %s (continuing)", err, string(out))
+	} else {
+		ks.Logger().Info("rancher-data PVC pre-created in cattle-system")
+	}
+
 	// Use nip.io to turn the raw IP into a valid DNS hostname.
 	// Kubernetes 1.28+ rejects raw IPs in Ingress spec.rules[0].host.
 	// nip.io is a public wildcard DNS: 100-102-126-31.nip.io → 100.102.126.31.
@@ -2211,6 +2286,12 @@ func (ks *K3sServer) deployRancher() error {
 		"--set", "extraEnv[1].value=unsupported-storage-drivers=true",
 		"--set-string", `ingress.extraAnnotations.nginx\.ingress\.kubernetes\.io/backend-protocol=HTTPS`,
 		"--set-string", `ingress.extraAnnotations.nginx\.ingress\.kubernetes\.io/proxy-ssl-verify=off`,
+		// Mount rancher-data PVC at /var/lib/rancher so the embedded SQLite DB
+		// (cattle.db) survives pod rescheduling to a different node.
+		"--set", "volumes[0].name=rancher-data",
+		"--set", "volumes[0].persistentVolumeClaim.claimName=rancher-data",
+		"--set", "volumeMounts[0].name=rancher-data",
+		"--set", "volumeMounts[0].mountPath=/var/lib/rancher",
 		"--wait", "--timeout", "5m0s",
 		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
 	)
