@@ -22,7 +22,7 @@ data:
     # slurmdbd configuration - managed by ClusterOS
     AuthType=auth/munge
     AuthInfo=/var/run/munge/munge.socket.2
-    DbdHost=slurmdbd.slurm.svc.cluster.local
+    DbdHost=slurmdbd
     DbdPort=6819
     SlurmUser=slurm
     DebugLevel=info
@@ -155,11 +155,23 @@ spec:
       labels:
         app: slurmdbd
     spec:
+      # hostname=slurmdbd so gethostname() matches DbdHost in slurmdbd.conf
+      hostname: slurmdbd
+      # Default ClusterFirst DNS — slurmdbd is deployed after CoreDNS is running,
+      # so internal .svc.cluster.local names resolve correctly via CoreDNS.
+      dnsPolicy: ClusterFirst
       initContainers:
       # Wait for MariaDB to be ready
       - name: wait-for-db
         image: busybox:1.36
-        command: ['sh', '-c', 'until nc -z slurmdbd-mysql 3306; do echo waiting for db; sleep 2; done']
+        command: ['sh', '-c', 'until nc -z slurmdbd-mysql.slurm.svc.cluster.local 3306; do echo waiting for db; sleep 2; done']
+      # Wait for host munged socket to appear (munged managed by node-agent, not this pod)
+      - name: wait-munge
+        image: busybox:1.36
+        command: ['sh', '-c', 'until [ -S /var/run/munge/munge.socket.2 ]; do sleep 2; done']
+        volumeMounts:
+        - name: munge-socket
+          mountPath: /var/run/munge
       containers:
       - name: slurmdbd
         image: ubuntu:24.04
@@ -168,40 +180,42 @@ spec:
         - -c
         - |
           set -e
-          # Install slurm packages
-          apt-get update -qq
-          apt-get install -y -qq slurmdbd munge libmunge-dev
+          # Create slurm user matching host UID — slurmdbd drops privileges to SlurmUser
+          groupadd -g 64030 slurm 2>/dev/null || true
+          useradd -u 64030 -g 64030 -M -s /usr/sbin/nologin slurm 2>/dev/null || true
 
-          # Create directories
-          mkdir -p /var/log/slurm /var/run/munge /etc/slurm
-          chown slurm:slurm /var/log/slurm
+          # Directories
+          mkdir -p /var/log/slurm /etc/slurm
+          chown 64030:64030 /var/log/slurm
+
+          # Link SLURM plugin directory (PluginDir in slurmdbd.conf points here)
+          mkdir -p /usr/lib/x86_64-linux-gnu
+          ln -sfn /hostfs/usr/lib/x86_64-linux-gnu/slurm-wlm /usr/lib/x86_64-linux-gnu/slurm-wlm
 
           # Copy config
           cp /config/slurmdbd.conf /etc/slurm/slurmdbd.conf
-          chown slurm:slurm /etc/slurm/slurmdbd.conf
+          chown 64030:64030 /etc/slurm/slurmdbd.conf
           chmod 600 /etc/slurm/slurmdbd.conf
 
-          # Setup munge
-          cp /munge-secret/munge.key /etc/munge/munge.key
-          chown munge:munge /etc/munge/munge.key
-          chmod 400 /etc/munge/munge.key
-
-          # Start munge in background
-          runuser -u munge -- /usr/sbin/munged --foreground &
-          sleep 2
-
-          # Start slurmdbd in foreground
-          exec /usr/sbin/slurmdbd -D -vvv
+          # Start slurmdbd — uses host munge socket at /var/run/munge/munge.socket.2
+          exec /hostfs/usr/sbin/slurmdbd -D -vvv
+        env:
+        - name: LD_LIBRARY_PATH
+          value: /hostfs/usr/lib/x86_64-linux-gnu/slurm-wlm:/hostfs/usr/lib/x86_64-linux-gnu
         ports:
         - containerPort: 6819
           name: slurmdbd
         volumeMounts:
         - name: slurmdbd-config
           mountPath: /config
-        - name: munge-key
-          mountPath: /munge-secret
+        - name: munge-socket
+          mountPath: /var/run/munge
+          readOnly: true
         - name: slurm-log
           mountPath: /var/log/slurm
+        - name: host-usr
+          mountPath: /hostfs/usr
+          readOnly: true
         resources:
           requests:
             memory: "256Mi"
@@ -226,8 +240,16 @@ spec:
       - name: munge-key
         secret:
           secretName: munge-key
+      - name: munge-socket
+        hostPath:
+          path: /var/run/munge
+          type: DirectoryOrCreate
       - name: slurm-log
         emptyDir: {}
+      - name: host-usr
+        hostPath:
+          path: /usr
+          type: Directory
 
 ---
 apiVersion: v1

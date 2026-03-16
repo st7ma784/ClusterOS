@@ -681,7 +681,7 @@ func (d *Daemon) runProvisioning() error {
 	// where workers might already be present before the leader finishes provisioning).
 	initialWorkers := d.buildWorkerList()
 	d.logger.Infof("Starting SLURM controller (initial workers=%d)...", len(initialWorkers))
-	slurmCtrl := controller.NewSLURMControllerRole(nodeIP, mungeKey, initialWorkers, "", d.logger)
+	slurmCtrl := controller.NewSLURMControllerRole(nodeIP, mungeKey, initialWorkers, nodeIP, d.logger)
 	if err := slurmCtrl.Start(); err != nil {
 		return fmt.Errorf("start slurm controller: %w", err)
 	}

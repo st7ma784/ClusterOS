@@ -615,7 +615,11 @@ command -v slurmctld &>/dev/null || PKGS="$PKGS slurmctld"
 command -v slurmd    &>/dev/null || PKGS="$PKGS slurmd"
 command -v munged    &>/dev/null || PKGS="$PKGS munge"
 # SLURM client tools — squeue, sbatch, sinfo, scancel (needed on ALL nodes, not just controller)
-command -v squeue  &>/dev/null || PKGS="$PKGS slurm-client"
+command -v squeue      &>/dev/null || PKGS="$PKGS slurm-client"
+# slurmrestd: REST API daemon — used by the slurmrestd k8s pod (mounts /usr from host)
+command -v slurmrestd  &>/dev/null || PKGS="$PKGS slurmrestd"
+# slurmdbd: accounting daemon — used by the slurmdbd k8s pod (mounts /usr from host)
+command -v slurmdbd   &>/dev/null || PKGS="$PKGS slurmdbd"
 # Longhorn distributed storage requirements:
 dpkg -s open-iscsi       &>/dev/null 2>&1 || PKGS="$PKGS open-iscsi"
 dpkg -s nfs-common       &>/dev/null 2>&1 || PKGS="$PKGS nfs-common"
@@ -1422,31 +1426,41 @@ mkdir -p /etc/rancher/k3s /etc/clusteros
 
 # Reliable upstream DNS file for k3s CoreDNS.
 # k3s reads this via 'resolv-conf' below to configure CoreDNS's forwarding upstreams.
-# Using public DNS (8.8.8.8/1.1.1.1) means CoreDNS can always resolve external names
-# even if the node's ISP DNS is unreachable.  This also prevents the CoreDNS Corefile
-# from being configured with "forward . 10.43.0.10" (circular) when the cluster DNS
-# entry somehow ends up in /etc/resolv.conf before k3s reads it.
-cat > /etc/clusteros/resolv.conf <<'DNSEOF'
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-nameserver 8.8.4.4
-DNSEOF
-ok "Created /etc/clusteros/resolv.conf with reliable upstream DNS for k3s CoreDNS"
+# We detect the network's actual working DNS servers first (via resolvectl) so that
+# environments which block outbound port 53 to public DNS (e.g. university networks)
+# still work.  Public DNS (8.8.8.8/1.1.1.1) is added as fallback at the end.
+# We exclude loopback (127.x) and k8s CoreDNS (10.43.x) to avoid circular forwarding.
+{
+    # Collect DNS servers currently active via systemd-resolved (exclude lo/CoreDNS/fallback)
+    resolvectl status 2>/dev/null \
+        | grep -E '^\s+(Current )?DNS Servers?:' \
+        | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' \
+        | grep -vE '^127\.|^10\.43\.' \
+        | sort -u \
+        | while read -r ns; do printf 'nameserver %s\n' "$ns"; done
+    # Public DNS as fallback (k8s limits resolv.conf to 3 nameservers total)
+    printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\nnameserver 8.8.4.4\n'
+} | awk '!seen[$0]++' | head -3 > /etc/clusteros/resolv.conf
+ok "Created /etc/clusteros/resolv.conf with network DNS + public fallback for k3s CoreDNS"
 
 # Configure systemd-resolved FallbackDNS so DNS survives k3s restarts / crashes.
 # When k3s is down, /etc/resolv.conf still points to 10.43.0.10 (CoreDNS),
-# but with FallbackDNS set, systemd-resolved falls back to 8.8.8.8 automatically.
+# but with FallbackDNS set, systemd-resolved falls back automatically.
+_FALLBACK_DNS=$(grep '^nameserver' /etc/clusteros/resolv.conf | awk '{print $2}' | head -3 | tr '\n' ' ' | sed 's/ $//')
 if [ -f /etc/systemd/resolved.conf ]; then
     if ! grep -q '^FallbackDNS=' /etc/systemd/resolved.conf 2>/dev/null; then
         if grep -q '^\[Resolve\]' /etc/systemd/resolved.conf 2>/dev/null; then
-            sed -i '/^\[Resolve\]/a FallbackDNS=8.8.8.8 1.1.1.1' /etc/systemd/resolved.conf
+            sed -i "/^\[Resolve\]/a FallbackDNS=${_FALLBACK_DNS}" /etc/systemd/resolved.conf
         else
-            printf '\n[Resolve]\nFallbackDNS=8.8.8.8 1.1.1.1\n' >> /etc/systemd/resolved.conf
+            printf '\n[Resolve]\nFallbackDNS=%s\n' "${_FALLBACK_DNS}" >> /etc/systemd/resolved.conf
         fi
         systemctl restart systemd-resolved 2>/dev/null || true
-        ok "systemd-resolved: FallbackDNS=8.8.8.8 1.1.1.1 configured"
+        ok "systemd-resolved: FallbackDNS=${_FALLBACK_DNS} configured"
     else
-        ok "systemd-resolved: fallback DNS already configured"
+        # Update existing FallbackDNS entry in case the network changed
+        sed -i "s/^FallbackDNS=.*/FallbackDNS=${_FALLBACK_DNS}/" /etc/systemd/resolved.conf
+        systemctl restart systemd-resolved 2>/dev/null || true
+        ok "systemd-resolved: fallback DNS updated to ${_FALLBACK_DNS}"
     fi
 fi
 

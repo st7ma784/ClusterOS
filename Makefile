@@ -319,7 +319,7 @@ SSH_KEY  ?= $(HOME)/.ssh/cluster_key
 
 # Internal: build ssh/scp command prefix (sshpass + key or just key).
 _SSH_AUTH := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $(if $(SSH_KEY),-i $(SSH_KEY))
-_SCP_AUTH := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') scp -o StrictHostKeyChecking=no $(if $(SSH_KEY),-i $(SSH_KEY))
+_SCP_AUTH := $(if $(SSH_PASS),sshpass -p '$(SSH_PASS)') scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 $(if $(SSH_KEY),-i $(SSH_KEY))
 
 deploy: patch
 	@if [ -z "$(NODES)" ]; then \
@@ -339,7 +339,8 @@ deploy: patch
 			 sudo pkill -KILL -f /tmp/node-agent 2>/dev/null; \
 			 true' 2>/dev/null || true; \
 		echo "    [2/4] Uploading patch bundle"; \
-		$(_SCP_AUTH) -r patch/ $(SSH_USER)@$$node:~/patch/ \
+		$(_SSH_AUTH) $(SSH_USER)@$$node 'rm -rf ~/patch && mkdir -p ~/patch' 2>/dev/null || true; \
+		$(_SCP_AUTH) -r patch/ $(SSH_USER)@$$node:~/ \
 			|| { echo "WARNING: SCP to $$node failed — skipping"; continue; }; \
 		echo "    [3/4] Running apply-patch.sh"; \
 		$(_SSH_AUTH) $(SSH_USER)@$$node 'sudo bash ~/patch/apply-patch.sh' \

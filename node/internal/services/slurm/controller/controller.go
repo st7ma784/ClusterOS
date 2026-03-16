@@ -208,14 +208,16 @@ func (sc *SLURMController) stopSlurmctld() error {
 
 func (sc *SLURMController) generateConfig() error {
 	// Determine accounting storage settings.
-	// slurmdbd listens on port 6819 (not the REST NodePort 30819).
+	// slurmdbd is deployed in k3s and exposed via NodePort 30820.
+	// Always configure slurmdbd if slurmdbdHost is provided — slurmctld handles
+	// temporary unavailability gracefully (reconnects when slurmdbd comes up).
 	acctHost := ""
-	acctPort := 6819
-	if sc.slurmdbdHost != "" && isTCPReachable(sc.slurmdbdHost, acctPort) {
+	acctPort := 30820 // NodePort for slurmdbd-external service
+	if sc.slurmdbdHost != "" {
 		acctHost = sc.slurmdbdHost
-		sc.Logger().Infof("SlurmDBD reachable at %s:%d — enabling accounting", acctHost, acctPort)
+		sc.Logger().Infof("SlurmDBD configured at %s:%d — enabling accounting", acctHost, acctPort)
 	} else {
-		sc.Logger().Info("SlurmDBD not reachable — starting without accounting")
+		sc.Logger().Info("SlurmDBD host not set — starting without accounting")
 	}
 
 	// Compute controller memory in MB (cap at 256 GB, floor at 1024 MB).

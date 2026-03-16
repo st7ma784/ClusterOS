@@ -986,6 +986,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: ingress-nginx
+        app.kubernetes.io/instance: ingress-nginx
         app.kubernetes.io/component: controller
     spec:
       serviceAccountName: ingress-nginx
@@ -1061,6 +1062,11 @@ func (ks *K3sServer) deployIngressNginx() error {
 		"get", "daemonset", "ingress-nginx-controller").Run() == nil
 	if dsExists {
 		ks.Logger().Debug("nginx-ingress DaemonSet already installed")
+		// Always delete the admission webhook — it frequently breaks (no endpoints,
+		// 502 Bad Gateway on TLS) and blocks ALL ingress creation silently.
+		// nginx-ingress works correctly without it; validation is nice-to-have only.
+		exec.Command("k3s", "kubectl", "delete", "validatingwebhookconfiguration",
+			"ingress-nginx-admission", "--ignore-not-found=true").Run()
 		ks.patchIngressForMetalLB()
 		return nil
 	}
@@ -1110,6 +1116,13 @@ func (ks *K3sServer) deployIngressNginx() error {
 		"--type=merge", "-p", patchJSON).Run()
 
 	ks.Logger().Info("nginx-ingress DaemonSet ready — port 80/443 bound on every cluster node")
+
+	// Delete the admission webhook — it uses a certgen Job that only runs once and
+	// its TLS cert gets out of sync with rolling pod replacements.  Without this
+	// deletion, kubectl apply for any Ingress resource will hit a 502 Bad Gateway
+	// from the broken webhook and silently fail.
+	exec.Command("k3s", "kubectl", "delete", "validatingwebhookconfiguration",
+		"ingress-nginx-admission", "--ignore-not-found=true").Run()
 
 	// Upgrade to LoadBalancer type if MetalLB is ready.
 	ks.patchIngressForMetalLB()
@@ -1778,6 +1791,10 @@ spec:
         hostPath:
           path: /etc/slurm
           type: DirectoryOrCreate
+      - name: host-usr
+        hostPath:
+          path: /usr
+          type: Directory
       initContainers:
       - name: wait-munge
         image: busybox:latest
@@ -1787,28 +1804,38 @@ spec:
           mountPath: /var/run/munge
       containers:
       - name: slurmrestd
-        image: ubuntu:22.04
+        image: ubuntu:24.04
         command:
-        - sh
+        - /bin/sh
         - -c
         - |
-          apt-get update -qq -o Acquire::ForceIPv4=true && \
-          apt-get install -y -qq -o Acquire::ForceIPv4=true slurm-wlm 2>/dev/null
-          exec slurmrestd -f /etc/slurm/slurm.conf -a rest_auth/munge 0.0.0.0:6820
+          # Create slurm user matching host UID — slurmrestd refuses to run as root
+          groupadd -g 64030 slurm 2>/dev/null || true
+          useradd -u 64030 -g 64030 -M -s /usr/sbin/nologin slurm 2>/dev/null || true
+          # slurm.conf PluginDir uses the host path; symlink so it resolves inside the container
+          mkdir -p /usr/lib/x86_64-linux-gnu
+          ln -sfn /hostfs/usr/lib/x86_64-linux-gnu/slurm-wlm /usr/lib/x86_64-linux-gnu/slurm-wlm
+          exec su -s /bin/sh slurm -c 'exec /hostfs/usr/sbin/slurmrestd -f /etc/slurm/slurm.conf -a rest_auth/local 0.0.0.0:6820'
+        env:
+        - name: LD_LIBRARY_PATH
+          value: /hostfs/usr/lib/x86_64-linux-gnu/slurm-wlm:/hostfs/usr/lib/x86_64-linux-gnu:/hostfs/usr/lib/aarch64-linux-gnu/slurm-wlm:/hostfs/usr/lib/aarch64-linux-gnu
         volumeMounts:
         - name: munge-socket
           mountPath: /var/run/munge
         - name: slurm-conf
           mountPath: /etc/slurm
           readOnly: true
+        - name: host-usr
+          mountPath: /hostfs/usr
+          readOnly: true
         ports:
         - containerPort: 6820
         readinessProbe:
           tcpSocket:
             port: 6820
-          initialDelaySeconds: 90
-          periodSeconds: 15
-          failureThreshold: 24
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 30
 `
 	// Ensure slurm namespace exists.
 	nsCmd := exec.Command("k3s", "kubectl", "create", "namespace", "slurm",
@@ -1909,11 +1936,13 @@ def build_page():
     sinfo = (nodes_data or {}).get("sinfo", [])
     node_rows = ""
     for n in sinfo:
-        nm = n.get("nodes", {})
-        nm = nm.get("list", ["-"])[0] if isinstance(nm, dict) else str(nm)
+        nodes_obj = n.get("nodes", {})
+        node_list = nodes_obj.get("nodes", []) if isinstance(nodes_obj, dict) else []
+        nm = ", ".join(node_list) if node_list else "-"
         st = n.get("node", {}).get("state", ["-"])
         st = " ".join(st) if isinstance(st, list) else str(st)
-        part = n.get("partition", "-")
+        part_obj = n.get("partition", {})
+        part = part_obj.get("name", "-") if isinstance(part_obj, dict) else str(part_obj)
         cpus = n.get("cpus", {})
         if isinstance(cpus, dict):
             cpus_s = f"{cpus.get('idle','-')}/{cpus.get('total','-')} idle"
@@ -1921,7 +1950,9 @@ def build_page():
             cpus_s = str(cpus)
         mem = n.get("memory", {})
         if isinstance(mem, dict):
-            mem_s = f"{mem.get('free','-')}/{mem.get('total','-')} MiB free"
+            mem_min = mem.get("minimum", "-")
+            mem_max = mem.get("maximum", "-")
+            mem_s = f"{mem_min}-{mem_max} MiB"
         else:
             mem_s = str(mem)
         node_rows += f"<tr><td>{nm}</td><td>{part}</td><td>{state_color(st)}</td><td>{cpus_s}</td><td>{mem_s}</td></tr>"
@@ -2034,6 +2065,10 @@ spec:
       - name: script
         configMap:
           name: slurmweb-script
+      - name: host-usr
+        hostPath:
+          path: /usr
+          type: Directory
       initContainers:
       - name: wait-munge
         image: busybox:latest
@@ -2043,14 +2078,20 @@ spec:
           mountPath: /var/run/munge
       containers:
       - name: slurmweb
-        image: ubuntu:22.04
+        image: ubuntu:24.04
         command:
-        - sh
+        - /bin/sh
         - -c
         - |
-          apt-get update -qq -o Acquire::ForceIPv4=true && \
-          apt-get install -y -qq -o Acquire::ForceIPv4=true python3 slurm-client munge 2>/dev/null
-          exec python3 /app/server.py
+          mkdir -p /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu
+          ln -sfn /hostfs/usr/lib/x86_64-linux-gnu/slurm-wlm /usr/lib/x86_64-linux-gnu/slurm-wlm 2>/dev/null || true
+          ln -sfn /hostfs/usr/lib/aarch64-linux-gnu/slurm-wlm /usr/lib/aarch64-linux-gnu/slurm-wlm 2>/dev/null || true
+          exec /hostfs/usr/bin/python3 /app/server.py
+        env:
+        - name: PATH
+          value: /hostfs/usr/bin:/hostfs/usr/sbin:/usr/local/bin:/usr/bin:/bin
+        - name: LD_LIBRARY_PATH
+          value: /hostfs/usr/lib/x86_64-linux-gnu/slurm-wlm:/hostfs/usr/lib/x86_64-linux-gnu:/hostfs/usr/lib/aarch64-linux-gnu/slurm-wlm:/hostfs/usr/lib/aarch64-linux-gnu
         volumeMounts:
         - name: munge-socket
           mountPath: /var/run/munge
@@ -2060,13 +2101,16 @@ spec:
         - name: script
           mountPath: /app
           readOnly: true
+        - name: host-usr
+          mountPath: /hostfs/usr
+          readOnly: true
         ports:
         - containerPort: 8090
         readinessProbe:
           httpGet:
             path: /
             port: 8090
-          initialDelaySeconds: 60
+          initialDelaySeconds: 10
           periodSeconds: 15
           timeoutSeconds: 10
           failureThreshold: 12
@@ -2099,10 +2143,6 @@ spec:
 			ks.Logger().Warnf("slurmweb manifest: %v: %s", err, out)
 		}
 	}
-	// Delete the old slurmrestd-only ingress at /slurm/ if it predates this split.
-	exec.Command("k3s", "kubectl", "-n", "slurm", "delete", "ingress",
-		"slurmrestd-ingress", "--ignore-not-found=true").Run()
-
 	ks.Logger().Info("SLURM web dashboard deployed — /slurm/ (HTML) /slurm/api/ (REST)")
 }
 
@@ -2131,13 +2171,12 @@ func (ks *K3sServer) deployRancher() error {
 	if !alreadyInstalled {
 	ks.Logger().Info("Installing Rancher management UI...")
 
-	// Use the node IP directly as the Rancher hostname.
-	// Rancher generates a self-signed TLS cert with the IP in the SAN, so
-	// https://IP:30444 works without any DNS dependency.  Using .nip.io was
-	// unnecessary and caused confusing .nip.io references in Rancher's own UI.
+	// Use nip.io to turn the raw IP into a valid DNS hostname.
+	// Kubernetes 1.28+ rejects raw IPs in Ingress spec.rules[0].host.
+	// nip.io is a public wildcard DNS: 100-102-126-31.nip.io → 100.102.126.31.
 	rancherHost := "rancher.cluster.local"
 	if ks.nodeIP != "" {
-		rancherHost = ks.nodeIP
+		rancherHost = strings.ReplaceAll(ks.nodeIP, ".", "-") + ".nip.io"
 	}
 
 	helmPath := "/usr/local/bin/helm"
@@ -2204,40 +2243,15 @@ spec:
 	applyCmd.Stdin = strings.NewReader(rancherNPYAML)
 	applyCmd.Run()
 
-	// Add a convenience /rancher redirect ingress so http://IP:30080/rancher → Rancher.
-	// Rancher can't serve at a subpath (it uses absolute redirects internally),
-	// so we issue a 302 redirect to the NodePort URL instead of proxying.
-	// Use nginx $host variable so the redirect target matches whichever IP the
-	// client used to reach the cluster (LAN IP, Tailscale IP, or hostname) —
-	// the same $host is always reachable by the browser making the request.
-	rancherRedirectYAML := `apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: rancher-path-redirect
-  namespace: cattle-system
-  annotations:
-    nginx.ingress.kubernetes.io/temporal-redirect: "https://$host:30444"
-    nginx.ingress.kubernetes.io/ssl-redirect: "false"
-spec:
-  ingressClassName: nginx
-  rules:
-  - http:
-      paths:
-      - path: /rancher
-        pathType: Prefix
-        backend:
-          service:
-            name: rancher
-            port:
-              number: 443
-`
-	redirectCmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
-	redirectCmd.Stdin = strings.NewReader(rancherRedirectYAML)
-	if output, err := redirectCmd.CombinedOutput(); err != nil {
-		ks.Logger().Warnf("rancher path redirect ingress: %v: %s", err, output)
-	}
+	// Delete any stale rancher-path-redirect ingress from previous deploys.
+	// The /rancher path is now handled by the landing page Python default backend
+	// (which returns a proper 302 using the actual request Host header), so this
+	// nginx ingress is no longer needed and would intercept /rancher before the
+	// default backend gets a chance to redirect it correctly.
+	exec.Command("k3s", "kubectl", "-n", "cattle-system", "delete", "ingress",
+		"rancher-path-redirect", "--ignore-not-found=true").Run()
 
-	ks.Logger().Infof("Rancher NodePort 30444 and /rancher redirect applied (admin/admin)")
+	ks.Logger().Infof("Rancher NodePort 30444 applied (admin/admin)")
 	return nil
 }
 
