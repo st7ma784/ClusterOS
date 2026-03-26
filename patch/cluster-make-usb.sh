@@ -25,6 +25,7 @@
 # Prerequisites (auto-installed if missing):
 #   pv, tar, gzip — for progress + compression
 #   losetup, mount, umount, mkfs.fat, sgdisk — for USB write mode
+#   qemu-utils (qemu-img) — for converting Ubuntu cloud image from qcow2 to raw
 
 set -euo pipefail
 
@@ -241,19 +242,40 @@ if [[ -z "$DEVICE" && -z "$OUTPUT" && -z "$BUNDLE_DIR_ARG" ]]; then
     echo -e "  ${YELLOW}No --device specified. Scanning for USB drives...${NC}"
     echo ""
 
-    # Detect boot device to exclude
+    # Detect boot device to exclude.
+    # lsblk PKNAME fails for LVM/dm-crypt/overlay roots, so use two methods:
+    # 1. PKNAME lookup (works for simple partitions)
+    # 2. Check if any partitions/children of the device are currently mounted
     BOOT_DEV=""
     ROOT_MOUNT=$(findmnt -n -o SOURCE / 2>/dev/null || true)
     if [[ -n "$ROOT_MOUNT" ]]; then
-        BOOT_DEV=$(lsblk -n -o PKNAME "$ROOT_MOUNT" 2>/dev/null | head -1 || true)
-        [[ -n "$BOOT_DEV" ]] && BOOT_DEV="/dev/$BOOT_DEV"
+        _pkname=$(lsblk -n -o PKNAME "$ROOT_MOUNT" 2>/dev/null | head -1 || true)
+        [[ -n "$_pkname" ]] && BOOT_DEV="/dev/$_pkname"
     fi
+
+    # Helper: returns 0 if the given disk has any mounted partitions/children
+    _disk_is_mounted() {
+        local d="$1"
+        # Direct partition match (e.g. /dev/sda1, /dev/nvme0n1p1)
+        if grep -qE "^${d}p?[0-9]" /proc/mounts 2>/dev/null; then return 0; fi
+        # lsblk children (catches LVM PVs, dm-crypt, etc.)
+        while IFS= read -r child; do
+            grep -q "^/dev/$child " /proc/mounts 2>/dev/null && return 0
+        done < <(lsblk -ln -o NAME "$d" 2>/dev/null | tail -n +2)
+        return 1
+    }
 
     declare -a _DEVS _DEVINFO
     _IDX=0
     for _dev in /dev/sd? /dev/nvme?n?; do
         [[ -b "$_dev" ]] || continue
         [[ "$_dev" = "$BOOT_DEV" ]] && continue
+        # Also skip any disk that has mounted partitions (catches LVM/dm roots
+        # where PKNAME lookup above may have returned empty)
+        if _disk_is_mounted "$_dev"; then
+            [[ -z "$BOOT_DEV" ]] && BOOT_DEV="$_dev"
+            continue
+        fi
         _removable=$(cat "/sys/block/$(basename "$_dev")/removable" 2>/dev/null || echo 0)
         _tran=$(lsblk -d -n -o TRAN "$_dev" 2>/dev/null || echo "")
         _size_b=$(lsblk -b -d -n -o SIZE "$_dev" 2>/dev/null || echo 0)
@@ -317,9 +339,19 @@ if [[ -n "$DEVICE" ]]; then
         exit 1
     fi
 
-    # Safety check: refuse if device is mounted
-    if grep -q "^$DEVICE" /proc/mounts 2>/dev/null; then
-        err "$DEVICE or one of its partitions is currently mounted — unmount first"
+    # Unmount any mounted partitions of the target device before writing.
+    # Partitions can be auto-mounted by udisks2 or left from a previous partial run.
+    _mounted=$(grep -E "^${DEVICE}p?[0-9]" /proc/mounts 2>/dev/null | awk '{print $2}' | sort -r || true)
+    if [[ -n "$_mounted" ]]; then
+        warn "$DEVICE has mounted partitions — unmounting automatically..."
+        while IFS= read -r _mnt; do
+            umount "$_mnt" 2>/dev/null && ok "Unmounted $_mnt" \
+                || { err "Cannot unmount $_mnt — please run: sudo umount $_mnt"; exit 1; }
+        done <<< "$_mounted"
+    fi
+    # Sanity check: if the device itself appears as a root/boot mount, refuse
+    if grep -qE "^${DEVICE} " /proc/mounts 2>/dev/null; then
+        err "$DEVICE is directly mounted — this looks like a system disk, not a USB target"
         exit 1
     fi
 
@@ -345,13 +377,22 @@ if [[ -n "$DEVICE" ]]; then
         ok "Base image ready: $(du -h "$_IMG_TMP" | cut -f1)"
 
         step "3-prep/4" "Preparing working image (expand to 8 GB for packages)"
-        cp "$_IMG_TMP" "$_IMG_WORK"
+        # Ubuntu cloud images use qcow2 format despite the .img extension.
+        # losetup treats the file as raw, so sfdisk finds no partition table →
+        # "failed to dump sfdisk info for /dev/loopN" → no /dev/loopNpX devices.
+        # Fix: convert to raw format first.
+        if ! command -v qemu-img &>/dev/null; then
+            apt-get -o Acquire::ForceIPv4=true install -y -qq qemu-utils || { err "qemu-utils install failed — cannot convert cloud image"; exit 1; }
+        fi
+        ok "Converting qcow2 → raw (this takes ~30s, image is ~2 GB expanded)"
+        qemu-img convert -f qcow2 -O raw "$_IMG_TMP" "$_IMG_WORK"
         # Expand to 8 GB so there's room for all packages
         truncate -s 8G "$_IMG_WORK"
         # Set up loop device for the working image
         _LOOP=$(losetup --find --show --partscan "$_IMG_WORK")
         ok "Loop device: $_LOOP"
-        sleep 1
+        # Wait for udev to create partition block devices (more reliable than sleep)
+        udevadm settle --timeout=10 2>/dev/null || sleep 3
         # Grow the root partition to fill the image (cloud images use partition 1)
         _ROOT_PART="${_LOOP}p1"
         if [[ ! -b "$_ROOT_PART" ]]; then _ROOT_PART="${_LOOP}p2"; fi
@@ -394,6 +435,30 @@ if [[ -n "$DEVICE" ]]; then
             warn "99-clusteros.yaml not in bundle — WiFi may not work on new nodes"
         fi
 
+        # ── Verify host internet connectivity before entering chroot ─────────────
+        # The chroot uses the HOST's network stack. If the host can't reach the
+        # internet (e.g. k3s overwrote /etc/resolv.conf with 10.43.0.10 and
+        # CoreDNS is down), apt-get update will silently fail and then package
+        # installs fail with "Unable to locate package".
+        _HOST_DNS_FIXED=false
+        if ! getent hosts archive.ubuntu.com &>/dev/null 2>&1; then
+            warn "Host DNS broken (likely k3s CoreDNS at $(grep nameserver /etc/resolv.conf 2>/dev/null | head -1 | awk '{print $2}') is unreachable)"
+            warn "Temporarily injecting 8.8.8.8 into host /etc/resolv.conf for provisioning..."
+            _orig_resolv=$(cat /etc/resolv.conf 2>/dev/null || true)
+            printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+            _HOST_DNS_FIXED=true
+            # Verify it worked
+            if ! getent hosts archive.ubuntu.com &>/dev/null 2>&1; then
+                # Restore and fail — no point entering chroot without internet
+                echo "$_orig_resolv" > /etc/resolv.conf 2>/dev/null || true
+                err "Cannot reach archive.ubuntu.com even with 8.8.8.8 — check this node's internet connection"
+                err "Try: ping 8.8.8.8    (basic connectivity)"
+                err "Try: curl -v http://archive.ubuntu.com/  (HTTP reachability)"
+                exit 1
+            fi
+            ok "Host DNS restored via 8.8.8.8 — internet reachable"
+        fi
+
         # ── Fix DNS in chroot for apt/curl ────────────────────────────────────
         # Ubuntu 24.04 /etc/resolv.conf is a symlink to an absolute path
         # (/run/systemd/resolve/stub-resolv.conf). Writing through the symlink
@@ -403,10 +468,32 @@ if [[ -n "$DEVICE" ]]; then
         printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > "$_MNT/etc/resolv.conf"
         ok "Chroot DNS set to 8.8.8.8 (symlink replaced with real file)"
 
+        # ── apt-get update with retry ─────────────────────────────────────────
+        # Run update separately so a transient DNS failure doesn't leave us
+        # trying to install from a broken/empty package index.
+        _APT_UPDATED=false
+        for _attempt in 1 2 3; do
+            if chroot "$_MNT" apt-get -o Acquire::ForceIPv4=true update -qq 2>&1; then
+                _APT_UPDATED=true
+                break
+            fi
+            warn "apt-get update attempt $_attempt/3 failed — retrying in 5s..."
+            sleep 5
+        done
+        if [[ "$_APT_UPDATED" != "true" ]]; then
+            # Restore host DNS if we changed it, then bail
+            if [[ "$_HOST_DNS_FIXED" == "true" ]]; then
+                echo "$_orig_resolv" > /etc/resolv.conf 2>/dev/null || true
+            fi
+            err "apt-get update failed after 3 attempts — cannot install packages"
+            err "The USB image will be incomplete. Fix internet access on this node and retry."
+            exit 1
+        fi
+        ok "apt-get update succeeded"
+
         # Install all dependencies via chroot apt
         chroot "$_MNT" /bin/bash -c "
             export DEBIAN_FRONTEND=noninteractive
-            apt-get -o Acquire::ForceIPv4=true update -qq
             apt-get -o Acquire::ForceIPv4=true install -y -qq \
                 openssh-server jq curl wget munge slurm-wlm slurm-client \
                 libpmix-dev openmpi-bin libopenmpi-dev python3-mpi4py \
@@ -428,6 +515,7 @@ if [[ -n "$DEVICE" ]]; then
         " && ok "clusteros user created (password: clusteros, sudo NOPASSWD)" || warn "User setup failed"
 
         # Install Tailscale inside chroot
+        # NOTE: keep host DNS fix in place until after ALL curl operations below
         chroot "$_MNT" /bin/bash -c "
             curl -fsSL https://tailscale.com/install.sh | sh
             systemctl enable tailscaled
@@ -438,10 +526,30 @@ if [[ -n "$DEVICE" ]]; then
             curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_ENABLE=true INSTALL_K3S_SKIP_START=true sh -
         " && ok "k3s installed" || warn "k3s install failed — node will retry on first boot"
 
-        # Leave 8.8.8.8 as the resolv.conf for runtime too.
-        # netplan/systemd-resolved will replace it once the system is running;
-        # having a working fallback ensures apt/curl work on first boot before
-        # systemd-resolved has started.
+        # Restore host /etc/resolv.conf now that all network operations are done
+        if [[ "$_HOST_DNS_FIXED" == "true" ]]; then
+            echo "$_orig_resolv" > /etc/resolv.conf 2>/dev/null || true
+            ok "Host /etc/resolv.conf restored"
+        fi
+
+        # ── Fix DNS on the booted image ───────────────────────────────────────
+        # On first boot, systemd-resolved starts before DHCP completes and may
+        # use a stub resolver that doesn't work yet. Set FallbackDNS so the
+        # booted node can always resolve names even before DHCP DNS arrives.
+        mkdir -p "$_MNT/etc/systemd"
+        cat >> "$_MNT/etc/systemd/resolved.conf" <<'RESOLVEDCONF'
+
+# ClusterOS: ensure public DNS fallback so apt/curl work on first boot
+# even before DHCP-provided DNS is available (or if k3s CoreDNS is down).
+[Resolve]
+FallbackDNS=8.8.8.8 1.1.1.1
+DNSStubListener=yes
+RESOLVEDCONF
+        ok "systemd-resolved FallbackDNS=8.8.8.8 configured in image"
+
+        # Leave 8.8.8.8 as the resolv.conf for runtime too — systemd-resolved
+        # will replace the nameserver entry once it starts, but this ensures
+        # DNS works in early boot before systemd-resolved is up.
         ok "resolv.conf left as 8.8.8.8 for first-boot network operations"
 
         # Install cluster-os-install: dd USB→internal disk, resize to fill, fix UEFI boot

@@ -1697,12 +1697,11 @@ spec:
     targetPort: 8080
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: DaemonSet
 metadata:
   name: clusteros-landing
   namespace: ingress-nginx
 spec:
-  replicas: 1
   selector:
     matchLabels:
       app: clusteros-landing
@@ -1712,6 +1711,11 @@ spec:
         app: clusteros-landing
     spec:
       serviceAccountName: clusteros-landing
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+      - operator: Exists
+        effect: NoExecute
       containers:
       - name: landing
         image: python:3.12-alpine
@@ -1749,7 +1753,7 @@ spec:
 
 	// Restart the landing page pod so it picks up any ConfigMap script changes.
 	exec.Command("k3s", "kubectl", "-n", "ingress-nginx", "rollout", "restart",
-		"deployment/clusteros-landing").Run()
+		"daemonset/clusteros-landing").Run()
 
 	// Patch the nginx-ingress-controller DaemonSet to use the landing page as its
 	// global default backend — requests not matched by any Ingress rule hit the landing

@@ -25,6 +25,7 @@
 #   new daemons talking to each other.
 
 set -e
+trap 'echo "  [apply-patch ERR] line $LINENO exited $?" >&2' ERR
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -768,7 +769,7 @@ while IFS= read -r disk; do
     if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
         ok "Extra disk $DEV already mounted at $MOUNT_POINT"
         echo "$MOUNT_POINT" >> "$EXTRA_DISK_MANIFEST"
-        DISK_IDX=$((DISK_IDX + 1))
+        DISK_IDX=$(( DISK_IDX + 1 )) || true
         continue
     fi
 
@@ -786,7 +787,9 @@ while IFS= read -r disk; do
     fi
 
     # Only format if completely empty (no filesystem signature).
-    FS_TYPE=$(blkid -o value -s TYPE "$DEV" 2>/dev/null)
+    # blkid exits 2 when no filesystem is found — || true prevents set -e
+    # from killing the script; empty FS_TYPE is handled below.
+    FS_TYPE=$(blkid -o value -s TYPE "$DEV" 2>/dev/null || true)
     if [ -z "$FS_TYPE" ]; then
         ok "Formatting $DEV (ext4, unpartitioned disk, label=clusteros-disk-$DISK_IDX)..."
         if ! mkfs.ext4 -L "clusteros-disk-$DISK_IDX" -m 1 -q "$DEV" 2>/dev/null; then
@@ -816,16 +819,21 @@ while IFS= read -r disk; do
     DISK_SIZE=$(lsblk -d -n -o SIZE "$DEV" 2>/dev/null)
     ok "Mounted extra disk $DEV ($DISK_SIZE) → $MOUNT_POINT"
     echo "$MOUNT_POINT" >> "$EXTRA_DISK_MANIFEST"
-    DISK_IDX=$((DISK_IDX + 1))
+    DISK_IDX=$(( DISK_IDX + 1 )) || true
 done < <(lsblk -d -n -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
 
 if [ "$DISK_IDX" -gt 0 ]; then
     # /scratch → first extra disk (SLURM job scratch + general large-file use)
-    FIRST_EXTRA=$(head -1 "$EXTRA_DISK_MANIFEST")
-    mkdir -p "$FIRST_EXTRA/scratch"
-    if [ ! -L /scratch ]; then
-        ln -sfn "$FIRST_EXTRA/scratch" /scratch
-        ok "/scratch → $FIRST_EXTRA/scratch (SLURM scratch space)"
+    FIRST_EXTRA=$(head -1 "$EXTRA_DISK_MANIFEST" 2>/dev/null || true)
+    if [ -n "$FIRST_EXTRA" ]; then
+        mkdir -p "$FIRST_EXTRA/scratch" 2>/dev/null || true
+        if [ ! -L /scratch ]; then
+            # /scratch may exist as a plain directory from a previous run —
+            # ln -sfn cannot replace a directory; remove it first.
+            rmdir /scratch 2>/dev/null || rm -rf /scratch 2>/dev/null || true
+            ln -sfn "$FIRST_EXTRA/scratch" /scratch || true
+        fi
+        readlink /scratch >/dev/null 2>&1 && ok "/scratch → $(readlink /scratch) (SLURM scratch space)" || true
     fi
     ok "Extra disks: $DISK_IDX found — paths in $EXTRA_DISK_MANIFEST"
 else
@@ -1480,6 +1488,12 @@ resolv-conf: "/etc/clusteros/resolv.conf"
 # or nodes on different subnets). Tailscale provides a stable, encrypted overlay
 # that reaches all nodes regardless of physical network topology.
 flannel-iface: "tailscale0"
+# Increase etcd max request size from the default 1.5MB to 8MB.
+# Rancher Fleet bundles (Git repo deployments) store rendered manifests as single
+# etcd writes; large repos with many resources exceed the 3MB default and fail with
+# "Etcdserver: request is too large".  8MB covers typical Helm chart deployments.
+etcd-arg:
+  - "--max-request-bytes=8388608"
 K3SCFG
 ok "k3s config.yaml written → pause-image + resolv-conf + flannel-iface=tailscale0"
 
