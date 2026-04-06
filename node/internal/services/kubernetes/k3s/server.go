@@ -156,8 +156,13 @@ func (ks *K3sServer) Start() error {
 			args = append(args, "--tls-san", lanIP)
 		}
 	}
-	// Note: --flannel-iface tailscale0 is set via /etc/rancher/k3s/config.yaml
-	// (written by apply-patch.sh). Do NOT add it here to avoid duplicate flags.
+	// Note: --flannel-iface tailscale0 is set via /etc/rancher/k3s/config.yaml.
+	// Do NOT add it here to avoid duplicate flags.
+
+	// etcd-arg is server-only and must NOT be in config.yaml (shared with k3s agent).
+	// Passing it to k3s agent causes a fatal "flag provided but not defined" crash-loop.
+	// Inject it here for the server command line only.
+	args = append(args, "--etcd-arg=--max-request-bytes=8388608")
 
 	cmd := exec.Command("k3s", args...)
 	cmd.Stdout = os.Stdout
@@ -436,6 +441,14 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 
 	if err := ks.deployRancher(); err != nil {
 		ks.Logger().Warnf("Failed to deploy Rancher: %v", err)
+	} else {
+		// Apply declarative Helm repos — runs every startup so repos survive full rebuilds.
+		// Blocks briefly (waits for CRD) but runs after deployRancher so Rancher is up.
+		go ks.applyRancherCatalogs()
+
+		// Install rancher-backup operator and configure scheduled snapshots.
+		// Runs in background; also triggers auto-restore if a backup exists in the PVC.
+		go ks.deployRancherBackup()
 	}
 
 	// NOTE: we deliberately do NOT deploy a path:/ catchall Rancher ingress here.
@@ -1487,12 +1500,19 @@ roleRef:
 	// CSS {{/}} in the f-string are Python's way of writing literal { } inside an f-string.
 	const pythonScript = `#!/usr/bin/env python3
 """ClusterOS dynamic landing page — auto-discovers every Kubernetes NodePort service."""
-import http.server, json, ssl, urllib.request, os
+import http.server, json, ssl, urllib.request, os, socket
 
-TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+TOKEN_FILE  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 CACERT_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-API_BASE    = "https://kubernetes.default.svc"
 NODE_IP     = os.environ.get("NODE_IP", "localhost")  # fallback only
+
+# Use KUBERNETES_SERVICE_HOST env var (always injected by k3s into every pod)
+# so we bypass CoreDNS entirely.  This prevents readiness-probe timeouts after
+# cluster resets when CoreDNS is still catching up.
+_K8S_HOST = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+_K8S_PORT = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS",
+            os.environ.get("KUBERNETES_SERVICE_PORT", "443"))
+API_BASE   = f"https://{_K8S_HOST}:{_K8S_PORT}"
 
 # Human-readable labels for known ingress paths.
 INGRESS_LABELS = {
@@ -1502,6 +1522,24 @@ INGRESS_LABELS = {
     "/slurm/api": ("SLURM REST API",       "REST / JSON"),
     "/jupyter":   ("JupyterHub",           "Notebook UI"),
 }
+
+# NodePort to probe (TCP connect) for each ingress path.
+# Used to show live up/down status on the landing page.
+PROBE_PORT = {
+    "/rancher":   30444,
+    "/longhorn":  30900,
+    "/slurm/api": 30819,
+    "/jupyter":   30888,
+}
+
+
+def port_open(host, port, timeout=2):
+    """TCP connect check — fast, no TLS handshake needed."""
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def k8s_get(path):
@@ -1556,23 +1594,37 @@ def collect_nodeports(req_host):
             if not np or np in SKIP_NP:
                 continue
             scheme = "https" if np in (30443, 30444) else "http"
-            rows.append((ns, name, np, p.get("name", ""), f"{scheme}://{req_host}:{np}"))
+            up = port_open(req_host, np)
+            rows.append((ns, name, np, p.get("name", ""), f"{scheme}://{req_host}:{np}", up))
     rows.sort()
     return rows, api_err
+
+
+def status_dot(up):
+    """Colored circle: green = up, red = down/starting."""
+    if up is True:
+        return "<span class='dot up' title='Service responding'>&#9679;</span>"
+    if up is False:
+        return "<span class='dot down' title='Not yet reachable — may still be deploying'>&#9679;</span>"
+    return "<span class='dot unknown' title='Status unknown'>&#9679;</span>"
 
 
 def build_page(req_host):
     ingresses         = collect_ingresses()
     nodeports, np_err = collect_nodeports(req_host)
 
-    # Web interfaces section (ingress-based).
+    # Web interfaces section (ingress-based) with live status dots.
     ing_rows = ""
     for path, label, desc in ingresses:
+        probe = PROBE_PORT.get(path)
+        up    = port_open(req_host, probe) if probe else None
+        dot   = status_dot(up)
+        dim   = " style='opacity:.45'" if up is False else ""
         ing_rows += (
             f"<tr>"
-            f"<td><b><a href='{path}' target='_blank'>{label}</a></b></td>"
+            f"<td>{dot} <b><a href='{path}' target='_blank'{dim}>{label}</a></b></td>"
             f"<td><span class='desc'>{desc}</span></td>"
-            f"<td><a href='{path}' target='_blank'>{path}</a></td>"
+            f"<td><a href='{path}' target='_blank'{dim}>{path}</a></td>"
             f"</tr>"
         )
     if not ing_rows:
@@ -1580,13 +1632,15 @@ def build_page(req_host):
 
     # NodePort direct-access section.
     np_rows = ""
-    for ns, name, np, pn, url in nodeports:
+    for ns, name, np, pn, url, up in nodeports:
         label = f"{name} / {pn}" if pn else name
+        dot   = status_dot(up)
+        dim   = " style='opacity:.45'" if not up else ""
         np_rows += (
             f"<tr>"
             f"<td><span class='ns'>{ns}</span></td>"
-            f"<td><b>{label}</b></td>"
-            f"<td><a href='{url}' target='_blank'>:{np}</a></td>"
+            f"<td>{dot} <b>{label}</b></td>"
+            f"<td><a href='{url}' target='_blank'{dim}>:{np}</a></td>"
             f"</tr>"
         )
     if not np_rows:
@@ -1610,6 +1664,10 @@ tr:hover td{{background:#1e293b}}
 a{{color:#34d399;text-decoration:none}}a:hover{{text-decoration:underline}}
 .ns{{color:#64748b;font-size:.8em}}
 .desc{{color:#94a3b8;font-size:.85em}}
+.dot{{font-size:.7em;margin-right:5px}}
+.dot.up{{color:#22c55e}}
+.dot.down{{color:#ef4444}}
+.dot.unknown{{color:#f59e0b}}
 .err{{background:#450a0a;border:1px solid #7f1d1d;border-radius:6px;
       padding:12px 16px;margin:16px 0;color:#fca5a5;font-size:.9em}}
 .empty{{color:#475569;font-style:italic;padding:16px 14px}}
@@ -2215,22 +2273,84 @@ func (ks *K3sServer) deployCertManager() error {
 	return nil
 }
 
-func (ks *K3sServer) deployRancher() error {
-	alreadyInstalled := exec.Command("k3s", "kubectl", "-n", "cattle-system", "get", "deployment", "rancher").Run() == nil
+// ensureRancherDataPVC ensures the rancher-data PVC exists in cattle-system.
+// On a normal deploy this is a no-op (PVC already Bound).
+// On a fresh cluster after an etcd wipe the PV object is gone, but longhorn-ha
+// has reclaimPolicy=Retain so the underlying Longhorn volume (with cattle.db) is
+// still on disk.  We find any Released PV that previously backed rancher-data and
+// clear its claimRef so it becomes Available again, then create a PVC that binds to it.
+// This recovers Rancher's SQLite DB — repos, API keys, and all configuration — without
+// reinstalling from scratch.
+func (ks *K3sServer) ensureRancherDataPVC() error {
+	const ns = "cattle-system"
 
-	if !alreadyInstalled {
-	ks.Logger().Info("Installing Rancher management UI...")
+	// Ensure namespace exists first.
+	exec.Command("k3s", "kubectl", "create", "namespace", ns,
+		"--dry-run=client", "-o", "yaml").Run()
+	nsCmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	nsCmd.Stdin = strings.NewReader("apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + ns + "\n")
+	nsCmd.Run()
 
-	// Pre-create cattle-system namespace and rancher-data PVC so Rancher's
-	// embedded SQLite DB survives pod rescheduling to a different node.
-	// The PVC uses longhorn-ha (2 Longhorn replicas, Retain) so data is
-	// preserved even when the node that hosted the Rancher pod is lost.
-	rancherNSAndPVC := `apiVersion: v1
-kind: Namespace
+	// PVC already bound — nothing to do.
+	out, _ := exec.Command("k3s", "kubectl", "get", "pvc", "rancher-data",
+		"-n", ns, "-o", "jsonpath={.status.phase}").Output()
+	if strings.TrimSpace(string(out)) == "Bound" {
+		return nil
+	}
+
+	// Look for a Released PV backed by longhorn-ha that previously held rancher-data.
+	// The PV's claimRef records the original namespace/name.
+	pvList, _ := exec.Command("k3s", "kubectl", "get", "pv",
+		"-o", `jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.spec.claimRef.namespace}{"\t"}{.spec.claimRef.name}{"\t"}{.spec.storageClassName}{"\n"}{end}`).Output()
+
+	var releasedPV string
+	for _, line := range strings.Split(string(pvList), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) < 5 {
+			continue
+		}
+		pvName, phase, claimNS, claimName, sc := fields[0], fields[1], fields[2], fields[3], fields[4]
+		if phase == "Released" && claimNS == ns && claimName == "rancher-data" && sc == "longhorn-ha" {
+			releasedPV = pvName
+			break
+		}
+	}
+
+	if releasedPV != "" {
+		ks.Logger().Infof("Found released rancher-data PV %s — re-binding to recover Rancher DB", releasedPV)
+		// Clear the claimRef so the PV becomes Available and can be re-bound.
+		patchCmd := exec.Command("k3s", "kubectl", "patch", "pv", releasedPV,
+			"--type=json",
+			`-p=[{"op":"remove","path":"/spec/claimRef"}]`)
+		if out, err := patchCmd.CombinedOutput(); err != nil {
+			ks.Logger().Warnf("patch PV claimRef: %v: %s", err, out)
+		}
+		// Create a PVC that binds specifically to this PV (volumeName selector).
+		pvcYAML := fmt.Sprintf(`apiVersion: v1
+kind: PersistentVolumeClaim
 metadata:
-  name: cattle-system
----
-apiVersion: v1
+  name: rancher-data
+  namespace: %s
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn-ha
+  volumeName: %s
+  resources:
+    requests:
+      storage: 5Gi
+`, ns, releasedPV)
+		cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(pvcYAML)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("re-bind PVC to released PV: %w: %s", err, out)
+		}
+		ks.Logger().Infof("rancher-data PVC re-bound to existing PV %s (Rancher DB recovered)", releasedPV)
+		return nil
+	}
+
+	// No existing PV — create a fresh PVC (new cluster or first install).
+	ks.Logger().Info("Creating new rancher-data PVC (fresh cluster)")
+	pvcYAML := `apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: rancher-data
@@ -2242,12 +2362,27 @@ spec:
     requests:
       storage: 5Gi
 `
-	applyPVCCmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
-	applyPVCCmd.Stdin = strings.NewReader(rancherNSAndPVC)
-	if out, err := applyPVCCmd.CombinedOutput(); err != nil {
-		ks.Logger().Warnf("rancher-data PVC pre-create: %v — %s (continuing)", err, string(out))
-	} else {
-		ks.Logger().Info("rancher-data PVC pre-created in cattle-system")
+	cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(pvcYAML)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("create rancher-data PVC: %w: %s", err, out)
+	}
+	return nil
+}
+
+func (ks *K3sServer) deployRancher() error {
+	alreadyInstalled := exec.Command("k3s", "kubectl", "-n", "cattle-system", "get", "deployment", "rancher").Run() == nil
+
+	if !alreadyInstalled {
+	ks.Logger().Info("Installing Rancher management UI...")
+
+	// Pre-create the rancher-data PVC backed by Longhorn (2 replicas, Retain reclaim).
+	// On a fresh cluster after an etcd wipe the PV object is gone but the Longhorn
+	// volume may still have data on disk.  We check for Released PVs first and
+	// re-bind to any that were the rancher-data PVC — this recovers the SQLite DB
+	// (including repos, API keys) without running helm install from scratch.
+	if err := ks.ensureRancherDataPVC(); err != nil {
+		ks.Logger().Warnf("rancher-data PVC: %v (continuing)", err)
 	}
 
 	// Use nip.io to turn the raw IP into a valid DNS hostname.
@@ -2329,15 +2464,276 @@ spec:
 	applyCmd.Run()
 
 	// Delete any stale rancher-path-redirect ingress from previous deploys.
-	// The /rancher path is now handled by the landing page Python default backend
-	// (which returns a proper 302 using the actual request Host header), so this
-	// nginx ingress is no longer needed and would intercept /rancher before the
-	// default backend gets a chance to redirect it correctly.
 	exec.Command("k3s", "kubectl", "-n", "cattle-system", "delete", "ingress",
 		"rancher-path-redirect", "--ignore-not-found=true").Run()
 
+	// Create a /rancher ingress in the ingress-nginx namespace so that
+	// collect_ingresses() on the landing page lists "Rancher" in the Web Interfaces
+	// table on every node.  nginx routes /rancher to the clusteros-landing service,
+	// which 302-redirects to https://<req_host>:30444 using the client's actual IP —
+	// so the link works from both LAN and Tailscale.
+	const rancherPathYAML = `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rancher-path-ingress
+  namespace: ingress-nginx
+spec:
+  ingressClassName: nginx
+  rules:
+  - http:
+      paths:
+      - path: /rancher
+        pathType: Prefix
+        backend:
+          service:
+            name: clusteros-landing
+            port:
+              number: 80
+`
+	rancherPathCmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	rancherPathCmd.Stdin = strings.NewReader(rancherPathYAML)
+	if out, err := rancherPathCmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("rancher-path-ingress: %v: %s", err, out)
+	}
+
 	ks.Logger().Infof("Rancher NodePort 30444 applied (admin/admin)")
 	return nil
+}
+
+// applyRancherCatalogs re-applies Helm repository definitions as ClusterRepo CRDs on every
+// leader startup.  Because these are applied unconditionally (not gated on alreadyInstalled),
+// the repos survive full cluster rebuilds — they are re-created from code without any manual
+// intervention.  Add or remove repos here; the change takes effect on the next leader start.
+func (ks *K3sServer) applyRancherCatalogs() {
+	// Wait for Rancher's catalog CRD to exist (Rancher must be running first).
+	ks.Logger().Info("Waiting for Rancher catalog CRD to be available...")
+	deadline := time.Now().Add(10 * time.Minute)
+	for time.Now().Before(deadline) {
+		if exec.Command("k3s", "kubectl", "get", "crd",
+			"clusterrepos.catalog.cattle.io").Run() == nil {
+			break
+		}
+		time.Sleep(20 * time.Second)
+	}
+	if exec.Command("k3s", "kubectl", "get", "crd",
+		"clusterrepos.catalog.cattle.io").Run() != nil {
+		ks.Logger().Warn("Rancher catalog CRD not available — skipping catalog apply")
+		return
+	}
+
+	// ── Declare your Helm repos here ────────────────────────────────────────────
+	// Each ClusterRepo is applied with kubectl apply (idempotent).  Add a new
+	// `---` separated block to persist an additional repo across rebuilds.
+	const catalogsYAML = `apiVersion: catalog.cattle.io/v1
+kind: ClusterRepo
+metadata:
+  name: rancher-stable
+spec:
+  url: https://releases.rancher.com/server-charts/stable
+---
+apiVersion: catalog.cattle.io/v1
+kind: ClusterRepo
+metadata:
+  name: rancher-charts
+spec:
+  url: https://charts.rancher.io
+---
+apiVersion: catalog.cattle.io/v1
+kind: ClusterRepo
+metadata:
+  name: bitnami
+spec:
+  url: https://charts.bitnami.com/bitnami
+---
+apiVersion: catalog.cattle.io/v1
+kind: ClusterRepo
+metadata:
+  name: ingress-nginx
+spec:
+  url: https://kubernetes.github.io/ingress-nginx
+`
+	cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(catalogsYAML)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("rancher catalogs apply: %v: %s", err, out)
+		return
+	}
+	ks.Logger().Info("Rancher catalogs applied (repos always in sync with code)")
+}
+
+// deployRancherBackup installs the rancher-backup-restore operator and configures
+// a scheduled backup to a Longhorn-backed PVC (longhorn-ha = Retain reclaim policy).
+//
+// On a full cluster rebuild (etcd wiped), the restore flow is:
+//   1. Fresh Rancher installed (empty DB)
+//   2. rancher-backup operator installed (this function)
+//   3. Operator detects existing backup files in the PVC (Longhorn volume survived)
+//   4. A Restore CR is created — Rancher merges the backed-up config into its DB
+//   5. applyRancherCatalogs() re-applies repos declaratively as a safety net
+//
+// Backup files are stored as <timestamp>.tar.gz in the PVC; the 5 most recent are kept.
+func (ks *K3sServer) deployRancherBackup() {
+	// Install rancher-backup CRDs + operator via Helm.
+	exec.Command("helm", "repo", "add", "rancher-charts",
+		"https://charts.rancher.io").Run()
+	exec.Command("helm", "repo", "update").Run()
+
+	alreadyInstalled := exec.Command("k3s", "kubectl", "-n", "cattle-resources-system",
+		"get", "deployment", "rancher-backup").Run() == nil
+
+	if !alreadyInstalled {
+		ks.Logger().Info("Installing rancher-backup operator...")
+		for _, chart := range []string{"rancher-backup-crd", "rancher-backup"} {
+			cmd := exec.Command("helm", "upgrade", "--install", chart,
+				"rancher-charts/"+chart,
+				"--namespace", "cattle-resources-system",
+				"--create-namespace",
+				"--kubeconfig", "/etc/rancher/k3s/k3s.yaml")
+			cmd.Env = append(os.Environ(), "KUBECONFIG=/etc/rancher/k3s/k3s.yaml")
+			if out, err := cmd.CombinedOutput(); err != nil {
+				ks.Logger().Warnf("helm install %s: %v: %s", chart, err, out)
+				return
+			}
+		}
+		ks.Logger().Info("rancher-backup operator installed")
+	}
+
+	// Ensure the backup storage PVC exists (longhorn-ha = 2 replicas, Retain reclaim).
+	const backupPVCYAML = `apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rancher-backup-storage
+  namespace: cattle-resources-system
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn-ha
+  resources:
+    requests:
+      storage: 10Gi
+`
+	applyPVC := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	applyPVC.Stdin = strings.NewReader(backupPVCYAML)
+	applyPVC.Run()
+
+	// Create a scheduled Backup resource (every 6 hours, keep 5 most recent).
+	// The operator writes <timestamp>.tar.gz files into the PVC.
+	const backupCRYAML = `apiVersion: resources.cattle.io/v1
+kind: Backup
+metadata:
+  name: clusteros-scheduled
+  namespace: cattle-resources-system
+spec:
+  schedule: "0 */6 * * *"
+  retentionCount: 5
+  storageLocation:
+    pvc:
+      claimName: rancher-backup-storage
+`
+	applyBackup := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	applyBackup.Stdin = strings.NewReader(backupCRYAML)
+	if out, err := applyBackup.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("rancher Backup CR: %v: %s", err, out)
+	} else {
+		ks.Logger().Info("Rancher backup schedule configured (every 6h → rancher-backup-storage PVC)")
+	}
+
+	// If this is a fresh Rancher install and backup files already exist in the PVC
+	// (from a previous cluster lifetime), create a Restore CR so Rancher recovers
+	// its repos, API keys, and other configuration automatically.
+	ks.maybeRestoreRancherBackup()
+}
+
+// maybeRestoreRancherBackup creates a Restore CR if:
+//   (a) no Restore has been attempted yet in this cluster lifetime, AND
+//   (b) backup files exist in the rancher-backup-storage PVC
+//
+// It identifies the latest backup by querying a temporary pod that mounts the PVC.
+func (ks *K3sServer) maybeRestoreRancherBackup() {
+	// Skip if a Restore already exists — don't restore twice.
+	out, _ := exec.Command("k3s", "kubectl", "get", "restore",
+		"-n", "cattle-resources-system", "--no-headers").Output()
+	if len(strings.TrimSpace(string(out))) > 0 {
+		return
+	}
+
+	// Spawn a short-lived pod to list backup files in the PVC.
+	const listerPodYAML = `apiVersion: v1
+kind: Pod
+metadata:
+  name: rancher-backup-lister
+  namespace: cattle-resources-system
+spec:
+  restartPolicy: Never
+  containers:
+  - name: lister
+    image: busybox:1.36
+    command: ["sh", "-c", "ls -1t /backup/*.tar.gz 2>/dev/null | head -1"]
+    volumeMounts:
+    - name: backup
+      mountPath: /backup
+  volumes:
+  - name: backup
+    persistentVolumeClaim:
+      claimName: rancher-backup-storage
+`
+	// Clean up any previous lister pod.
+	exec.Command("k3s", "kubectl", "delete", "pod", "rancher-backup-lister",
+		"-n", "cattle-resources-system", "--ignore-not-found=true").Run()
+
+	applyPod := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	applyPod.Stdin = strings.NewReader(listerPodYAML)
+	if applyPod.Run() != nil {
+		return
+	}
+
+	// Wait up to 60s for the pod to complete.
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		phase, _ := exec.Command("k3s", "kubectl", "get", "pod", "rancher-backup-lister",
+			"-n", "cattle-resources-system",
+			"-o", "jsonpath={.status.phase}").Output()
+		if strings.TrimSpace(string(phase)) == "Succeeded" {
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+
+	logsOut, err := exec.Command("k3s", "kubectl", "logs", "rancher-backup-lister",
+		"-n", "cattle-resources-system").Output()
+	exec.Command("k3s", "kubectl", "delete", "pod", "rancher-backup-lister",
+		"-n", "cattle-resources-system", "--ignore-not-found=true").Run()
+
+	if err != nil {
+		return
+	}
+	backupFile := strings.TrimSpace(string(logsOut))
+	if backupFile == "" {
+		ks.Logger().Info("No existing rancher backup found — starting fresh")
+		return
+	}
+	// backupFile is the full path like /backup/2026-03-27T12:00:00Z.tar.gz;
+	// the Restore CR only needs the filename portion.
+	backupFilename := backupFile[strings.LastIndex(backupFile, "/")+1:]
+	ks.Logger().Infof("Found existing rancher backup: %s — creating Restore CR", backupFilename)
+
+	restoreCRYAML := fmt.Sprintf(`apiVersion: resources.cattle.io/v1
+kind: Restore
+metadata:
+  name: clusteros-restore
+  namespace: cattle-resources-system
+spec:
+  backupFilename: %s
+  storageLocation:
+    pvc:
+      claimName: rancher-backup-storage
+`, backupFilename)
+	applyRestore := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	applyRestore.Stdin = strings.NewReader(restoreCRYAML)
+	if out, err := applyRestore.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("rancher Restore CR: %v: %s", err, out)
+	} else {
+		ks.Logger().Infof("Rancher Restore CR created — waiting for operator to restore config...")
+	}
 }
 
 // createRancherCatchallIngress adds a wildcard ingress rule (no Host filter) so that

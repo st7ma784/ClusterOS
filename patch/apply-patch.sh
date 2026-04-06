@@ -1488,13 +1488,12 @@ resolv-conf: "/etc/clusteros/resolv.conf"
 # or nodes on different subnets). Tailscale provides a stable, encrypted overlay
 # that reaches all nodes regardless of physical network topology.
 flannel-iface: "tailscale0"
-# Increase etcd max request size from the default 1.5MB to 8MB.
-# Rancher Fleet bundles (Git repo deployments) store rendered manifests as single
-# etcd writes; large repos with many resources exceed the 3MB default and fail with
-# "Etcdserver: request is too large".  8MB covers typical Helm chart deployments.
-etcd-arg:
-  - "--max-request-bytes=8388608"
 K3SCFG
+# etcd-arg is a SERVER-ONLY flag and must NOT appear in config.yaml (which is
+# shared with k3s agent).  Passing it to k3s agent causes:
+#   level=fatal msg="flag provided but not defined: -etcd-arg"
+# and a crash-loop on every worker node.  The flag is instead injected into the
+# k3s server Start() command-line args by the node-agent (server.go).
 ok "k3s config.yaml written → pause-image + resolv-conf + flannel-iface=tailscale0"
 
 # Layer 2: containerd rewrite rule — redirects pause image pulls at network level.

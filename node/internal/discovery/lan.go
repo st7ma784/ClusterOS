@@ -296,6 +296,12 @@ func (sd *SerfDiscovery) watchNeighbours(ctx context.Context) {
 			continue
 		}
 
+		// recentJoins deduplicates ARP events: the kernel oscillates STALE↔REACHABLE
+		// for every ARP refresh (~30s), generating repeated events for stable peers.
+		// We skip re-joining an IP if we already successfully joined it within 5 min.
+		recentJoins := make(map[string]time.Time)
+		var recentMu sync.Mutex
+
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -318,8 +324,16 @@ func (sd *SerfDiscovery) watchNeighbours(ctx context.Context) {
 			if tailscaleRange.Contains(ip) {
 				continue
 			}
-			// Probe async so we don't block the monitor loop.
+			// Dedup: skip if we joined this IP within the last 5 minutes.
 			ipStr := fields[0]
+			recentMu.Lock()
+			last, seen := recentJoins[ipStr]
+			if seen && time.Since(last) < 5*time.Minute {
+				recentMu.Unlock()
+				continue
+			}
+			recentMu.Unlock()
+			// Probe async so we don't block the monitor loop.
 			go func() {
 				if probeSerfPort(ipStr) {
 					sd.logger.Infof("[lan-neigh] New neighbour %s has Serf port open — joining", ipStr)
@@ -327,6 +341,9 @@ func (sd *SerfDiscovery) watchNeighbours(ctx context.Context) {
 						sd.logger.Debugf("[lan-neigh] join %s: %d joined, err: %v", ipStr, n, err)
 					} else if n > 0 {
 						sd.logger.Infof("[lan-neigh] Joined cluster via new neighbour %s", ipStr)
+						recentMu.Lock()
+						recentJoins[ipStr] = time.Now()
+						recentMu.Unlock()
 					}
 				}
 			}()

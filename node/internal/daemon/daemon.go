@@ -2,14 +2,16 @@ package daemon
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -942,6 +944,21 @@ func (d *Daemon) runJoiningCP() error {
 
 	controllerIP := d.extractHost(k3sServerURL)
 
+	// Wait for the leader's k3s API to be genuinely ready before joining.
+	// A Serf "phase=ready" tag only means the leader published readiness; it does
+	// NOT mean the API is serving requests.  After a cluster-reset the leader's
+	// single-member etcd needs ~10-30s to elect itself before it can serve the
+	// API.  Starting a secondary k3s server before the API is ready causes a
+	// race where k3s adds the secondary as an etcd learner while etcd is still
+	// unstable, producing "authentication handshake failed: context deadline
+	// exceeded" and a permanent quorum loss.
+	leaderHost := d.extractHost(k3sServerURL)
+	d.logger.Infof("Verifying leader k3s API is truly ready at %s before joining CP...", leaderHost)
+	if err := d.waitForK3sAPIHTTP(leaderHost, 10*time.Minute); err != nil {
+		return fmt.Errorf("leader k3s API not ready: %w", err)
+	}
+	d.logger.Info("Leader k3s API confirmed ready — starting secondary k3s server")
+
 	d.logger.Infof("Starting k3s server in joining mode → %s", k3sServerURL)
 	k3sServer := k3s.NewK3sServerRoleJoining(nodeIP, k3sServerURL, k3sToken, d.logger)
 	if err := k3sServer.Start(); err != nil {
@@ -1517,6 +1534,47 @@ func (d *Daemon) extractHost(rawURL string) string {
 	return s
 }
 
+// waitForK3sAPIHTTP polls https://host:6443/healthz until the API server responds
+// with any HTTP status < 500.  This is stricter than a TCP connect: it confirms
+// the k3s API server is actually serving HTTP, not just that etcd is initialising
+// (which returns 503 or connection-refused before it is ready).
+//
+// NOTE: k3s v1.31+ requires authentication on /healthz and returns 401 for
+// unauthenticated requests.  We treat any non-5xx response as "ready" because a
+// 401 means the API server is up and processing requests — it is just asking us
+// to authenticate.  A 503 means etcd or the apiserver itself is not yet healthy.
+//
+// Callers in runJoiningCP MUST use this before starting a secondary k3s server to
+// prevent the etcd quorum race described in the CP join comments above.
+func (d *Daemon) waitForK3sAPIHTTP(host string, timeout time.Duration) error {
+	url := "https://" + host + ":6443/healthz"
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+	}
+	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode < 500 {
+				// Any 2xx or 4xx means the API server is up and handling HTTP.
+				// 401 = auth required (k3s v1.31+), 200 = fully healthy.
+				// Both indicate etcd has converged and the API is ready.
+				d.logger.Infof("Leader k3s API ready (HTTP %d)", resp.StatusCode)
+				return nil
+			}
+			lastErr = fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
+		} else {
+			lastErr = err
+		}
+		d.logger.Debugf("Leader k3s API not ready (%v) — retrying in 10s", lastErr)
+		time.Sleep(10 * time.Second)
+	}
+	return fmt.Errorf("timeout after %v: %w", timeout, lastErr)
+}
+
 // getLocalIP returns the Tailscale IP if available, otherwise the first usable IP.
 func (d *Daemon) getLocalIP() string {
 	if d.tailscale != nil {
@@ -2088,6 +2146,7 @@ func (d *Daemon) setupFirewallRules() error {
 		{"6819", "tcp", "SLURM slurmdbd"},
 		{"10250", "tcp", "Kubelet API"},
 		{"2379:2380", "tcp", "etcd"},
+		{"8090", "tcp", "slurmweb (hostNetwork, readiness probe)"},
 		{"30000:32767", "tcp", "K8s NodePort"},
 		{"30000:32767", "udp", "K8s NodePort"},
 	}
