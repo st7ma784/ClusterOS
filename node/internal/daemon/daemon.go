@@ -464,15 +464,10 @@ func (d *Daemon) computeReachableLeader() (string, bool) {
 		}
 		if k3sURL := m.Tags["k3s-server"]; k3sURL != "" {
 			host := d.extractHost(k3sURL)
-			if !strings.Contains(host, ":") {
-				host = host + ":6443"
-			}
-			conn, err := net.DialTimeout("tcp", host, 2*time.Second)
-			if err != nil {
+			if err := d.probeK3sHealthz(host, 2*time.Second); err != nil {
 				d.logger.Warnf("Election: excluding %s — k3s-server %s unreachable (%v)", m.Name, host, err)
 				continue
 			}
-			conn.Close()
 		}
 		candidates = append(candidates, candidate{name: m.Name})
 	}
@@ -496,8 +491,8 @@ func (d *Daemon) computeReachableLeader() (string, bool) {
 // the cluster leader — identified by having both phase=ready AND a non-empty
 // k3s-server tag (only the elected leader publishes that tag).
 // Workers also reach phase=ready but never publish k3s-server, so they are excluded.
-// Additionally confirms the candidate's k3s port (6443) is reachable so we don't
-// adopt a ghost leader whose Serf entry is still "alive" but the node is offline.
+// Additionally confirms the candidate's k3s API is healthy (200 from /healthz) so we
+// don't get stuck deferring to a leader whose k3s is open but returning 503 (boot loop).
 // Returns "" if no active leader exists (fresh cluster formation).
 func (d *Daemon) findRunningLeader() string {
 	for _, m := range d.discovery.Members() {
@@ -507,21 +502,34 @@ func (d *Daemon) findRunningLeader() string {
 		if m.Tags["phase"] != string(PhaseReady) || m.Tags["k3s-server"] == "" {
 			continue
 		}
-		// Confirm the leader is actually reachable before adopting it.
-		// This prevents adopting a node whose Serf entry is still "alive" but
-		// the machine is offline (e.g. a node that rebooted and hasn't rejoined yet).
+		// Confirm the leader's k3s API is genuinely healthy, not just TCP-open.
+		// A 503 from /healthz means k3s is booting or stuck — don't adopt as leader.
 		k3sURL := m.Tags["k3s-server"]
-		host := strings.TrimPrefix(k3sURL, "https://")
-		host = strings.TrimPrefix(host, "http://")
-		conn, err := net.DialTimeout("tcp", host, 2*time.Second)
-		if err != nil {
-			d.logger.Debugf("findRunningLeader: candidate %s k3s port unreachable (%v) — skipping", m.Name, err)
+		host := d.extractHost(k3sURL)
+		if err := d.probeK3sHealthz(host, 3*time.Second); err != nil {
+			d.logger.Debugf("findRunningLeader: candidate %s k3s not healthy (%v) — skipping", m.Name, err)
 			continue
 		}
-		conn.Close()
 		return m.Name
 	}
 	return ""
+}
+
+// probeK3sHealthz does a quick HTTP health check against the k3s /healthz endpoint.
+// Returns nil only if the server responds with 200 or 401 (API up, just needs auth).
+// 503 or connection error are treated as "not ready".
+func (d *Daemon) probeK3sHealthz(host string, timeout time.Duration) error {
+	tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	client := &http.Client{Transport: tr, Timeout: timeout}
+	resp, err := client.Get("https://" + host + ":6443/healthz")
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusUnauthorized {
+		return nil // 200=healthy, 401=auth required but API is up
+	}
+	return fmt.Errorf("HTTP %d", resp.StatusCode)
 }
 
 // findCompetingLeader returns the name of an alive Serf member that is ALSO
@@ -614,18 +622,9 @@ func (d *Daemon) runProvisioning() error {
 		return fmt.Errorf("read k3s token: %w", err)
 	}
 
-	// Distribute the actual running cluster CA cert via Serf user event.
-	// This eliminates the x509 "certificate signed by unknown authority" error
-	// when workers were patched with a different k3s-ca.crt than what the leader
-	// is actually using.  Workers install this cert before starting the k3s agent.
-	if caCert, err := k3sServer.ReadCACert(); err != nil {
-		d.logger.Warnf("Could not read cluster CA cert for distribution: %v", err)
-	} else if d.discovery != nil {
-		d.logger.Infof("Broadcasting cluster CA cert via Serf user event (%d bytes)", len(caCert))
-		if err := d.discovery.SendEvent("k3s-ca-cert", caCert, false); err != nil {
-			d.logger.Warnf("Failed to send k3s-ca-cert user event: %v", err)
-		}
-	}
+	// NOTE: CA cert broadcast via Serf user event was removed — the cert is 1180 bytes
+	// which exceeds Serf's 512-byte user event limit.  apply-patch.sh pre-seeds the
+	// identical k3s-ca.crt on every node so broadcast distribution is unnecessary.
 
 	// Label this k8s node with its extra disk count so Longhorn registration
 	// can read it without needing SSH or Serf tag budget for path strings.
@@ -2109,13 +2108,10 @@ func (d *Daemon) writeStatusFile() {
 	}
 	d.mu.RUnlock()
 
-	// Refresh leader from elector in case it changed.
-	if d.leaderElector != nil {
-		if leader, err := d.leaderElector.GetLeader(); err == nil {
-			sd.Leader = leader
-		}
-		sd.IsLeader = d.leaderElector.IsLeader()
-	}
+	// d.isLeader and d.leaderName reflect the phase machine's actual election
+	// outcome (who actually runs k3s). Don't override with the simple lex elector
+	// which ignores k3s health and would report the wrong leader when the lex-winner
+	// deferred to another node that had a warm running k3s cluster.
 
 	jsonData, err := json.MarshalIndent(sd, "", "  ")
 	if err != nil {

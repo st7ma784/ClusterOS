@@ -1,6 +1,7 @@
 package k3s
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"fmt"
@@ -850,67 +851,48 @@ func detectLANIP() string {
 // The MetalLB speaker memberlist port is moved from 7946 (conflicts with Serf)
 // to 7476. On failure the caller falls back to NodePort-only access.
 func (ks *K3sServer) deployMetalLB() error {
-	if exec.Command("k3s", "kubectl", "-n", "metallb-system",
-		"get", "deployment", "controller").Run() == nil {
-		ks.Logger().Info("MetalLB already installed — skipping")
-		return nil
-	}
-	ks.Logger().Info("Installing MetalLB (Layer2 mode)...")
+	alreadyInstalled := exec.Command("k3s", "kubectl", "-n", "metallb-system",
+		"get", "deployment", "controller").Run() == nil
 
-	const metallbURL = "https://raw.githubusercontent.com/metallb/metallb/v0.14.8/config/manifests/metallb-native.yaml"
-	if out, err := exec.Command("k3s", "kubectl", "apply", "-f", metallbURL).CombinedOutput(); err != nil {
-		return fmt.Errorf("apply metallb manifest: %w: %s", err, out)
-	}
+	if !alreadyInstalled {
+		ks.Logger().Info("Installing MetalLB (Layer2 mode)...")
 
-	// Create the memberlist secret that MetalLB speakers require to form their gossip mesh.
-	// Without this, speakers stay in ContainerCreating indefinitely on fresh installs.
-	if exec.Command("k3s", "kubectl", "-n", "metallb-system", "get", "secret", "memberlist").Run() != nil {
-		keyBytes, err := exec.Command("openssl", "rand", "-base64", "128").Output()
-		if err != nil {
-			return fmt.Errorf("generate memberlist key: %w", err)
+		const metallbURL = "https://raw.githubusercontent.com/metallb/metallb/v0.14.8/config/manifests/metallb-native.yaml"
+		if out, err := exec.Command("k3s", "kubectl", "apply", "-f", metallbURL).CombinedOutput(); err != nil {
+			return fmt.Errorf("apply metallb manifest: %w: %s", err, out)
 		}
-		createCmd := exec.Command("k3s", "kubectl", "-n", "metallb-system", "create", "secret",
-			"generic", "memberlist", "--from-literal=secretkey="+strings.TrimSpace(string(keyBytes)))
-		if out, err := createCmd.CombinedOutput(); err != nil {
-			ks.Logger().Warnf("MetalLB memberlist secret creation failed: %v: %s (continuing)", err, out)
-		} else {
-			ks.Logger().Info("MetalLB memberlist secret created")
+
+		// Create the memberlist secret that MetalLB speakers require to form their gossip mesh.
+		// Without this, speakers stay in ContainerCreating indefinitely on fresh installs.
+		if exec.Command("k3s", "kubectl", "-n", "metallb-system", "get", "secret", "memberlist").Run() != nil {
+			keyBytes, err := exec.Command("openssl", "rand", "-base64", "128").Output()
+			if err != nil {
+				return fmt.Errorf("generate memberlist key: %w", err)
+			}
+			createCmd := exec.Command("k3s", "kubectl", "-n", "metallb-system", "create", "secret",
+				"generic", "memberlist", "--from-literal=secretkey="+strings.TrimSpace(string(keyBytes)))
+			if out, err := createCmd.CombinedOutput(); err != nil {
+				ks.Logger().Warnf("MetalLB memberlist secret creation failed: %v: %s (continuing)", err, out)
+			} else {
+				ks.Logger().Info("MetalLB memberlist secret created")
+			}
 		}
-	}
 
-	// Wait for controller Deployment to be ready (up to 3 min).
-	ks.Logger().Info("Waiting up to 3m for MetalLB controller to be ready...")
-	if out, err := exec.Command("k3s", "kubectl", "-n", "metallb-system",
-		"rollout", "status", "deployment/controller", "--timeout=180s").CombinedOutput(); err != nil {
-		return fmt.Errorf("metallb controller not ready: %w: %s", err, out)
-	}
+		// Wait for controller Deployment to be ready (up to 3 min).
+		ks.Logger().Info("Waiting up to 3m for MetalLB controller to be ready...")
+		if out, err := exec.Command("k3s", "kubectl", "-n", "metallb-system",
+			"rollout", "status", "deployment/controller", "--timeout=180s").CombinedOutput(); err != nil {
+			return fmt.Errorf("metallb controller not ready: %w: %s", err, out)
+		}
 
-	// Move the speaker memberlist from port 7946 (conflicts with Serf) to 7476.
-	speakerPatch := `[` +
-		`{"op":"add","path":"/spec/template/spec/containers/0/env/-","value":` +
-		`{"name":"METALLB_ML_BIND_ADDR","value":"0.0.0.0"}},` +
-		`{"op":"add","path":"/spec/template/spec/containers/0/env/-","value":` +
-		`{"name":"METALLB_ML_BIND_PORT","value":"7476"}}` +
-		`]`
-	if out, err := exec.Command("k3s", "kubectl", "-n", "metallb-system",
-		"patch", "daemonset", "speaker",
-		"--type=json", "-p", speakerPatch).CombinedOutput(); err != nil {
-		ks.Logger().Warnf("MetalLB speaker port patch: %v: %s (continuing)", err, out)
-	}
+		// Detect LAN subnet and apply IP pool CRs.
+		_, poolStart, poolEnd := detectLANSubnet()
+		if poolStart == "" {
+			return fmt.Errorf("no LAN interface detected — cannot configure MetalLB IP pool")
+		}
+		ks.Logger().Infof("MetalLB IP pool: %s-%s", poolStart, poolEnd)
 
-	// Wait for speaker DaemonSet rollout.
-	exec.Command("k3s", "kubectl", "-n", "metallb-system",
-		"rollout", "status", "daemonset/speaker", "--timeout=120s").Run()
-
-	// Detect LAN subnet.
-	_, poolStart, poolEnd := detectLANSubnet()
-	if poolStart == "" {
-		return fmt.Errorf("no LAN interface detected — cannot configure MetalLB IP pool")
-	}
-	ks.Logger().Infof("MetalLB IP pool: %s-%s", poolStart, poolEnd)
-
-	// Apply IPAddressPool CR.
-	poolYAML := fmt.Sprintf(`apiVersion: metallb.io/v1beta1
+		poolYAML := fmt.Sprintf(`apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata:
   name: lan-pool
@@ -919,14 +901,13 @@ spec:
   addresses:
   - %s-%s
 `, poolStart, poolEnd)
-	cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
-	cmd.Stdin = strings.NewReader(poolYAML)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("apply IPAddressPool: %w: %s", err, out)
-	}
+		cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(poolYAML)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("apply IPAddressPool: %w: %s", err, out)
+		}
 
-	// Apply L2Advertisement CR.
-	const l2AdvYAML = `apiVersion: metallb.io/v1beta1
+		const l2AdvYAML = `apiVersion: metallb.io/v1beta1
 kind: L2Advertisement
 metadata:
   name: lan-advertisement
@@ -935,13 +916,31 @@ spec:
   ipAddressPools:
   - lan-pool
 `
-	cmd2 := exec.Command("k3s", "kubectl", "apply", "-f", "-")
-	cmd2.Stdin = strings.NewReader(l2AdvYAML)
-	if out, err := cmd2.CombinedOutput(); err != nil {
-		return fmt.Errorf("apply L2Advertisement: %w: %s", err, out)
+		cmd2 := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+		cmd2.Stdin = strings.NewReader(l2AdvYAML)
+		if out, err := cmd2.CombinedOutput(); err != nil {
+			return fmt.Errorf("apply L2Advertisement: %w: %s", err, out)
+		}
+
+		ks.Logger().Infof("MetalLB installed — pool %s-%s, L2 advertisement active", poolStart, poolEnd)
+	} // end if !alreadyInstalled
+
+	// Always ensure the speaker memberlist port is 7476 (not 7946 which conflicts with Serf).
+	// Runs on every leader start so existing installs are also fixed.
+	// kubectl set env is the reliable way to add/update env vars without touching other fields.
+	if out, err := exec.Command("k3s", "kubectl", "set", "env",
+		"daemonset/speaker", "-n", "metallb-system",
+		"METALLB_ML_BIND_ADDR=0.0.0.0",
+		"METALLB_ML_BIND_PORT=7476").CombinedOutput(); err != nil {
+		ks.Logger().Warnf("MetalLB speaker port patch: %v: %s (continuing)", err, out)
+	} else {
+		ks.Logger().Info("MetalLB speaker memberlist port set to 7476 (Serf port 7946 freed)")
 	}
 
-	ks.Logger().Infof("MetalLB installed — pool %s-%s, L2 advertisement active", poolStart, poolEnd)
+	// Wait for speaker DaemonSet rollout.
+	exec.Command("k3s", "kubectl", "-n", "metallb-system",
+		"rollout", "status", "daemonset/speaker", "--timeout=120s").Run()
+
 	return nil
 }
 
@@ -1850,9 +1849,21 @@ func (ks *K3sServer) deploySLURMRestAPI(mungeKey []byte) {
 		}
 	}
 
-	// Deploy slurmrestd as a Deployment on the leader node only (hostNetwork = can reach
-	// local slurmctld on 127.0.0.1:6817).  The host's munge socket and slurm.conf are
-	// mounted directly so no separate munged is needed inside the container.
+	// Label this node as the SLURM controller so slurmrestd is pinned here.
+	// slurmrestd needs the FULL slurm.conf (with AccountingStorageType), which only
+	// exists on the leader/controller node — worker nodes only have a minimal client config.
+	hostname, _ := os.Hostname()
+	if hostname != "" {
+		labelCmd := exec.Command("k3s", "kubectl", "label", "node", hostname,
+			"clusteros.io/slurm-controller=true", "--overwrite")
+		if out, err := labelCmd.CombinedOutput(); err != nil {
+			ks.Logger().Warnf("Failed to label SLURM controller node: %v: %s", err, out)
+		}
+	}
+
+	// Deploy slurmrestd as a Deployment pinned to the SLURM controller node (hostNetwork
+	// = can reach local slurmctld on 127.0.0.1:6817).  The host's munge socket and
+	// slurm.conf are mounted directly so no separate munged is needed inside the container.
 	const restYAML = `apiVersion: v1
 kind: Service
 metadata:
@@ -1889,7 +1900,7 @@ spec:
       tolerations:
       - operator: Exists
       nodeSelector:
-        node-role.kubernetes.io/control-plane: "true"
+        clusteros.io/slurm-controller: "true"
       volumes:
       - name: munge-socket
         hostPath:
@@ -2160,7 +2171,7 @@ spec:
       tolerations:
       - operator: Exists
       nodeSelector:
-        node-role.kubernetes.io/control-plane: "true"
+        clusteros.io/slurm-controller: "true"
       volumes:
       - name: munge-socket
         hostPath:
@@ -2370,6 +2381,142 @@ spec:
 	return nil
 }
 
+// ensureRancherDataMounted checks whether the Rancher deployment already declares
+// the rancher-data volume.  If not it migrates existing /var/lib/rancher content
+// from the running pod into the PVC, then patches the deployment so future
+// restarts (including leader changes) resume from persisted state.
+func (ks *K3sServer) ensureRancherDataMounted() {
+	out, _ := exec.Command("k3s", "kubectl", "get", "deployment", "rancher",
+		"-n", "cattle-system",
+		"-o", `jsonpath={.spec.template.spec.volumes[?(@.name=="rancher-data")].name}`).Output()
+	if strings.TrimSpace(string(out)) == "rancher-data" {
+		return // already mounted — nothing to do
+	}
+
+	ks.Logger().Info("Rancher deployment has no persistent volume — migrating state and patching...")
+
+	// Ensure PVC exists first (idempotent).
+	if err := ks.ensureRancherDataPVC(); err != nil {
+		ks.Logger().Warnf("rancher-data PVC: %v (skipping volume patch)", err)
+		return
+	}
+
+	// Copy existing /var/lib/rancher content into the PVC before patching so that
+	// cattle.db (settings, API keys, repos) survives the imminent pod restart.
+	ks.migrateRancherDataToPVC()
+
+	// Strategic-merge-patch the deployment to add the volume + volumeMount.
+	// Strategic merge uses the "name" field as the merge key for volumes and
+	// volumeMounts arrays, so this is additive — it won't remove existing entries.
+	// Unlike JSON Patch op:add with "/-", strategic merge handles null arrays safely.
+	mergePatch := `{"spec":{"template":{"spec":{` +
+		`"volumes":[{"name":"rancher-data","persistentVolumeClaim":{"claimName":"rancher-data"}}],` +
+		`"containers":[{"name":"rancher","volumeMounts":[{"name":"rancher-data","mountPath":"/var/lib/rancher"}]}]` +
+		`}}}}`
+	cmd := exec.Command("k3s", "kubectl", "patch", "deployment", "rancher",
+		"-n", "cattle-system", "--type=strategic", "-p", mergePatch)
+	if patchOut, err := cmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("patch rancher deployment volumes: %v: %s", err, patchOut)
+		return
+	}
+	ks.Logger().Info("Rancher deployment patched — pod will restart with persistent /var/lib/rancher")
+}
+
+// migrateRancherDataToPVC copies /var/lib/rancher from the currently running Rancher
+// pod into the rancher-data PVC so that the first restart with the mounted PVC
+// picks up the existing cattle.db rather than starting empty.
+//
+// It is idempotent: if the PVC already contains cattle.db the copy is skipped.
+func (ks *K3sServer) migrateRancherDataToPVC() {
+	// Find a running Rancher pod to copy from.
+	podOut, _ := exec.Command("k3s", "kubectl", "get", "pod",
+		"-n", "cattle-system", "-l", "app=rancher",
+		"--field-selector=status.phase=Running",
+		"-o", "jsonpath={.items[0].metadata.name}").Output()
+	srcPod := strings.TrimSpace(string(podOut))
+	if srcPod == "" {
+		ks.Logger().Info("No running Rancher pod found — PVC will be initialised fresh on first start")
+		return
+	}
+
+	// Spin up a receiver pod that mounts the PVC; check if data is already there.
+	const receiverName = "rancher-data-receiver"
+	receiverYAML := `apiVersion: v1
+kind: Pod
+metadata:
+  name: rancher-data-receiver
+  namespace: cattle-system
+spec:
+  restartPolicy: Never
+  containers:
+  - name: receiver
+    image: busybox:1.36
+    command: ["sh", "-c", "sleep 120"]
+    volumeMounts:
+    - name: data
+      mountPath: /var/lib/rancher
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: rancher-data
+`
+	exec.Command("k3s", "kubectl", "delete", "pod", receiverName,
+		"-n", "cattle-system", "--ignore-not-found=true").Run()
+	applyCmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	applyCmd.Stdin = strings.NewReader(receiverYAML)
+	if applyCmd.Run() != nil {
+		return
+	}
+	defer exec.Command("k3s", "kubectl", "delete", "pod", receiverName,
+		"-n", "cattle-system", "--ignore-not-found=true").Run()
+
+	// Wait up to 90s for the receiver pod to be Running.
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		phase, _ := exec.Command("k3s", "kubectl", "get", "pod", receiverName,
+			"-n", "cattle-system", "-o", "jsonpath={.status.phase}").Output()
+		if strings.TrimSpace(string(phase)) == "Running" {
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+	phaseOut, _ := exec.Command("k3s", "kubectl", "get", "pod", receiverName,
+		"-n", "cattle-system", "-o", "jsonpath={.status.phase}").Output()
+	if strings.TrimSpace(string(phaseOut)) != "Running" {
+		ks.Logger().Warn("rancher-data-receiver pod not ready — skipping data migration")
+		return
+	}
+
+	// Skip if cattle.db already exists in the PVC (second run after a restart).
+	checkOut, _ := exec.Command("k3s", "kubectl", "exec", receiverName,
+		"-n", "cattle-system", "--",
+		"sh", "-c", "test -f /var/lib/rancher/cattle.db && echo HAS_DATA").Output()
+	if strings.Contains(string(checkOut), "HAS_DATA") {
+		ks.Logger().Info("rancher-data PVC already contains cattle.db — skipping migration")
+		return
+	}
+
+	// Tar the source pod's /var/lib/rancher into memory, then extract into the PVC via the receiver.
+	ks.Logger().Infof("Copying /var/lib/rancher from %s into rancher-data PVC...", srcPod)
+	tarOut, err := exec.Command("k3s", "kubectl", "exec", srcPod,
+		"-n", "cattle-system", "--",
+		"tar", "czf", "-", "-C", "/", "var/lib/rancher").Output()
+	if err != nil || len(tarOut) == 0 {
+		ks.Logger().Warnf("tar from rancher pod failed: %v — PVC will be initialised fresh", err)
+		return
+	}
+
+	extractCmd := exec.Command("k3s", "kubectl", "exec", receiverName,
+		"-n", "cattle-system", "-i", "--",
+		"tar", "xzf", "-", "-C", "/")
+	extractCmd.Stdin = bytes.NewReader(tarOut)
+	if extractOut, err := extractCmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("extract into PVC failed: %v: %s", err, extractOut)
+	} else {
+		ks.Logger().Info("Rancher state migrated to persistent PVC — cattle.db will survive restarts and leader changes")
+	}
+}
+
 func (ks *K3sServer) deployRancher() error {
 	alreadyInstalled := exec.Command("k3s", "kubectl", "-n", "cattle-system", "get", "deployment", "rancher").Run() == nil
 
@@ -2495,6 +2642,12 @@ spec:
 	if out, err := rancherPathCmd.CombinedOutput(); err != nil {
 		ks.Logger().Warnf("rancher-path-ingress: %v: %s", err, out)
 	}
+
+	// Ensure the rancher-data PVC is mounted on the Rancher deployment.
+	// This is a no-op for fresh installs (already set via helm --set flags) but
+	// patches existing deployments that were installed before this code was added.
+	// Must run after the PVC is guaranteed to exist (ensureRancherDataPVC called above).
+	ks.ensureRancherDataMounted()
 
 	ks.Logger().Infof("Rancher NodePort 30444 applied (admin/admin)")
 	return nil
