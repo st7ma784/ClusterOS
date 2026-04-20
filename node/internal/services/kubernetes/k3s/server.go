@@ -2588,6 +2588,16 @@ func (ks *K3sServer) deployRancher() error {
 	}
 	} // end if !alreadyInstalled
 
+	// Ensure the Rancher ingress uses HTTPS to talk to the backend.
+	// The helm chart's extraAnnotations flag doesn't reliably apply due to
+	// dot-in-key escaping; a post-install patch is the safe fallback.
+	exec.Command("k3s", "kubectl", "patch", "ingress", "rancher",
+		"-n", "cattle-system",
+		"--type=json",
+		`-p=[{"op":"add","path":"/metadata/annotations/nginx.ingress.kubernetes.io~1backend-protocol","value":"HTTPS"},`+
+			`{"op":"replace","path":"/spec/rules/0/http/paths/0/backend/service/port/number","value":443}]`,
+	).Run()
+
 	// Always (re-)apply the NodePort service and redirect ingress so they survive
 	// node-agent restarts where Rancher is already installed.
 
