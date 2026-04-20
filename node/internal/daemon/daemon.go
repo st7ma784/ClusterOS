@@ -614,6 +614,7 @@ func (d *Daemon) runProvisioning() error {
 
 	// --- K3s server ---
 	d.logger.Info("Starting K3s server...")
+	d.pruneStaleEtcdPeers(nodeIP)
 	k3sServer := k3s.NewK3sServerRole(nodeIP, d.logger)
 	if err := k3sServer.Start(); err != nil {
 		return fmt.Errorf("start k3s server: %w", err)
@@ -727,6 +728,7 @@ func (d *Daemon) runProvisioning() error {
 	d.mu.Unlock()
 	cpServersTag := strings.Join(cpIPs, ",")
 	d.logger.Infof("CP servers selected: %v", cpIPs)
+	d.writeCPPeersFile(nodeIP, cpIPs)
 
 	// Publish ALL cluster tags in a single atomic UpdateTags call alongside phase=ready.
 	// This is critical: because Serf gossip is asynchronous, workers that see phase=ready
@@ -1444,6 +1446,76 @@ func parseBuildTimeFromVer(ver, buildTime string) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+// etcdCPPeersFile stores the set of CP-server IPs that were registered in etcd
+// during the last successful provisioning cycle.  On the next leader start we probe
+// each peer's etcd port (2380) before launching k3s; if any peer is unreachable we
+// wipe the local etcd directory so k3s starts with a clean single-member cluster
+// rather than stalling waiting for quorum from a node that may never rejoin.
+const etcdCPPeersFile = "/var/lib/rancher/k3s/server/db/.etcd-cp-peers"
+
+// writeCPPeersFile persists the CP-server IP list (excluding self) so that
+// pruneStaleEtcdPeers can read it on the next leader start.
+func (d *Daemon) writeCPPeersFile(selfIP string, cpIPs []string) {
+	var peers []string
+	for _, ip := range cpIPs {
+		if ip != selfIP {
+			peers = append(peers, ip)
+		}
+	}
+	if len(peers) == 0 {
+		os.Remove(etcdCPPeersFile) // single-node cluster — nothing to track
+		return
+	}
+	_ = os.MkdirAll(filepath.Dir(etcdCPPeersFile), 0755)
+	_ = os.WriteFile(etcdCPPeersFile, []byte(strings.Join(peers, "\n")), 0644)
+	d.logger.Infof("Recorded %d etcd CP peer(s) to %s", len(peers), etcdCPPeersFile)
+}
+
+// pruneStaleEtcdPeers is called at the start of every leader provisioning cycle,
+// before k3s starts.  It reads the stored CP-peer IP list, probes port 2380 on
+// each peer, and wipes the local etcd directory if any peer is unreachable.
+//
+// Why this works: in our single-leader architecture the etcd directory on the
+// leader should only contain state that all listed etcd members can service.  If a
+// peer that was registered in etcd is now unreachable on 2380, the cluster cannot
+// reach quorum and the k3s API will return 503 until manually fixed.  By wiping
+// the directory the leader starts a brand-new single-member cluster; the CP peers
+// will wipe their own stale etcd (their marker IP won't match the new leader URL)
+// and rejoin cleanly via k3s server --server <leaderURL> --token <token>.
+func (d *Daemon) pruneStaleEtcdPeers(selfIP string) {
+	etcdDir := "/var/lib/rancher/k3s/server/db/etcd"
+	if _, err := os.Stat(etcdDir); os.IsNotExist(err) {
+		return // no etcd data yet — nothing to check
+	}
+
+	data, err := os.ReadFile(etcdCPPeersFile)
+	if err != nil {
+		return // no peers file — either first run or single-node; trust resetEtcdIfStale
+	}
+
+	peers := strings.Fields(strings.TrimSpace(string(data)))
+	if len(peers) == 0 {
+		return
+	}
+
+	for _, peer := range peers {
+		if peer == selfIP {
+			continue
+		}
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(peer, "2380"), 3*time.Second)
+		if err != nil {
+			d.logger.Warnf("Etcd peer %s:2380 unreachable (%v) — wiping local etcd to prevent quorum stall", peer, err)
+			if rmErr := os.RemoveAll(etcdDir); rmErr != nil {
+				d.logger.Errorf("Failed to wipe etcd dir: %v", rmErr)
+			}
+			os.Remove(etcdCPPeersFile)
+			return
+		}
+		conn.Close()
+		d.logger.Infof("Etcd peer %s:2380 reachable — keeping local etcd", peer)
+	}
 }
 
 // storedLeaderName returns the leader name that was explicitly stored during election
