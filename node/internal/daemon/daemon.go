@@ -2,10 +2,13 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -208,6 +211,11 @@ func (d *Daemon) Start() error {
 	// Role manager handles health-checking of services started by the phase machine.
 	d.roleManager = roles.NewManager(d.logger)
 	d.roleManager.StartHealthCheckLoop(30 * time.Second)
+
+	// Every node serves its binary so any peer can pull the latest version.
+	d.startUpdateServer()
+	// Periodically scan peers and self-update if a newer binary is found.
+	d.startUpdateWatcher()
 
 	go d.runPhaseMachine()
 
@@ -1169,6 +1177,275 @@ func (d *Daemon) retryPublishTags(tags map[string]string) {
 	}
 }
 
+// updatePort is the port every node listens on to serve its binary to peers.
+const updatePort = 9999
+
+// updateBinaryPath is the installed location of the node-agent binary.
+const updateBinaryPath = "/usr/local/bin/node-agent"
+
+// updateCheckInterval is how often each node scans peers for a newer binary.
+const updateCheckInterval = 10 * time.Minute
+
+// startUpdateServer starts a minimal HTTP server on 0.0.0.0:9999 so that any
+// peer — regardless of whether it reaches us via Tailscale, LAN, or p2p cable —
+// can pull the current binary. Every node serves, so a stale cluster that has
+// lost Tailscale connectivity can still receive updates from a freshly-joined
+// peer over a direct ethernet patch.
+//
+// Endpoints:
+//
+//	GET /version   — version string of the running binary
+//	GET /sha256    — hex SHA256 of the on-disk binary (fresh per request)
+//	GET /node-agent — the binary itself
+func (d *Daemon) startUpdateServer() {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, d.version)
+	})
+
+	mux.HandleFunc("/sha256", func(w http.ResponseWriter, r *http.Request) {
+		f, err := os.Open(updateBinaryPath)
+		if err != nil {
+			http.Error(w, "binary unavailable", http.StatusInternalServerError)
+			return
+		}
+		defer f.Close()
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			http.Error(w, "hash error", http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprint(w, hex.EncodeToString(h.Sum(nil)))
+	})
+
+	mux.HandleFunc("/node-agent", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Disposition", "attachment; filename=node-agent")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		http.ServeFile(w, r, updateBinaryPath)
+	})
+
+	addr := fmt.Sprintf("0.0.0.0:%d", updatePort)
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 120 * time.Second,
+	}
+
+	go func() {
+		d.logger.Infof("Update server on :%d — any peer can pull this node's binary", updatePort)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			d.logger.Warnf("Update server stopped: %v", err)
+		}
+	}()
+
+	go func() {
+		<-d.ctx.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+}
+
+// startUpdateWatcher runs a background loop that fires every updateCheckInterval.
+// On each tick it scans all alive Serf peers, parses the build timestamp from their
+// "ver" tag, and downloads the binary from whichever peer has the newest build —
+// provided that build is newer than the locally-running binary. After a successful
+// verified download the process re-execs itself with the new binary so systemd sees
+// a seamless upgrade (same PID, no service restart required).
+//
+// This means a freshly-joined node with a new binary will eventually bring stale
+// cluster members up to date, even if the stale nodes have been isolated and
+// never received a manual deploy.
+func (d *Daemon) startUpdateWatcher() {
+	go func() {
+		// Small initial delay so discovery has time to populate the member list.
+		select {
+		case <-d.ctx.Done():
+			return
+		case <-time.After(2 * time.Minute):
+		}
+
+		ticker := time.NewTicker(updateCheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-d.ctx.Done():
+				return
+			case <-ticker.C:
+				d.checkAndApplyUpdate()
+			}
+		}
+	}()
+}
+
+// checkAndApplyUpdate scans alive peers for a binary with a newer build timestamp.
+// If found it downloads, verifies SHA256, replaces the on-disk binary atomically,
+// and re-execs the process so the new binary takes over immediately.
+func (d *Daemon) checkAndApplyUpdate() {
+	if d.discovery == nil {
+		return
+	}
+
+	localBuildTime := parseBuildTimeFromVer(d.version, d.buildTime)
+
+	// Find the peer with the newest build time.
+	type candidate struct {
+		addr      string
+		ver       string
+		buildTime time.Time
+	}
+	var best candidate
+
+	for _, m := range d.discovery.GetAliveMembers() {
+		if m.Name == d.discovery.LocalMember().Name {
+			continue
+		}
+		peerVer := m.Tags["ver"]
+		if peerVer == "" {
+			continue
+		}
+		peerBT := parseBuildTimeFromVer(peerVer, "")
+		if peerBT.IsZero() {
+			continue // peer has no timestamp — can't compare
+		}
+		if peerBT.After(best.buildTime) {
+			peerIP := m.Addr.String()
+			if wgip := m.Tags["wgip"]; wgip != "" {
+				peerIP = wgip
+			}
+			best = candidate{addr: peerIP, ver: peerVer, buildTime: peerBT}
+		}
+	}
+
+	if best.addr == "" {
+		return // no timestamped peer found
+	}
+	if !best.buildTime.After(localBuildTime) {
+		return // we're already on the newest version
+	}
+
+	d.logger.Infof("Update watcher: peer %s has newer build %s (local: %s) — downloading",
+		best.addr, best.ver, d.version)
+
+	if err := d.downloadAndApply(best.addr, best.ver); err != nil {
+		d.logger.Warnf("Auto-update from %s failed: %v — will retry at next interval", best.addr, err)
+		return
+	}
+
+	// Re-exec: replace the running process image with the new binary.
+	// All goroutines die; systemd (same PID) restarts the service automatically.
+	exe := updateBinaryPath
+	if path, err := os.Executable(); err == nil {
+		if real, err := filepath.EvalSymlinks(path); err == nil {
+			exe = real
+		}
+	}
+	d.logger.Infof("Re-execing with new binary: %s", exe)
+	_ = syscall.Exec(exe, os.Args, os.Environ())
+	// If Exec fails (unlikely), log and let the watcher retry next interval.
+	d.logger.Errorf("syscall.Exec failed — node-agent is still running the old binary")
+}
+
+// downloadAndApply downloads the node-agent binary from peerAddr:updatePort,
+// verifies its SHA256 against what the peer reports, and atomically replaces
+// updateBinaryPath. Returns nil on success.
+func (d *Daemon) downloadAndApply(peerAddr, peerVer string) error {
+	base := fmt.Sprintf("http://%s:%d", peerAddr, updatePort)
+	client := &http.Client{Timeout: 120 * time.Second}
+
+	// 1. Confirm the peer's reported version matches what we discovered via Serf.
+	resp, err := client.Get(base + "/version")
+	if err != nil {
+		return fmt.Errorf("probe version: %w", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	confirmedVer := strings.TrimSpace(string(body))
+	if confirmedVer != peerVer {
+		return fmt.Errorf("version mismatch: Serf says %q, HTTP says %q", peerVer, confirmedVer)
+	}
+
+	// 2. Fetch expected SHA256.
+	resp, err = client.Get(base + "/sha256")
+	if err != nil {
+		return fmt.Errorf("fetch sha256: %w", err)
+	}
+	shaBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	expectedSHA := strings.TrimSpace(string(shaBytes))
+	if len(expectedSHA) != 64 {
+		return fmt.Errorf("invalid sha256 response (%d chars)", len(expectedSHA))
+	}
+
+	// 3. Download binary to a temp file.
+	tmp, err := os.CreateTemp("", "node-agent-update-*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath) // cleaned up whether we succeed or fail
+
+	resp, err = client.Get(base + "/node-agent")
+	if err != nil {
+		tmp.Close()
+		return fmt.Errorf("download binary: %w", err)
+	}
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmp, h), resp.Body); err != nil {
+		tmp.Close()
+		resp.Body.Close()
+		return fmt.Errorf("write binary: %w", err)
+	}
+	resp.Body.Close()
+	tmp.Close()
+
+	// 4. Verify SHA256.
+	actualSHA := hex.EncodeToString(h.Sum(nil))
+	if actualSHA != expectedSHA {
+		return fmt.Errorf("SHA256 mismatch: expected %s got %s", expectedSHA, actualSHA)
+	}
+
+	// 5. Atomically replace the binary.
+	if err := os.Chmod(tmpPath, 0755); err != nil {
+		return fmt.Errorf("chmod: %w", err)
+	}
+	if err := os.Rename(tmpPath, updateBinaryPath); err != nil {
+		return fmt.Errorf("rename: %w", err)
+	}
+
+	d.logger.Infof("Binary updated to %s (SHA256: %s)", peerVer, actualSHA)
+	return nil
+}
+
+// parseBuildTimeFromVer extracts the build timestamp from a version string of the
+// form "<commit>[-dirty+<timestamp>]". The buildTime argument is the daemon's own
+// buildTime field (used as a fallback when ver has no "+" suffix). Returns the zero
+// Time if no parseable timestamp is found.
+func parseBuildTimeFromVer(ver, buildTime string) time.Time {
+	ts := ""
+	if idx := strings.Index(ver, "+"); idx >= 0 {
+		ts = ver[idx+1:]
+	} else if buildTime != "" {
+		ts = buildTime
+	}
+	if ts == "" {
+		return time.Time{}
+	}
+	// Try ISO 8601 variants used by the Makefile: T separator or _ separator.
+	for _, layout := range []string{
+		"2006-01-02T15:04:05",
+		"2006-01-02_15:04:05",
+		time.RFC3339,
+	} {
+		if t, err := time.Parse(layout, ts); err == nil {
+			return t
+		}
+	}
+	return time.Time{}
+}
+
 // storedLeaderName returns the leader name that was explicitly stored during election
 // (either from findRunningLeader or ComputeLeader). This is the name workers should use
 // when looking up leader tags — not d.leaderElector.ComputeLeader(), which recomputes
@@ -2058,6 +2335,7 @@ func (d *Daemon) writeStatusFile() {
 		Status string `json:"status"`
 		NodeID string `json:"node_id"`
 		Phase  string `json:"phase,omitempty"`
+		Ver    string `json:"ver,omitempty"`
 	}
 
 	var members []memberInfo
@@ -2082,6 +2360,7 @@ func (d *Daemon) writeStatusFile() {
 				Status: status,
 				NodeID: m.Tags["node_id"],
 				Phase:  m.Tags["phase"],
+				Ver:    m.Tags["ver"],
 			})
 		}
 	}

@@ -85,6 +85,12 @@ func (sc *SLURMController) Start() error {
 		return fmt.Errorf("start slurmctld: %w", err)
 	}
 
+	// Initialise sacctmgr accounting DB in the background.
+	// slurmdbd may not be ready yet, so we retry for up to 3 minutes.
+	if sc.slurmdbdHost != "" {
+		go sc.initSlurmAccounting()
+	}
+
 	sc.SetRunning(true)
 	return nil
 }
@@ -141,6 +147,47 @@ func (sc *SLURMController) createDirectories() error {
 	// Log directory
 	os.MkdirAll("/var/log/slurm", 0755)
 	return nil
+}
+
+// initSlurmAccounting waits for slurmdbd to accept connections, then bootstraps
+// the cluster/account/user records so jobs can be submitted without manual setup.
+func (sc *SLURMController) initSlurmAccounting() {
+	const clusterName = "cluster-os"
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("sacctmgr", "-n", "show", "cluster", clusterName).Output()
+		if err == nil && strings.Contains(string(out), clusterName) {
+			// Already initialised — just ensure default accounts are set.
+			exec.Command("sacctmgr", "-i", "modify", "user", "root", "set", "DefaultAccount=clusteros").Run()
+			exec.Command("sacctmgr", "-i", "modify", "user", "clusteros", "set", "DefaultAccount=clusteros").Run()
+			exec.Command("scontrol", "reconfigure").Run()
+			sc.Logger().Info("SLURM accounting: cluster already registered, defaults ensured")
+			return
+		}
+		if err == nil {
+			break // sacctmgr responded but cluster not registered yet — proceed with init
+		}
+		time.Sleep(10 * time.Second)
+	}
+
+	sc.Logger().Info("SLURM accounting: initialising cluster, account and users in sacctmgr")
+	cmds := [][]string{
+		{"sacctmgr", "-i", "add", "cluster", clusterName},
+		{"sacctmgr", "-i", "add", "account", "clusteros", "cluster=" + clusterName, "description=ClusterOS users", "organization=clusteros"},
+		{"sacctmgr", "-i", "add", "user", "root", "account=clusteros", "cluster=" + clusterName, "adminlevel=Administrator"},
+		{"sacctmgr", "-i", "add", "user", "clusteros", "account=clusteros", "cluster=" + clusterName},
+		{"sacctmgr", "-i", "modify", "user", "root", "set", "DefaultAccount=clusteros"},
+		{"sacctmgr", "-i", "modify", "user", "clusteros", "set", "DefaultAccount=clusteros"},
+	}
+	for _, args := range cmds {
+		out, err := exec.Command(args[0], args[1:]...).CombinedOutput()
+		if err != nil {
+			sc.Logger().Warnf("sacctmgr init: %v: %s", args, string(out))
+		}
+	}
+	// Reload slurmctld so it sees the new associations immediately.
+	exec.Command("scontrol", "reconfigure").Run()
+	sc.Logger().Info("SLURM accounting: initialisation complete")
 }
 
 func (sc *SLURMController) startSlurmctld() error {

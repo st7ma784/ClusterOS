@@ -307,15 +307,15 @@ cmd_test() {
 
     PASS=0; FAIL=0; SKIP=0
 
-    pass() { echo -e "  ${GREEN}✓ PASS${NC}: $1"; ((PASS++)); }
-    fail() { echo -e "  ${RED}✗ FAIL${NC}: $1"; ((FAIL++)); }
-    skip() { echo -e "  ${YELLOW}○ SKIP${NC}: $1"; ((SKIP++)); }
+    pass() { echo -e "  ${GREEN}✓ PASS${NC}: $1"; ((PASS++)) || true; }
+    fail() { echo -e "  ${RED}✗ FAIL${NC}: $1"; ((FAIL++)) || true; }
+    skip() { echo -e "  ${YELLOW}○ SKIP${NC}: $1"; ((SKIP++)) || true; }
     header() { echo -e "\n${CYAN}=== $1 ===${NC}"; }
 
     # Prerequisites
     check_prereqs() {
         header "Prerequisites"
-        systemctl is-active --quiet node-agent 2>/dev/null \
+        { systemctl is-active --quiet node-agent 2>/dev/null || pgrep -f node-agent &>/dev/null; } \
             && pass "node-agent running" || fail "node-agent not running"
 
         tailscale ip -4 &>/dev/null \
@@ -338,39 +338,43 @@ cmd_test() {
         command -v sinfo &>/dev/null  || { skip "sinfo not available"; return; }
         command -v sbatch &>/dev/null || { skip "sbatch not available"; return; }
 
-        pgrep -x slurmctld &>/dev/null || pgrep -x slurmd &>/dev/null \
+        pgrep -f slurmctld &>/dev/null || pgrep -f slurmd &>/dev/null \
             && pass "SLURM daemon running" || fail "No SLURM daemon running"
 
         sinfo &>/dev/null \
             && pass "sinfo responds" || fail "sinfo failed"
 
-        # Simple job
-        local tmpdir
+        # Simple job — pin to local node so output lands here
+        local tmpdir local_node
         tmpdir=$(mktemp -d)
-        cat >"$tmpdir/test.sh" <<'EOF'
+        local_node=$(sinfo -h -o '%n' -n "$(hostname)" 2>/dev/null | head -1)
+        [ -z "$local_node" ] && local_node=$(sinfo -h -o '%n' 2>/dev/null | head -1)
+        cat >"$tmpdir/test.sh" <<EOF
 #!/bin/bash
 #SBATCH --job-name=cluster-test
-#SBATCH --output=/tmp/cluster-test-%j.out
+#SBATCH --output=$tmpdir/out-%j.txt
 #SBATCH --time=00:01:00
 #SBATCH --ntasks=1
-echo "SLURM test OK on $(hostname)"
+${local_node:+#SBATCH --nodelist=$local_node}
+echo "SLURM test OK on \$(hostname)"
 EOF
         local jobid
         jobid=$(sbatch "$tmpdir/test.sh" 2>/dev/null | awk '{print $NF}')
         if [ -n "$jobid" ] && [ "$jobid" -gt 0 ] 2>/dev/null; then
             pass "Job submitted (id=$jobid)"
-            # Wait for completion (max 60s)
-            local waited=0
+            # Wait for completion (max 60s) using sacct
+            local waited=0 jstate=""
             while [ $waited -lt 60 ]; do
-                local state
-                state=$(squeue -j "$jobid" --noheader 2>/dev/null | awk '{print $5}')
-                [ -z "$state" ] && break
-                sleep 3; ((waited+=3))
+                jstate=$(sacct -n -j "$jobid" --format=State 2>/dev/null | awk 'NR==1{print $1}')
+                [[ "$jstate" == COMPLETED* || "$jstate" == FAILED* || "$jstate" == CANCELLED* ]] && break
+                sleep 3; ((waited+=3)) || true
             done
-            if grep -q "SLURM test OK" "/tmp/cluster-test-${jobid}.out" 2>/dev/null; then
+            if grep -q "SLURM test OK" "$tmpdir/out-${jobid}.txt" 2>/dev/null; then
                 pass "Job output correct"
+            elif [[ "$jstate" == COMPLETED* ]]; then
+                pass "Job completed (output on remote node)"
             else
-                fail "Job output missing or wrong"
+                fail "Job output missing (state=$jstate)"
             fi
             scancel "$jobid" 2>/dev/null || true
         else
@@ -403,7 +407,7 @@ EOF
         if mpicc "$tmpdir/hello.c" -o "$tmpdir/hello" 2>/dev/null; then
             pass "MPI compile"
             local out
-            out=$(mpirun -np 2 "$tmpdir/hello" 2>/dev/null)
+            out=$(mpirun --allow-run-as-root -np 2 "$tmpdir/hello" 2>/dev/null)
             echo "$out" | grep -q "MPI rank" \
                 && pass "MPI run (2 ranks)" || fail "MPI run failed"
         else
@@ -1390,6 +1394,264 @@ cmd_info() {
     fi
 }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster health
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_health() {
+    echo -e "${CYAN}${BOLD}═══ ClusterOS Health Check ═══${NC}"
+    echo ""
+
+    ISSUES=0
+    _hok()  { echo -e "  ${GREEN}✓${NC} $*"; }
+    _hwarn(){ echo -e "  ${YELLOW}⚠${NC} $*"; ((ISSUES++)) || true; }
+    _hbad() { echo -e "  ${RED}✗${NC} $*"; ((ISSUES++)) || true; }
+
+    # ── Leader election ──────────────────────────────────────────────────────
+    echo -e "${YELLOW}${BOLD} Leader Election${NC}"
+    local leader
+    leader=$(status_field "leader" "unknown")
+    local is_leader
+    is_leader=$(status_field "is_leader" "false")
+
+    if [ "$leader" != "unknown" ] && [ -n "$leader" ]; then
+        _hok "Leader: ${BOLD}${leader}${NC}$([ "$is_leader" = "true" ] && echo "  (this node)" || true)"
+    else
+        _hbad "No leader elected"
+    fi
+
+    # Check for split-brain: any alive node with k3s-server tag that isn't the known leader
+    if [ -f "$STATUS_FILE" ] && command -v jq &>/dev/null; then
+        local leaders_with_k3s
+        leaders_with_k3s=$(jq -r '[.members[]? | select(.status == "alive" and .phase == "ready")] | length' \
+            "$STATUS_FILE" 2>/dev/null || echo 0)
+        if [ "$leaders_with_k3s" -gt 1 ] 2>/dev/null; then
+            _hwarn "SPLIT-BRAIN: $leaders_with_k3s nodes in phase=ready (expected 1 leader + workers)"
+        fi
+    fi
+
+    # ── Node versions ────────────────────────────────────────────────────────
+    echo -e "\n${YELLOW}${BOLD} Node Versions${NC}"
+    local local_ver
+    local_ver=$(/usr/local/bin/node-agent --version 2>/dev/null | head -1 | awk '{print $1}' || echo "unknown")
+    echo -e "  Local:  ${BOLD}$local_ver${NC}"
+    echo ""
+
+    if [ -f "$STATUS_FILE" ] && command -v jq &>/dev/null; then
+        local mismatches=0
+        while IFS=$'\t' read -r name addr ver phase stat; do
+            local lver_clean rver_clean
+            lver_clean="${local_ver%%-dirty*}"
+            rver_clean="${ver%%-dirty*}"
+            local icon
+            if [ "$stat" = "failed" ]; then
+                icon="${RED}○${NC}"
+            elif [ -z "$ver" ] || [ "$lver_clean" = "$rver_clean" ]; then
+                icon="${GREEN}●${NC}"
+            else
+                icon="${YELLOW}⚠${NC}"
+                ((mismatches++)) || true
+            fi
+            printf "  %b %-22s %-18s ver=%-20s phase=%s\n" \
+                "$icon" "$name" "$addr" "${ver:-unknown}" "${phase:-?}"
+        done < <(jq -r '.members[]? | [.name, .addr, (.ver // ""), (.phase // "?"), .status] | @tsv' \
+            "$STATUS_FILE" 2>/dev/null | sort)
+
+        if [ "$mismatches" -gt 0 ]; then
+            echo ""
+            _hwarn "$mismatches node(s) on a different version — run ${BOLD}sudo cluster update${NC} on the stale node(s)"
+        fi
+    else
+        echo "  (status file not available)"
+    fi
+
+    # ── K3s node health ──────────────────────────────────────────────────────
+    echo -e "\n${YELLOW}${BOLD} Kubernetes Nodes${NC}"
+    if pgrep -f 'k3s server' &>/dev/null; then
+        local kout notready_count k3s_node_count
+        kout=$(k3s kubectl get nodes --no-headers 2>/dev/null || true)
+        if [ -n "$kout" ]; then
+            echo "$kout" | awk '{
+                status = ($2 == "Ready") ? "\033[0;32m●\033[0m" : "\033[0;31m○\033[0m"
+                printf "  %s  %-22s %-8s %s\n", status, $1, $2, $5
+            }'
+            notready_count=$(echo "$kout" | grep -vc '\bReady\b' || true)
+            k3s_node_count=$(echo "$kout" | wc -l)
+            if [ "$notready_count" -gt 0 ] 2>/dev/null; then
+                _hbad "$notready_count k8s node(s) NotReady"
+            else
+                _hok "All $k3s_node_count k8s node(s) Ready"
+            fi
+        else
+            _hbad "kubectl returned no nodes (API may be starting)"
+        fi
+    elif pgrep -f 'k3s agent' &>/dev/null; then
+        echo -e "  ${DIM}(worker — run 'cluster health' on the leader for full k8s status)${NC}"
+    else
+        _hbad "k3s not running on this node"
+    fi
+
+    # ── SLURM node health ────────────────────────────────────────────────────
+    echo -e "\n${YELLOW}${BOLD} SLURM Nodes${NC}"
+    if command -v sinfo &>/dev/null && (pgrep -f 'slurmctld' &>/dev/null || pgrep -f 'slurmd' &>/dev/null); then
+        local sinfo_out
+        sinfo_out=$(sinfo -N --format="  %-14n %-8T %-10P %-8C" 2>/dev/null || true)
+        if [ -n "$sinfo_out" ]; then
+            echo "$sinfo_out"
+            local down_count
+            down_count=$(sinfo -N --noheader --format="%T" 2>/dev/null | grep -cE 'down|drain|fail' || true)
+            if [ "$down_count" -gt 0 ] 2>/dev/null; then
+                _hwarn "$down_count SLURM node(s) in down/drain/fail state"
+            else
+                _hok "All SLURM nodes reachable"
+            fi
+        else
+            echo -e "  ${DIM}(sinfo returned no output — cluster may still be starting)${NC}"
+        fi
+    else
+        echo -e "  ${DIM}(SLURM not running on this node)${NC}"
+    fi
+
+    # ── Summary ──────────────────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}$(printf '─%.0s' $(seq 1 40))${NC}"
+    if [ "$ISSUES" -eq 0 ]; then
+        echo -e "${GREEN}${BOLD}All health checks passed.${NC}"
+    else
+        echo -e "${YELLOW}${BOLD}${ISSUES} issue(s) detected — see above.${NC}"
+    fi
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# cluster update  (must run as root)
+# ──────────────────────────────────────────────────────────────────────────────
+
+cmd_update() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo -e "${RED}✗${NC} Must run as root: sudo cluster update"
+        exit 1
+    fi
+
+    local BINARY="/usr/local/bin/node-agent"
+    local UPDATE_PORT=9999
+
+    echo -e "${CYAN}${BOLD}═══ ClusterOS Node Update ═══${NC}"
+
+    # ── Local version ────────────────────────────────────────────────────────
+    local local_ver local_ts
+    local_ver=$("$BINARY" --version 2>/dev/null | head -1 | awk '{print $1}' || echo "unknown")
+    # Extract build timestamp from version string: <commit>[-dirty+<ts>]
+    local_ts="${local_ver#*+}"
+    [ "$local_ts" = "$local_ver" ] && local_ts=""
+    echo "  Local version:  $local_ver"
+
+    # ── Scan ALL alive peers for the newest binary ────────────────────────────
+    # Any peer may have a newer build, not just the leader. A fresh node that
+    # just joined after an outage could have a binary newer than the current leader.
+    echo "  Scanning peers..."
+
+    local best_ip="" best_ver="" best_ts=""
+
+    if [ -f "$STATUS_FILE" ] && command -v jq &>/dev/null; then
+        while IFS=$'\t' read -r addr ver; do
+            [ -z "$addr" ] && continue
+            # Probe the peer's update server
+            local peer_ver
+            peer_ver=$(curl -sf --connect-timeout 3 "http://${addr}:${UPDATE_PORT}/version" 2>/dev/null || echo "")
+            [ -z "$peer_ver" ] && continue
+            # Extract timestamp from ver tag: <commit>[-dirty+<ts>]
+            local peer_ts
+            peer_ts="${peer_ver#*+}"
+            [ "$peer_ts" = "$peer_ver" ] && peer_ts=""
+            [ -z "$peer_ts" ] && continue  # no timestamp → can't compare
+
+            echo "    $(echo -e "${GREEN}●${NC}") $addr  ver=$peer_ver"
+
+            # Compare timestamps lexicographically (ISO format sorts correctly)
+            if [[ -z "$best_ts" || "$peer_ts" > "$best_ts" ]]; then
+                best_ip="$addr"
+                best_ver="$peer_ver"
+                best_ts="$peer_ts"
+            fi
+        done < <(jq -r '.members[]? | select(.status == "alive") | [.addr, (.ver // "")] | @tsv' \
+            "$STATUS_FILE" 2>/dev/null)
+    fi
+
+    if [ -z "$best_ip" ]; then
+        echo -e "${YELLOW}⚠ No peers with a timestamped version found.${NC}"
+        echo "  Peers running older node-agents (pre-update-server) can only be updated via 'make deploy'."
+        exit 0
+    fi
+
+    echo ""
+    echo "  Newest peer:    $best_ip  ($best_ver)"
+
+    # Are we already up to date?
+    if [[ -n "$local_ts" && ! "$best_ts" > "$local_ts" ]]; then
+        echo -e "\n${GREEN}Already at the newest known version.${NC}"
+        exit 0
+    fi
+
+    echo -e "\n${YELLOW}Update available:${NC} $local_ver → $best_ver"
+
+    # ── Download ─────────────────────────────────────────────────────────────
+    local base_url="http://${best_ip}:${UPDATE_PORT}"
+    echo "  Downloading from $best_ip..."
+
+    local tmpbin
+    tmpbin=$(mktemp /tmp/node-agent-XXXXXX)
+    if ! curl -sf --connect-timeout 10 --max-time 120 \
+            "${base_url}/node-agent" -o "$tmpbin"; then
+        rm -f "$tmpbin"
+        echo -e "${RED}✗ Download failed${NC}"
+        exit 1
+    fi
+    echo "  Downloaded $(du -h "$tmpbin" | awk '{print $1}')"
+
+    # ── Verify SHA256 ────────────────────────────────────────────────────────
+    local expected_sha actual_sha
+    expected_sha=$(curl -sf --connect-timeout 5 "${base_url}/sha256" 2>/dev/null || echo "")
+    actual_sha=$(sha256sum "$tmpbin" | awk '{print $1}')
+
+    if [ -z "$expected_sha" ]; then
+        rm -f "$tmpbin"
+        echo -e "${RED}✗ Could not fetch expected SHA256${NC}"
+        exit 1
+    fi
+    if [ "$expected_sha" != "$actual_sha" ]; then
+        rm -f "$tmpbin"
+        echo -e "${RED}✗ SHA256 mismatch — binary may be corrupted or tampered${NC}"
+        echo "  Expected: $expected_sha"
+        echo "  Got:      $actual_sha"
+        exit 1
+    fi
+    echo -e "  ${GREEN}SHA256 verified: $actual_sha${NC}"
+
+    # ── Sanity: must be an ELF binary ────────────────────────────────────────
+    if ! file "$tmpbin" 2>/dev/null | grep -q ELF; then
+        rm -f "$tmpbin"
+        echo -e "${RED}✗ Downloaded file is not a valid ELF binary${NC}"
+        exit 1
+    fi
+
+    # ── Atomic replacement ───────────────────────────────────────────────────
+    chmod +x "$tmpbin"
+    mv "$tmpbin" "$BINARY"
+    echo -e "  ${GREEN}Binary installed: $BINARY${NC}"
+
+    # ── Restart ──────────────────────────────────────────────────────────────
+    echo "  Restarting node-agent..."
+    if systemctl is-enabled node-agent &>/dev/null; then
+        systemctl restart node-agent
+        echo -e "${GREEN}${BOLD}Update complete. node-agent restarted via systemd.${NC}"
+    else
+        pkill -f '/usr/local/bin/node-agent' 2>/dev/null || true
+        sleep 1
+        nohup "$BINARY" >> /var/log/cluster-os/node-agent.log 2>&1 &
+        echo -e "${GREEN}${BOLD}Update complete. node-agent restarted.${NC}"
+    fi
+}
+
 cmd_help() {
     echo -e "${CYAN}${BOLD}cluster — ClusterOS management tool${NC}"
     echo ""
@@ -1399,6 +1661,8 @@ cmd_help() {
     echo "  status                   Snapshot of node, cluster, and service state"
     echo "  dash [--interval N]      Live dashboard (default refresh: 5s)"
     echo "        [--once]           Print one snapshot and exit"
+    echo "  health                   Check leader, node versions, k8s/SLURM node health"
+    echo "  update                   Self-update from the newest peer (requires root)"
     echo "  leader                   Show elected leader and its role"
     echo "  nodes                    List all cluster nodes (Tailscale + k8s + SLURM)"
     echo "  info                     This node's hardware, versions, and identity"
@@ -1429,6 +1693,8 @@ shift || true
 case "$CMD" in
     status)    cmd_status ;;
     dash)      cmd_dash "$@" ;;
+    health)    cmd_health ;;
+    update)    cmd_update ;;
     test)      cmd_test "$@" ;;
     logs)      cmd_logs "$@" ;;
     diag)      cmd_diag ;;

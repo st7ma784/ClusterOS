@@ -2043,6 +2043,7 @@ def build_page():
         name  = j.get("name", "-")
         user  = j.get("user_name", "-")
         state = j.get("job_state", "-")
+        state = " ".join(state) if isinstance(state, list) else str(state)
         nodes = j.get("nodes", "-")
         t     = j.get("run_time", {})
         secs  = t.get("number", 0) if isinstance(t, dict) else 0
