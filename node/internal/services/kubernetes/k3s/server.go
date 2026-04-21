@@ -1531,6 +1531,10 @@ PROBE_PORT = {
     "/jupyter":   30888,
 }
 
+# Rancher API endpoint — discover deployed workloads automatically
+RANCHER_NAMESPACE = os.environ.get("RANCHER_NAMESPACE", "cattle-system")
+RANCHER_API_URL = f"https://{_K8S_HOST}:{_K8S_PORT}/apis/management.cattle.io/v3"
+
 
 def port_open(host, port, timeout=2):
     """TCP connect check — fast, no TLS handshake needed."""
@@ -1574,6 +1578,55 @@ def collect_ingresses():
     return rows
 
 
+def collect_rancher_workloads(req_host):
+    """Discover all Rancher-deployed workloads via API.
+    
+    Returns list of (ns, name, type, np, url, up) tuples for services with NodePorts.
+    Falls back to accessing via Rancher's proxy if no direct NodePort.
+    """
+    rows = []
+    try:
+        # Query Rancher for deployed workloads (Deployments, StatefulSets, DaemonSets)
+        for wl_type in ["deployments", "statefulsets", "daemonsets"]:
+            try:
+                wls = k8s_get(f"/api/v1/{wl_type}").get("items", [])
+            except:
+                continue
+            
+            for wl in wls:
+                ns = wl.get("metadata", {}).get("namespace", "")
+                name = wl.get("metadata", {}).get("name", "")
+                
+                # Skip system namespaces and cluster-os services
+                if ns.startswith("kube-") or ns.startswith("cattle-"):
+                    continue
+                if name.startswith("coredns") or name.startswith("flannel"):
+                    continue
+                
+                # Look for associated service with NodePort
+                try:
+                    svc_list = k8s_get(f"/api/v1/namespaces/{ns}/services").get("items", [])
+                    for svc in svc_list:
+                        svc_name = svc.get("metadata", {}).get("name", "")
+                        if svc.get("spec", {}).get("type") != "NodePort":
+                            continue
+                        
+                        for p in svc.get("spec", {}).get("ports", []):
+                            np = p.get("nodePort")
+                            if not np:
+                                continue
+                            scheme = "https" if np in (30443, 30444) else "http"
+                            up = port_open(req_host, np)
+                            rows.append((ns, svc_name, wl_type.rstrip("s"), np, 
+                                       f"{scheme}://{req_host}:{np}", up))
+                except:
+                    pass
+    except:
+        pass
+    
+    return rows
+
+
 def collect_nodeports(req_host):
     try:
         items   = k8s_get("/api/v1/services").get("items", [])
@@ -1611,6 +1664,7 @@ def status_dot(up):
 def build_page(req_host):
     ingresses         = collect_ingresses()
     nodeports, np_err = collect_nodeports(req_host)
+    rancher_wls       = collect_rancher_workloads(req_host)
 
     # Web interfaces section (ingress-based) with live status dots.
     ing_rows = ""
@@ -1642,8 +1696,25 @@ def build_page(req_host):
             f"<td><a href='{url}' target='_blank'{dim}>:{np}</a></td>"
             f"</tr>"
         )
-    if not np_rows:
-        np_rows = "<tr><td colspan='3' class='empty'>No additional NodePort services</td></tr>"
+    
+    # Rancher-deployed workloads section.
+    rancher_rows = ""
+    for ns, name, wl_type, np, url, up in rancher_wls:
+        label = f"{name} ({wl_type})"
+        dot   = status_dot(up)
+        dim   = " style='opacity:.45'" if not up else ""
+        rancher_rows += (
+            f"<tr>"
+            f"<td><span class='ns'>{ns}</span></td>"
+            f"<td>{dot} <b>{label}</b></td>"
+            f"<td><a href='{url}' target='_blank'{dim}>:{np}</a></td>"
+            f"</tr>"
+        )
+    
+    if not np_rows and not rancher_rows:
+        combined_np = "<tr><td colspan='3' class='empty'>No additional NodePort services</td></tr>"
+    else:
+        combined_np = np_rows + rancher_rows
 
     err = f"<div class='err'>Kubernetes API: {np_err}</div>" if np_err else ""
     return f"""<!DOCTYPE html>
@@ -1683,7 +1754,7 @@ a{{color:#34d399;text-decoration:none}}a:hover{{text-decoration:underline}}
 <h2>Direct NodePort Access</h2>
 <table>
   <thead><tr><th>Namespace</th><th>Service</th><th>Port</th></tr></thead>
-  <tbody>{np_rows}</tbody>
+  <tbody>{combined_np}</tbody>
 </table>
 </body></html>"""
 
@@ -1708,6 +1779,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        
+        # For unknown paths (not "/" or "/index.html"), forward to Rancher.
+        # This allows services to be discoverable via Rancher's UI even if
+        # they don't have explicit ingress rules — the landing page auto-discovers
+        # them and shows links to their NodePorts.
+        if path not in ("", "/", "/index.html", "/favicon.ico"):
+            location = f"https://{req_host}:30444{self.path}"
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        
         try:
             body = build_page(req_host).encode("utf-8")
             code = 200
