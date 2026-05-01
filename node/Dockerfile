@@ -90,12 +90,13 @@ COPY node/config/node.yaml /etc/cluster-os/node.yaml
 # Copy systemd service file
 COPY node/systemd/node-agent.service /etc/systemd/system/node-agent.service
 
-# Bake in Tailscale credentials (same flow as OS images — OAuth, never-expiring)
-# patch/tailscale.env must exist at build time; patch/tailscale-auth is the auth script
+# Bake in Tailscale credentials and cluster auth key (same flow as OS images)
+# patch/tailscale.env and cluster.key must exist at build time (run 'make patch' first)
 COPY patch/tailscale-auth /usr/local/bin/clusteros-tailscale-init
 COPY patch/tailscale.env /etc/clusteros/tailscale.env
+COPY cluster.key /etc/clusteros/cluster.key
 RUN chmod +x /usr/local/bin/clusteros-tailscale-init && \
-    chmod 600 /etc/clusteros/tailscale.env
+    chmod 600 /etc/clusteros/tailscale.env /etc/clusteros/cluster.key
 
 # Copy entrypoint script
 COPY test/docker/entrypoint.sh /entrypoint.sh

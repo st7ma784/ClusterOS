@@ -10,7 +10,7 @@ NODE_BOOTSTRAP="${NODE_BOOTSTRAP:-false}"
 NODE_JOIN="${NODE_JOIN:-}"
 SERF_BIND_PORT="${SERF_BIND_PORT:-7946}"
 RAFT_BIND_PORT="${RAFT_BIND_PORT:-7373}"
-CLUSTER_AUTH_KEY="${CLUSTER_AUTH_KEY:-}"
+CLUSTER_AUTH_KEY="${CLUSTER_AUTH_KEY:-$(cat /etc/clusteros/cluster.key 2>/dev/null | tr -d '[:space:]')}"
 
 echo "Node Name: $NODE_NAME"
 echo "Bootstrap Mode: $NODE_BOOTSTRAP"

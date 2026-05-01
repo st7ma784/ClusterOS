@@ -240,6 +240,10 @@ patch: node
 	@cp bin/$(BINARY_NAME) patch/$(BINARY_NAME)
 	@printf '%s\n' "version=$(VERSION)" "commit=$(COMMIT)" "built=$(BUILD_TIME)" > patch/VERSION
 	@echo "Binary version: $(VERSION) ($(COMMIT))"
+	@if [ -f cluster.key ]; then \
+		printf 'CLUSTER_AUTH_KEY=%s\n' "$$(cat cluster.key | tr -d '[:space:]')" > test/docker/.env; \
+		echo "  test/docker/.env written from cluster.key (docker-compose will use it)"; \
+	fi
 	@echo "Generating fresh munge key (32 bytes) for patch/munge.key..."
 	@head -c 32 /dev/urandom > patch/munge.key || openssl rand -out patch/munge.key 32
 	@chmod 600 patch/munge.key

@@ -15,7 +15,11 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 BRIDGE_NET=docker_cluster_net
-CLUSTER_AUTH_KEY="${CLUSTER_AUTH_KEY:-7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=}"
+CLUSTER_AUTH_KEY="${CLUSTER_AUTH_KEY:-$(cat cluster.key 2>/dev/null | tr -d '[:space:]')}"
+if [ -z "$CLUSTER_AUTH_KEY" ]; then
+    echo "Error: cluster.key not found. Run 'make cluster-key' first."
+    exit 1
+fi
 
 echo -e "${GREEN}Starting Cluster-OS test cluster...${NC}"
 echo "Bridge network: $BRIDGE_NET (10.90.0.0/16)"
