@@ -13,6 +13,8 @@ services:
       - SYS_ADMIN
     security_opt:
       - seccomp:unconfined
+    devices:
+      - /dev/net/tun:/dev/net/tun
     tmpfs:
       - /run
       - /run/lock
@@ -30,7 +32,6 @@ services:
       - NODE_K3S_ENABLED=true
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
-      # WIREGUARD_PORT removed — networking is Tailscale, not WireGuard
       - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
@@ -38,6 +39,9 @@ services:
     ports:
       - "7946:7946/tcp"
       - "7946:7946/udp"
+      - "6443:6443"
+      - "30080:30080"
+      - "30819:30819"
     healthcheck:
       test: ["CMD", "/usr/local/bin/node-agent", "info"]
       interval: 10s
@@ -59,6 +63,8 @@ services:
       - SYS_ADMIN
     security_opt:
       - seccomp:unconfined
+    devices:
+      - /dev/net/tun:/dev/net/tun
     tmpfs:
       - /run
       - /run/lock
@@ -73,10 +79,9 @@ services:
     environment:
       - NODE_NAME=node2
       - NODE_BOOTSTRAP=false
-      - NODE_JOIN=node1:7946
+      - NODE_JOIN=10.90.0.10:7946
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
-      # WIREGUARD_PORT removed — networking is Tailscale, not WireGuard
       - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
@@ -99,6 +104,8 @@ services:
       - SYS_ADMIN
     security_opt:
       - seccomp:unconfined
+    devices:
+      - /dev/net/tun:/dev/net/tun
     tmpfs:
       - /run
       - /run/lock
@@ -113,10 +120,9 @@ services:
     environment:
       - NODE_NAME=node3
       - NODE_BOOTSTRAP=false
-      - NODE_JOIN=node1:7946
+      - NODE_JOIN=10.90.0.10:7946
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
-      # WIREGUARD_PORT removed — networking is Tailscale, not WireGuard
       - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
@@ -139,6 +145,8 @@ services:
       - SYS_ADMIN
     security_opt:
       - seccomp:unconfined
+    devices:
+      - /dev/net/tun:/dev/net/tun
     tmpfs:
       - /run
       - /run/lock
@@ -153,10 +161,9 @@ services:
     environment:
       - NODE_NAME=node4
       - NODE_BOOTSTRAP=false
-      - NODE_JOIN=node1:7946
+      - NODE_JOIN=10.90.0.10:7946
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
-      # WIREGUARD_PORT removed — networking is Tailscale, not WireGuard
       - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:
@@ -179,6 +186,8 @@ services:
       - SYS_ADMIN
     security_opt:
       - seccomp:unconfined
+    devices:
+      - /dev/net/tun:/dev/net/tun
     tmpfs:
       - /run
       - /run/lock
@@ -193,10 +202,9 @@ services:
     environment:
       - NODE_NAME=node5
       - NODE_BOOTSTRAP=false
-      - NODE_JOIN=node1:7946
+      - NODE_JOIN=10.90.0.10:7946
       - SERF_BIND_PORT=7946
       - RAFT_BIND_PORT=7373
-      # WIREGUARD_PORT removed — networking is Tailscale, not WireGuard
       - CLUSTER_AUTH_KEY=7RB0TPs+d/VuD3rL/7ZD2JEcpA14aNCBvLOPHwEBy9s=
     networks:
       cluster_net:

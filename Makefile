@@ -51,11 +51,11 @@ help:
 	@echo "  sudo systemctl start clusteros-make-usb           # via systemd"
 	@echo ""
 	@echo "Test Targets (Docker):"
-	@echo "  make test         - Run unit tests"
-	@echo "  make test-cluster - Start Docker multi-node test cluster"
-	@echo "  make test-slurm   - Test SLURM integration only"
-	@echo "  make test-k3s     - Test K3s integration only"
-	@echo "  make test-full    - Full integration suite (SLURM + K3s)"
+	@echo "  make test           - Run unit tests"
+	@echo "  make test-cluster   - Start Docker multi-node test cluster (bridge + Tailscale overlay)"
+	@echo "  make test-slurm     - Test SLURM integration only"
+	@echo "  make test-k3s       - Test K3s integration only"
+	@echo "  make test-full      - Full integration suite (SLURM + K3s)"
 	@echo ""
 	@echo "Test Targets (QEMU VMs):"
 	@echo "  make test-vm      - Start QEMU VM cluster (3 nodes)"
@@ -114,8 +114,6 @@ test-coverage: test
 
 test-cluster: node
 	@echo "Starting Docker test cluster..."
-	@echo "Note: This will stop and remove any existing cluster containers"
-	@echo "Building cluster containers and starting services..."
 	@./test/docker/start-cluster-direct.sh
 	@echo ""
 	@echo "Useful commands:"
@@ -185,10 +183,14 @@ test-full: node
 	@echo "Full test suite complete!"
 	@echo "=========================================="
 
-image: node cluster-key
+image: patch cluster-key
 	@echo "========================================="
 	@echo "Building OS image with Packer"
 	@echo "========================================="
+	@if [ ! -f images/ubuntu/.env ]; then \
+		echo "Error: images/ubuntu/.env missing — copy images/ubuntu/.env.example and add Tailscale credentials"; \
+		exit 1; \
+	fi
 	@if [ ! -f $(PACKER_FILE) ]; then \
 		echo "Error: Packer file not found at $(PACKER_FILE)"; \
 		exit 1; \

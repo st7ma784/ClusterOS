@@ -21,9 +21,13 @@ RUN apt-get update && apt-get install -y \
     sudo \
     vim \
     less \
+    jq \
+    avahi-daemon \
+    avahi-utils \
+    libnss-mdns \
     slurm-wlm \
-    slurmd \
-    slurmctld \
+    slurm-client \
+    slurmrestd \
     munge \
     python3 \
     python3-pip \
@@ -39,15 +43,21 @@ RUN apt-get update && apt-get install -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Tailscale
+RUN curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
+        | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null && \
+    curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
+        | tee /etc/apt/sources.list.d/tailscale.list && \
+    apt-get update && apt-get install -y tailscale && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # Install k3s binary (pre-installed for production readiness)
 RUN curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true \
     INSTALL_K3S_SKIP_ENABLE=true \
     INSTALL_K3S_EXEC="--snapshotter=fuse-overlayfs" sh -
 
-# Install kubectl for easier k8s management
-RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
-    chmod +x kubectl && \
-    mv kubectl /usr/local/bin/
+# k3s ships kubectl; symlink it under the standard name for convenience
+RUN ln -s /usr/local/bin/k3s /usr/local/bin/kubectl
 
 # Configure systemd for container environment
 RUN systemctl mask systemd-udevd.service \
@@ -66,6 +76,7 @@ RUN mkdir -p /var/run/dbus && \
 # Create cluster-os directories
 RUN mkdir -p /var/lib/cluster-os \
     /etc/cluster-os \
+    /etc/clusteros \
     /var/log/cluster-os \
     /usr/local/bin
 
@@ -78,6 +89,13 @@ COPY node/config/node.yaml /etc/cluster-os/node.yaml
 
 # Copy systemd service file
 COPY node/systemd/node-agent.service /etc/systemd/system/node-agent.service
+
+# Bake in Tailscale credentials (same flow as OS images — OAuth, never-expiring)
+# patch/tailscale.env must exist at build time; patch/tailscale-auth is the auth script
+COPY patch/tailscale-auth /usr/local/bin/clusteros-tailscale-init
+COPY patch/tailscale.env /etc/clusteros/tailscale.env
+RUN chmod +x /usr/local/bin/clusteros-tailscale-init && \
+    chmod 600 /etc/clusteros/tailscale.env
 
 # Copy entrypoint script
 COPY test/docker/entrypoint.sh /entrypoint.sh

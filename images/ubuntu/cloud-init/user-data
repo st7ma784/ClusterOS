@@ -65,8 +65,8 @@ write_files:
             dhcp4: true
             optional: true
             access-points:
-              "MANDER84":
-                password: "M4nd3rsM0b"
+              "TALKTALK665317":
+                password: "NXJP7U39"
 
   # Tailscale first-boot auth script.
   # Reads /etc/clusteros/tailscale.env (written by cluster-make-usb or make deploy).

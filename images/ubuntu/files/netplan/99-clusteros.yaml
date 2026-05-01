@@ -23,5 +23,5 @@ network:
       optional: true
       link-local: [ipv4, ipv6]
       access-points:
-        "MANDER84":
-          password: "M4nd3rsM0b"
+        "TALKTALK665317":
+          password: "NXJP7U39"

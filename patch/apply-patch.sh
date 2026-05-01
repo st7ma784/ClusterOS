@@ -218,6 +218,14 @@ ok "MOTD updated  →  /etc/update-motd.d/99-clusteros"
 # install it and authenticate now — before any step that might need network.
 # This is what gets a fresh node onto the Tailscale overlay so 'make deploy' can
 # find it automatically next time without needing the IP to be specified manually.
+# Install GitOps repo list — only if the node doesn't already have one configured.
+# Preserves any repos the user has added to the existing file on the node.
+mkdir -p /etc/clusteros
+if [ -f "$SCRIPT_DIR/gitops-repos.yaml" ] && [ ! -f /etc/clusteros/gitops-repos.yaml ]; then
+    install -m 644 "$SCRIPT_DIR/gitops-repos.yaml" /etc/clusteros/gitops-repos.yaml
+    ok "GitOps repo list installed → /etc/clusteros/gitops-repos.yaml (edit to add repos)"
+fi
+
 if [ -f "$SCRIPT_DIR/tailscale.env" ]; then
     mkdir -p /etc/clusteros
     install -m 600 "$SCRIPT_DIR/tailscale.env" /etc/clusteros/tailscale.env

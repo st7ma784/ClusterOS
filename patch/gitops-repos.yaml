@@ -1,0 +1,30 @@
+# ClusterOS GitOps repo list
+# Applied on every leader start — repos survive full cluster rebuilds automatically.
+#
+# Usage: edit this file once, then run `make deploy` (or just restart the cluster).
+# The node-agent re-applies these on every boot, so you never need to touch Rancher's UI.
+#
+# Fields:
+#   name              - unique identifier for the GitRepo object (alphanumeric, hyphens)
+#   url               - git repo URL (https:// or git@)
+#   branch            - branch to track (default: main)
+#   path              - subdirectory inside the repo to deploy from (default: repo root)
+#   clientSecretName  - k8s Secret name in fleet-default namespace containing SSH key
+#                       (for private repos; create with:
+#                        kubectl create secret generic my-key -n fleet-default \
+#                          --from-file=ssh-privatekey=/path/to/id_rsa)
+#
+# Example:
+# repos:
+#   - name: monitoring-stack
+#     url: https://github.com/yourorg/monitoring
+#     branch: main
+#     path: deploy/
+#
+#   - name: app-platform
+#     url: git@github.com:yourorg/app-platform.git
+#     branch: production
+#     clientSecretName: app-platform-ssh-key
+#
+# Uncomment and populate to activate:
+repos: []

@@ -538,7 +538,7 @@ EOF
         [ "$phase" = "ready" ]   && pass "Phase=ready"  || fail "Phase=$phase"
         [ "$members" -gt 0 ] 2>/dev/null && pass "$members member(s)" || fail "No cluster members"
         [ "$leader" != "unknown" ] && pass "Leader: $leader" || fail "No leader elected"
-        pgrep -x munged &>/dev/null && pass "munged running" || fail "munged not running"
+        pgrep -f munged &>/dev/null && pass "munged running" || fail "munged not running"
     }
 
     # Run selected tests
@@ -940,15 +940,15 @@ cmd_diag() {
 
     echo ""
     echo -e "${YELLOW}${BOLD} Processes${NC}"
-    pgrep -x slurmctld &>/dev/null && ok "slurmctld running (PID $(pgrep -x slurmctld))" || warn "slurmctld not running"
-    pgrep -x slurmd    &>/dev/null && ok "slurmd running (PID $(pgrep -x slurmd))"    || warn "slurmd not running"
-    pgrep -x munged    &>/dev/null && ok "munged running (PID $(pgrep -x munged))"    || warn "munged not running"
+    pgrep -f slurmctld &>/dev/null && ok "slurmctld running (PID $(pgrep -f slurmctld | head -1))" || warn "slurmctld not running"
+    pgrep -f slurmd    &>/dev/null && ok "slurmd running (PID $(pgrep -f slurmd | head -1))"    || warn "slurmd not running"
+    pgrep -f munged    &>/dev/null && ok "munged running (PID $(pgrep -f munged | head -1))"    || warn "munged not running"
     pgrep -f 'k3s server' &>/dev/null && ok "k3s server running" || \
         { pgrep -f 'k3s agent' &>/dev/null && ok "k3s agent running" || warn "k3s not running"; }
 
     echo ""
     echo -e "${YELLOW}${BOLD} Munge Authentication${NC}"
-    if pgrep -x munged &>/dev/null; then
+    if pgrep -f munged &>/dev/null; then
         if munge -n 2>/dev/null | unmunge &>/dev/null; then
             ok "munge encode/decode self-test passed"
         else
@@ -962,7 +962,7 @@ cmd_diag() {
 
     echo ""
     echo -e "${YELLOW}${BOLD} SLURM${NC}"
-    if pgrep -x slurmctld &>/dev/null || pgrep -x slurmd &>/dev/null; then
+    if pgrep -f slurmctld &>/dev/null || pgrep -f slurmd &>/dev/null; then
         local sinfo_out
         sinfo_out=$(sinfo --noheader 2>/dev/null)
         if [ -n "$sinfo_out" ]; then

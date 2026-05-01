@@ -434,10 +434,7 @@ func (ka *K3sAgent) killExistingAgent() {
 	// Killing unconditionally guarantees a clean-slate containerd start every
 	// time, so k3s always generates a fresh config.toml with the correct image.
 	ka.Logger().Info("Killing any orphaned k3s containerd before agent start")
-	exec.Command("pkill", "-TERM", "-f", "/run/k3s/containerd/containerd").Run() //nolint:errcheck
-	time.Sleep(500 * time.Millisecond)
-	exec.Command("pkill", "-KILL", "-f", "/run/k3s/containerd/containerd").Run() //nolint:errcheck
-	os.Remove("/run/k3s/containerd/containerd.sock")                              //nolint:errcheck
+	killOrphanedContainerd(500 * time.Millisecond)
 }
 
 // cleanupOrphanedPodVolumes force-unmounts lingering kubelet pod volume bind-mounts

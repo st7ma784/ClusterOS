@@ -72,6 +72,8 @@ type Daemon struct {
 	slurmCtrl      *controller.SLURMController // non-nil only on leader
 	failedPeerCache *peerFailCache
 	k3sServerURL   string // URL this worker joined with; empty on leader/CP nodes
+	forceShutdown  bool
+	drainTimeout   time.Duration
 }
 
 // Config contains configuration for creating a daemon.
@@ -85,7 +87,8 @@ type Config struct {
 	// BuildTime is the binary build timestamp. For dirty builds it is appended to
 	// Version in the Serf tag so binaries built at different times are treated as
 	// distinct versions even when the commit hash is the same.
-	BuildTime string
+	BuildTime     string
+	ForceShutdown bool
 }
 
 // New creates a new daemon instance.
@@ -104,6 +107,8 @@ func New(cfg *Config) (*Daemon, error) {
 		cancel:          cancel,
 		phase:           PhaseDiscovering,
 		failedPeerCache: newPeerFailCache(),
+		forceShutdown:   cfg.ForceShutdown,
+		drainTimeout:    5 * time.Minute,
 	}, nil
 }
 
@@ -236,9 +241,59 @@ func (d *Daemon) Run() error {
 	return d.Shutdown()
 }
 
+// drainSLURM drains SLURM jobs off this node. Only called on the leader (d.slurmCtrl != nil).
+func (d *Daemon) drainSLURM(ctx context.Context) {
+	hostname, _ := os.Hostname()
+	d.logger.Infof("Draining SLURM node %s before shutdown...", hostname)
+	exec.CommandContext(ctx, "scontrol", "update",
+		"NodeName="+hostname, "State=DRAIN", "Reason=node-agent shutdown").Run()
+	for {
+		select {
+		case <-ctx.Done():
+			d.logger.Warn("SLURM drain timed out — proceeding with shutdown")
+			return
+		case <-time.After(5 * time.Second):
+			out, _ := exec.CommandContext(ctx, "squeue", "--noheader",
+				"--nodes="+hostname, "--states=R").Output()
+			if strings.TrimSpace(string(out)) == "" {
+				d.logger.Info("SLURM node drained — no running jobs")
+				return
+			}
+			d.logger.Infof("SLURM drain: waiting for jobs to finish on %s", hostname)
+		}
+	}
+}
+
+// drainKubernetes cordons and drains k8s pods off this node. Only called on CP server nodes.
+func (d *Daemon) drainKubernetes(ctx context.Context) {
+	hostname, _ := os.Hostname()
+	d.logger.Infof("Cordoning and draining k8s node %s before shutdown...", hostname)
+	exec.CommandContext(ctx, "k3s", "kubectl", "cordon", hostname).Run()
+	cmd := exec.CommandContext(ctx, "k3s", "kubectl", "drain", hostname,
+		"--ignore-daemonsets", "--delete-emptydir-data", "--force",
+		"--grace-period=30", "--timeout=4m30s")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		d.logger.Warnf("kubectl drain incomplete: %v — %s", err, string(out))
+		return
+	}
+	d.logger.Info("Kubernetes node drained successfully")
+}
+
 // Shutdown gracefully stops all components.
 func (d *Daemon) Shutdown() error {
 	d.logger.Info("Shutting down daemon")
+	if !d.forceShutdown {
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), d.drainTimeout)
+		defer drainCancel()
+		if d.slurmCtrl != nil {
+			d.drainSLURM(drainCtx)
+		}
+		if d.isCPServer {
+			d.drainKubernetes(drainCtx)
+		}
+	} else {
+		d.logger.Warn("Force shutdown — skipping drain")
+	}
 	d.cancel()
 	if d.roleManager != nil {
 		d.roleManager.Shutdown()
@@ -637,15 +692,7 @@ func (d *Daemon) runProvisioning() error {
 
 	// Label this k8s node with its extra disk count so Longhorn registration
 	// can read it without needing SSH or Serf tag budget for path strings.
-	if paths := readExtraDiskPaths(); len(paths) > 0 {
-		hostname, _ := os.Hostname()
-		label := fmt.Sprintf("clusteros-ndisks=%d", len(paths))
-		if out, err := exec.Command("k3s", "kubectl", "label", "node", hostname, label, "--overwrite").CombinedOutput(); err != nil {
-			d.logger.Warnf("Could not label node with disk count: %v — %s", err, string(out))
-		} else {
-			d.logger.Infof("Labelled k8s node %s with %s", hostname, label)
-		}
-	}
+	d.labelNodeDiskCount("", 0)
 
 	serverURL := fmt.Sprintf("https://%s:6443", nodeIP)
 
@@ -810,34 +857,11 @@ func (d *Daemon) runJoining() error {
 
 	// All cluster tags are published atomically with phase=ready.
 	// Use a 5-minute timeout per tag as insurance against slow gossip propagation.
-	k3sServerURL, err := d.waitForLeaderTag("k3s-server", "", 5*time.Minute)
+	tags, err := d.readLeaderClusterTags()
 	if err != nil {
-		d.logger.Errorf("k3s-server tag not found; leader tags visible: %v", d.getLeaderTags())
-		return fmt.Errorf("read k3s-server tag: %w", err)
+		return err
 	}
-	k3sToken, err := d.waitForLeaderTag("k3s-token", "", 5*time.Minute)
-	if err != nil {
-		return fmt.Errorf("read k3s-token tag: %w", err)
-	}
-	var mungeKey []byte
-	mungeKeyB64, err := d.waitForLeaderTag("munge-key", "", 5*time.Minute)
-	if err != nil {
-		d.logger.Warnf("munge-key tag not found; leader tags visible: %v — will try local munge.key or user-event delivery", d.getLeaderTags())
-		// Attempt to read a locally-applied munge key (might have arrived via user event)
-		mungeManager := slurmauth.NewMungeKeyManager(d.logger)
-		if k, err2 := mungeManager.ReadMungeKey(); err2 == nil {
-			d.logger.Info("Found local /etc/munge/munge.key written by user event; using it")
-			mungeKey = k
-		} else {
-			// No local key — fail with original error
-			return fmt.Errorf("read munge-key tag: %w", err)
-		}
-	} else {
-		mungeKey, err = base64.StdEncoding.DecodeString(mungeKeyB64)
-		if err != nil {
-			return fmt.Errorf("decode munge key: %w", err)
-		}
-	}
+	k3sServerURL, k3sToken, mungeKey := tags.ServerURL, tags.Token, tags.MungeKey
 
 	// Extract controller IP from the K3s server URL (https://<IP>:6443).
 	controllerIP := d.extractHost(k3sServerURL)
@@ -849,18 +873,9 @@ func (d *Daemon) runJoining() error {
 	d.mu.Unlock()
 
 	// Wait for Tailscale before attempting to join k3s.
-	// The k3s server URL is a Tailscale IP (e.g. https://100.x.x.x:6443).
 	// On a freshly patched node, Tailscale OAuth can take 30-120s to authenticate.
-	// We waited 45s at startup; give it an additional 90s here (total ~2.5 min).
-	// If Tailscale is already up, this returns instantly.
-	if tsIP := d.detectTailscaleIPWithRetry(90 * time.Second); tsIP != "" {
-		d.logger.Infof("Tailscale ready (%s) — proceeding with k3s join", tsIP)
-		// Update wgip Serf tag so other nodes know our Tailscale IP.
-		_ = d.discovery.UpdateTags(map[string]string{"wgip": tsIP})
-		// Use Tailscale IP for SLURM (which registers by nodeIP with the controller).
+	if tsIP := d.updateTailscaleIP("k3s join"); tsIP != "" {
 		nodeIP = tsIP
-	} else {
-		d.logger.Warn("Tailscale not available after 2.5min — attempting k3s join via LAN routing")
 	}
 
 	// --- K3s agent ---
@@ -874,19 +889,8 @@ func (d *Daemon) runJoining() error {
 		d.roleManager.RegisterRole("k3s-agent", k3sAgent)
 		// Label this worker node with its extra disk count so the leader's Longhorn
 		// registration goroutine can read it from the k8s API without SSH.
-		if paths := readExtraDiskPaths(); len(paths) > 0 {
-			hostname, _ := os.Hostname()
-			label := fmt.Sprintf("clusteros-ndisks=%d", len(paths))
-			// Wait briefly for agent registration before labelling.
-			time.Sleep(30 * time.Second)
-			if out, err := exec.Command("k3s", "kubectl",
-				"--server", k3sServerURL,
-				"label", "node", hostname, label, "--overwrite").CombinedOutput(); err != nil {
-				d.logger.Warnf("Could not label worker node with disk count: %v — %s", err, string(out))
-			} else {
-				d.logger.Infof("Labelled worker k8s node %s with %s", hostname, label)
-			}
-		}
+		// Wait 30s for agent registration before labelling.
+		d.labelNodeDiskCount(k3sServerURL, 30*time.Second)
 	}
 
 	// --- SLURM worker ---
@@ -920,34 +924,14 @@ func (d *Daemon) runJoiningCP() error {
 	}
 	d.syncWithLeader()
 
-	k3sServerURL, err := d.waitForLeaderTag("k3s-server", "", 5*time.Minute)
+	tags, err := d.readLeaderClusterTags()
 	if err != nil {
-		return fmt.Errorf("read k3s-server tag: %w", err)
+		return err
 	}
-	k3sToken, err := d.waitForLeaderTag("k3s-token", "", 5*time.Minute)
-	if err != nil {
-		return fmt.Errorf("read k3s-token tag: %w", err)
-	}
-	var mungeKey []byte
-	mungeKeyB64, err := d.waitForLeaderTag("munge-key", "", 5*time.Minute)
-	if err != nil {
-		mungeManager := slurmauth.NewMungeKeyManager(d.logger)
-		if k, err2 := mungeManager.ReadMungeKey(); err2 == nil {
-			mungeKey = k
-		} else {
-			return fmt.Errorf("read munge-key tag: %w", err)
-		}
-	} else {
-		mungeKey, err = base64.StdEncoding.DecodeString(mungeKeyB64)
-		if err != nil {
-			return fmt.Errorf("decode munge key: %w", err)
-		}
-	}
+	k3sServerURL, k3sToken, mungeKey := tags.ServerURL, tags.Token, tags.MungeKey
 
 	nodeIP := d.getLocalIP()
-	if tsIP := d.detectTailscaleIPWithRetry(90 * time.Second); tsIP != "" {
-		d.logger.Infof("Tailscale ready (%s) — proceeding with CP join", tsIP)
-		_ = d.discovery.UpdateTags(map[string]string{"wgip": tsIP})
+	if tsIP := d.updateTailscaleIP("CP join"); tsIP != "" {
 		nodeIP = tsIP
 	}
 
@@ -961,9 +945,8 @@ func (d *Daemon) runJoiningCP() error {
 	// race where k3s adds the secondary as an etcd learner while etcd is still
 	// unstable, producing "authentication handshake failed: context deadline
 	// exceeded" and a permanent quorum loss.
-	leaderHost := d.extractHost(k3sServerURL)
-	d.logger.Infof("Verifying leader k3s API is truly ready at %s before joining CP...", leaderHost)
-	if err := d.waitForK3sAPIHTTP(leaderHost, 10*time.Minute); err != nil {
+	d.logger.Infof("Verifying leader k3s API is truly ready at %s before joining CP...", controllerIP)
+	if err := d.waitForK3sAPIHTTP(controllerIP, 10*time.Minute); err != nil {
 		return fmt.Errorf("leader k3s API not ready: %w", err)
 	}
 	d.logger.Info("Leader k3s API confirmed ready — starting secondary k3s server")
@@ -984,13 +967,7 @@ func (d *Daemon) runJoiningCP() error {
 	}
 
 	// Label this node's extra disks in k8s.
-	if paths := readExtraDiskPaths(); len(paths) > 0 {
-		hostname, _ := os.Hostname()
-		label := fmt.Sprintf("clusteros-ndisks=%d", len(paths))
-		if out, lErr := exec.Command("k3s", "kubectl", "label", "node", hostname, label, "--overwrite").CombinedOutput(); lErr != nil {
-			d.logger.Warnf("Could not label CP node with disk count: %v — %s", lErr, string(out))
-		}
-	}
+	d.labelNodeDiskCount("", 0)
 
 	// Start SLURM worker — CP nodes participate in compute just like pure agents.
 	d.logger.Infof("Starting SLURM worker on CP node (controller=%s)", controllerIP)
@@ -2809,6 +2786,82 @@ func readExtraDiskPaths() []string {
 		}
 	}
 	return paths
+}
+
+// labelNodeDiskCount labels the local k8s node with its extra-disk count.
+// serverURL, when non-empty, adds --server so a worker can reach the leader API.
+// preDelay, when non-zero, sleeps first (used on workers to wait for node registration).
+func (d *Daemon) labelNodeDiskCount(serverURL string, preDelay time.Duration) {
+	paths := readExtraDiskPaths()
+	if len(paths) == 0 {
+		return
+	}
+	if preDelay > 0 {
+		time.Sleep(preDelay)
+	}
+	hostname, _ := os.Hostname()
+	label := fmt.Sprintf("clusteros-ndisks=%d", len(paths))
+	args := []string{"kubectl"}
+	if serverURL != "" {
+		args = append(args, "--server", serverURL)
+	}
+	args = append(args, "label", "node", hostname, label, "--overwrite")
+	if out, err := exec.Command("k3s", args...).CombinedOutput(); err != nil {
+		d.logger.Warnf("Could not label node with disk count: %v — %s", err, string(out))
+	} else {
+		d.logger.Infof("Labelled k8s node %s with %s", hostname, label)
+	}
+}
+
+// leaderClusterTags holds the three tags published by the leader when the cluster is ready.
+type leaderClusterTags struct {
+	ServerURL string
+	Token     string
+	MungeKey  []byte
+}
+
+// readLeaderClusterTags waits for and decodes the three tags the leader publishes.
+func (d *Daemon) readLeaderClusterTags() (leaderClusterTags, error) {
+	serverURL, err := d.waitForLeaderTag("k3s-server", "", 5*time.Minute)
+	if err != nil {
+		d.logger.Errorf("k3s-server tag not found; leader tags visible: %v", d.getLeaderTags())
+		return leaderClusterTags{}, fmt.Errorf("read k3s-server tag: %w", err)
+	}
+	token, err := d.waitForLeaderTag("k3s-token", "", 5*time.Minute)
+	if err != nil {
+		return leaderClusterTags{}, fmt.Errorf("read k3s-token tag: %w", err)
+	}
+	var mungeKey []byte
+	mungeKeyB64, err := d.waitForLeaderTag("munge-key", "", 5*time.Minute)
+	if err != nil {
+		d.logger.Warnf("munge-key tag not found; leader tags visible: %v — will try local munge.key or user-event delivery", d.getLeaderTags())
+		mungeManager := slurmauth.NewMungeKeyManager(d.logger)
+		if k, err2 := mungeManager.ReadMungeKey(); err2 == nil {
+			d.logger.Info("Found local /etc/munge/munge.key written by user event; using it")
+			mungeKey = k
+		} else {
+			return leaderClusterTags{}, fmt.Errorf("read munge-key tag: %w", err)
+		}
+	} else {
+		mungeKey, err = base64.StdEncoding.DecodeString(mungeKeyB64)
+		if err != nil {
+			return leaderClusterTags{}, fmt.Errorf("decode munge key: %w", err)
+		}
+	}
+	return leaderClusterTags{ServerURL: serverURL, Token: token, MungeKey: mungeKey}, nil
+}
+
+// updateTailscaleIP detects the Tailscale IP (up to 90s) and, if found, updates
+// the wgip Serf tag and returns the IP. Returns empty string if Tailscale is unavailable.
+func (d *Daemon) updateTailscaleIP(purpose string) string {
+	tsIP := d.detectTailscaleIPWithRetry(90 * time.Second)
+	if tsIP == "" {
+		d.logger.Warnf("Tailscale not available after 2.5min — attempting %s via LAN routing", purpose)
+		return ""
+	}
+	d.logger.Infof("Tailscale ready (%s) — proceeding with %s", tsIP, purpose)
+	_ = d.discovery.UpdateTags(map[string]string{"wgip": tsIP})
+	return tsIP
 }
 
 // extraDiskTotalMB returns the total usable space in MB across n standardised

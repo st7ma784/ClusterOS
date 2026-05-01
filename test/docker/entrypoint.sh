@@ -8,21 +8,18 @@ echo "=========================================="
 NODE_NAME="${NODE_NAME:-$(hostname)}"
 NODE_BOOTSTRAP="${NODE_BOOTSTRAP:-false}"
 NODE_JOIN="${NODE_JOIN:-}"
-NODE_K3S_ENABLED="${NODE_K3S_ENABLED:-false}"
 SERF_BIND_PORT="${SERF_BIND_PORT:-7946}"
 RAFT_BIND_PORT="${RAFT_BIND_PORT:-7373}"
-# WIREGUARD_PORT removed — networking is handled by Tailscale, not WireGuard.
 CLUSTER_AUTH_KEY="${CLUSTER_AUTH_KEY:-}"
 
 echo "Node Name: $NODE_NAME"
 echo "Bootstrap Mode: $NODE_BOOTSTRAP"
 echo "Join Address: ${NODE_JOIN:-none}"
-echo "K3S Enabled: $NODE_K3S_ENABLED"
-echo "Cluster Auth: ${CLUSTER_AUTH_KEY:0:16}..." # Show only first 16 chars for security
-echo "Note: WireGuard not used in containers — Tailscale handles overlay networking on bare metal"
+echo "Cluster Auth: ${CLUSTER_AUTH_KEY:0:16}..."
+echo "Tailscale: $([ -f /etc/clusteros/tailscale.env ] && echo "credentials baked in" || echo "no credentials — LAN-only")"
 
 # Create configuration directory if it doesn't exist
-mkdir -p /etc/cluster-os /var/lib/cluster-os
+mkdir -p /etc/cluster-os /var/lib/cluster-os /var/log/cluster-os
 
 # Generate node configuration
 cat > /etc/cluster-os/node.yaml <<EOF
@@ -39,8 +36,6 @@ discovery:
   encrypt_key: ""
 
 networking:
-  # interface/listen_port not used — Tailscale handles overlay networking on bare metal.
-  # In container test mode, nodes communicate over the Docker bridge (cluster_net).
   interface: ""
   listen_port: 0
   subnet: "10.42.0.0/16"
@@ -59,11 +54,9 @@ if [ -n "$NODE_ROLES" ]; then
         echo "    - $role" >> /etc/cluster-os/node.yaml
     done
 elif [ "$NODE_BOOTSTRAP" = "true" ]; then
-    # Bootstrap node gets controller roles
     echo "    - slurm-controller" >> /etc/cluster-os/node.yaml
     echo "    - k3s-server" >> /etc/cluster-os/node.yaml
 else
-    # Non-bootstrap nodes get worker roles
     echo "    - slurm-worker" >> /etc/cluster-os/node.yaml
     echo "    - k3s-agent" >> /etc/cluster-os/node.yaml
 fi
@@ -85,13 +78,12 @@ cluster:
   region: docker
   datacenter: test
   auth_key: $CLUSTER_AUTH_KEY
-  election_mode: serf  # Use stateless Serf-based election for Docker (no persistent storage)
+  election_mode: serf
 EOF
 
 # If NODE_JOIN is set, add bootstrap peers
 if [ -n "$NODE_JOIN" ]; then
     echo "Configuring to join via: $NODE_JOIN"
-    # Update config with bootstrap peers
     sed -i "s/bootstrap_peers: \[\]/bootstrap_peers: [\"$NODE_JOIN\"]/" /etc/cluster-os/node.yaml
 fi
 
@@ -101,57 +93,34 @@ export CLUSTEROS_RAFT_BIND_PORT="${RAFT_BIND_PORT}"
 export CLUSTEROS_BOOTSTRAP="${NODE_BOOTSTRAP}"
 
 echo "Configuration written to /etc/cluster-os/node.yaml"
-
-# This should show in logs
-echo "=========================================="
-echo "DEBUG: NODE_BOOTSTRAP=$NODE_BOOTSTRAP"
-echo "DEBUG: NODE_K3S_ENABLED=$NODE_K3S_ENABLED"  
 echo "=========================================="
 
-# Start k3s server in background if enabled
-if [ "$NODE_BOOTSTRAP" = "true" ] && [ "$NODE_K3S_ENABLED" = "true" ]; then
-    echo "K3S: Condition met - Starting k3s..."
-    
-    if command -v k3s &> /dev/null; then
-        echo "K3S: Binary found, starting..."
-        
-        # Get the container's IP address (from cluster network)
-        CONTAINER_IP=$(hostname -i | awk '{print $1}')
-        echo "K3S: Using container IP: $CONTAINER_IP"
-        
-        # Create a k3s config with TLS SANs to fix certificate issues
-        mkdir -p /etc/rancher/k3s
-        cat > /etc/rancher/k3s/config.yaml <<EOFK3S
-tls-san:
-  - "$CONTAINER_IP"
-  - "127.0.0.1"
-  - "0.0.0.0"
-  - "$NODE_NAME"
-  - "localhost"
-EOFK3S
-        
-        k3s server \
-            --snapshotter=fuse-overlayfs \
-            --disable=traefik \
-            --disable=servicelb \
-            --disable=local-storage \
-            --node-name="$NODE_NAME" \
-            --bind-address=0.0.0.0 \
-            --advertise-address="$CONTAINER_IP" \
-            --flannel-backend=vxlan \
-            --kubelet-arg=cgroups-per-qos=false \
-            --kubelet-arg=enforce-node-allocatable="" \
-            --kubelet-arg=make-iptables-util-chains=false \
-            --kubelet-arg=feature-gates=KubeletInUserNamespace=true \
-            --kube-apiserver-arg=enable-aggregator-routing=true \
-            > /var/log/cluster-os/k3s-server.log 2>&1 &
-        
-        echo "K3S: Started with PID $!"
-    else
-        echo "K3S: Binary NOT found"
-    fi
+# Start Tailscale using baked-in OAuth credentials (same flow as OS images)
+# clusteros-tailscale-init handles OAuth token → ephemeral auth key → tailscale up
+if [ -f /etc/clusteros/tailscale.env ]; then
+    echo "Tailscale: baked credentials found — starting tailscaled..."
+    mkdir -p /var/lib/tailscale /run/tailscale
+
+    tailscaled \
+        --state=/var/lib/tailscale/tailscaled.state \
+        --socket=/run/tailscale/tailscaled.sock \
+        > /var/log/cluster-os/tailscaled.log 2>&1 &
+
+    # Set per-container hostname before the auth script reads the env file
+    sed -i "s/^TAILSCALE_HOSTNAME=.*/TAILSCALE_HOSTNAME=cluster-os-$NODE_NAME/" \
+        /etc/clusteros/tailscale.env
+
+    # Wait for socket (clusteros-tailscale-init also waits, but give it a head start)
+    for i in $(seq 1 15); do
+        [ -S /run/tailscale/tailscaled.sock ] && break
+        sleep 1
+    done
+
+    clusteros-tailscale-init \
+        && echo "Tailscale: connected as cluster-os-$NODE_NAME" \
+        || echo "Tailscale: WARNING — auth failed (non-fatal, LAN/macvlan discovery still works)"
 else
-    echo "K3S: Condition NOT met (BOOTSTRAP=$NODE_BOOTSTRAP, ENABLED=$NODE_K3S_ENABLED)"
+    echo "Tailscale: no credentials baked in — LAN discovery only"
 fi
 
 echo "=========================================="
@@ -166,5 +135,5 @@ else
     echo "Warning: dbus-daemon not found (non-fatal)"
 fi
 
-# Execute the CMD
+# node-agent owns k3s lifecycle — do not pre-start k3s here
 exec "$@"

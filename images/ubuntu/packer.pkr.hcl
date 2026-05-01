@@ -213,6 +213,21 @@ build {
     destination = "/tmp/cluster.key"
   }
 
+  # Stage the patch bundle (apply-patch.sh, cluster CLI, node-agent binary, etc.)
+  # This must be present before provision.sh runs so that first-boot ExecStartPre can use it.
+  provisioner "file" {
+    source      = "../../patch/"
+    destination = "/tmp/patch-stage"
+  }
+
+  provisioner "shell" {
+    inline = [
+      "sudo mkdir -p /root/patch",
+      "sudo cp -r /tmp/patch-stage/. /root/patch/",
+      "sudo chmod +x /root/patch/apply-patch.sh /root/patch/cluster 2>/dev/null || true"
+    ]
+  }
+
   # Run provisioning script
   provisioner "shell" {
     script = "provision.sh"

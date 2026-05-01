@@ -15,10 +15,14 @@ import (
 
 	"github.com/cluster-os/node/internal/roles"
 	"github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v3"
 )
 
 //go:embed manifests/slurm/slurmdbd.yaml
 var slurmdbdManifest []byte
+
+//go:embed manifests/jupyter/namespace.yaml
+var jupyterNamespaceManifest []byte
 
 // K3sServer manages the k3s server process on the elected leader node.
 // It implements roles.Role for health checking.
@@ -34,6 +38,7 @@ type K3sServer struct {
 	manifestsDir        string
 	slurmdbdDeployed    bool
 	slurmRestDeployed   bool
+	jupyterDeployed     bool
 	servicesDeployed    bool
 	startCount          int // number of times Start() has been called
 }
@@ -340,18 +345,27 @@ func (ks *K3sServer) patchKubeconfigForLocalAccess() {
 	ks.Logger().Info("Patched k3s kubeconfig server URL → https://127.0.0.1:6443")
 }
 
-// ReadToken reads the cluster join token from disk, retrying up to 60s.
-func (ks *K3sServer) ReadToken() (string, error) {
-	deadline := time.Now().Add(60 * time.Second)
+// readFileWithDeadline polls path until it has content or timeout elapses.
+func readFileWithDeadline(path string, timeout time.Duration) ([]byte, error) {
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(ks.tokenPath); err == nil && len(data) > 0 {
-			token := strings.TrimSpace(string(data))
-			ks.Logger().Infof("K3s token read (%d chars)", len(token))
-			return token, nil
+		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+			return data, nil
 		}
 		time.Sleep(2 * time.Second)
 	}
-	return "", fmt.Errorf("K3s token not available after 60s at %s", ks.tokenPath)
+	return nil, fmt.Errorf("file not available after %.0fs at %s", timeout.Seconds(), path)
+}
+
+// ReadToken reads the cluster join token from disk, retrying up to 60s.
+func (ks *K3sServer) ReadToken() (string, error) {
+	data, err := readFileWithDeadline(ks.tokenPath, 60*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("K3s token not available after 60s at %s", ks.tokenPath)
+	}
+	token := strings.TrimSpace(string(data))
+	ks.Logger().Infof("K3s token read (%d chars)", len(token))
+	return token, nil
 }
 
 // ReadCACert returns the k3s cluster CA certificate PEM that the leader's server is using.
@@ -359,15 +373,12 @@ func (ks *K3sServer) ReadToken() (string, error) {
 // without needing the patch/k3s-ca.crt bundle (which may differ across installations).
 func (ks *K3sServer) ReadCACert() ([]byte, error) {
 	caPath := filepath.Join(ks.dataDir, "server/tls/server-ca.crt")
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(caPath); err == nil && len(data) > 0 {
-			ks.Logger().Infof("Read cluster CA cert (%d bytes) from %s", len(data), caPath)
-			return data, nil
-		}
-		time.Sleep(2 * time.Second)
+	data, err := readFileWithDeadline(caPath, 30*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("cluster CA cert not available after 30s at %s", caPath)
 	}
-	return nil, fmt.Errorf("cluster CA cert not available after 30s at %s", caPath)
+	ks.Logger().Infof("Read cluster CA cert (%d bytes) from %s", len(data), caPath)
+	return data, nil
 }
 
 // waitForAPIStable waits until the k3s API is consistently reachable (3 successes
@@ -436,6 +447,7 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 		ks.Logger().Warnf("Failed to deploy cert-manager: %v (skipping Rancher)", err)
 		// Still deploy SLURM REST even if Rancher fails.
 		ks.deploySLURMRestAPI(mungeKey)
+		go ks.deployJupyterHub()
 		ks.servicesDeployed = true
 		return
 	}
@@ -446,6 +458,10 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 		// Apply declarative Helm repos — runs every startup so repos survive full rebuilds.
 		// Blocks briefly (waits for CRD) but runs after deployRancher so Rancher is up.
 		go ks.applyRancherCatalogs()
+
+		// Apply user-defined Fleet GitRepo objects from /etc/clusteros/gitops-repos.yaml.
+		// Runs on every leader start so GitOps repos survive full cluster rebuilds.
+		go ks.applyFleetGitRepos()
 
 		// Install rancher-backup operator and configure scheduled snapshots.
 		// Runs in background; also triggers auto-restore if a backup exists in the PVC.
@@ -464,6 +480,7 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 		"rancher-catchall", "--ignore-not-found=true").Run()
 
 	ks.deploySLURMRestAPI(mungeKey)
+	go ks.deployJupyterHub()
 
 	ks.servicesDeployed = true
 	ks.Logger().Info("Cluster services deployment complete")
@@ -597,10 +614,7 @@ func (ks *K3sServer) killExistingK3s(killContainerd bool) {
 	// complete CRD registration well within the timeout.
 	if killContainerd {
 		ks.Logger().Info("Killing any orphaned k3s containerd before first start")
-		exec.Command("pkill", "-TERM", "-f", "/run/k3s/containerd/containerd").Run() //nolint:errcheck
-		time.Sleep(1 * time.Second)
-		exec.Command("pkill", "-KILL", "-f", "/run/k3s/containerd/containerd").Run() //nolint:errcheck
-		os.Remove("/run/k3s/containerd/containerd.sock")                              //nolint:errcheck
+		killOrphanedContainerd(1 * time.Second)
 	} else {
 		ks.Logger().Info("Skipping containerd kill on restart — reusing running containerd instance")
 	}
@@ -667,6 +681,17 @@ func (ks *K3sServer) waitForIPReady() error {
 		time.Sleep(2 * time.Second)
 	}
 	return fmt.Errorf("IP %s not bound after 120s", ks.nodeIP)
+}
+
+// killOrphanedContainerd sends SIGTERM to the k3s-embedded containerd, waits
+// graceDelay, then SIGKILLs it, and removes the socket. Called during both
+// server and agent startup to guarantee a clean containerd state.
+func killOrphanedContainerd(graceDelay time.Duration) {
+	const pattern = "/run/k3s/containerd/containerd"
+	exec.Command("pkill", "-TERM", "-f", pattern).Run() //nolint:errcheck
+	time.Sleep(graceDelay)
+	exec.Command("pkill", "-KILL", "-f", pattern).Run() //nolint:errcheck
+	os.Remove("/run/k3s/containerd/containerd.sock")    //nolint:errcheck
 }
 
 // refreshFirewallRules re-applies the critical iptables/UFW rules on the leader node
@@ -2809,6 +2834,98 @@ spec:
 	ks.Logger().Info("Rancher catalogs applied (repos always in sync with code)")
 }
 
+// gitOpsRepoConfig is the schema for /etc/clusteros/gitops-repos.yaml.
+type gitOpsRepoConfig struct {
+	Repos []struct {
+		Name             string `yaml:"name"`
+		URL              string `yaml:"url"`
+		Branch           string `yaml:"branch"`
+		Path             string `yaml:"path"`
+		ClientSecretName string `yaml:"clientSecretName"`
+	} `yaml:"repos"`
+}
+
+// applyFleetGitRepos reads /etc/clusteros/gitops-repos.yaml and applies Fleet GitRepo CRs
+// on every leader start. This makes GitOps repos survive full cluster rebuilds (etcd wipes)
+// because the source of truth is the on-disk config file, not etcd.
+//
+// File format (YAML):
+//
+//	repos:
+//	  - name: my-app
+//	    url: https://github.com/user/my-app
+//	    branch: main          # optional, default: main
+//	    path: deploy/         # optional, default: "" (repo root)
+//	    clientSecretName: ""  # optional: k8s secret in fleet-default with SSH key
+func (ks *K3sServer) applyFleetGitRepos() {
+	const configPath = "/etc/clusteros/gitops-repos.yaml"
+
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		return // no config — nothing to do
+	}
+	if err != nil {
+		ks.Logger().Warnf("Fleet GitOps: cannot read %s: %v", configPath, err)
+		return
+	}
+
+	var cfg gitOpsRepoConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		ks.Logger().Warnf("Fleet GitOps: cannot parse %s: %v", configPath, err)
+		return
+	}
+	if len(cfg.Repos) == 0 {
+		return
+	}
+
+	// Wait for Fleet CRD (Fleet is bundled with Rancher; appears after Rancher is up).
+	ks.Logger().Info("Fleet GitOps: waiting for Fleet CRD...")
+	deadline := time.Now().Add(15 * time.Minute)
+	for time.Now().Before(deadline) {
+		if exec.Command("k3s", "kubectl", "get", "crd", "gitrepos.fleet.cattle.io").Run() == nil {
+			break
+		}
+		time.Sleep(20 * time.Second)
+	}
+	if exec.Command("k3s", "kubectl", "get", "crd", "gitrepos.fleet.cattle.io").Run() != nil {
+		ks.Logger().Warn("Fleet GitOps: Fleet CRD not available — skipping GitRepo apply")
+		return
+	}
+
+	// Ensure the fleet-default namespace exists (created by Rancher, but belt-and-suspenders).
+	exec.Command("k3s", "kubectl", "create", "namespace", "fleet-default",
+		"--dry-run=client", "-o", "yaml").Run()
+	exec.Command("k3s", "kubectl", "apply", "-f", "-").Run()
+
+	var buf strings.Builder
+	for _, r := range cfg.Repos {
+		branch := r.Branch
+		if branch == "" {
+			branch = "main"
+		}
+		buf.WriteString("apiVersion: fleet.cattle.io/v1alpha1\nkind: GitRepo\nmetadata:\n")
+		buf.WriteString(fmt.Sprintf("  name: %s\n  namespace: fleet-default\nspec:\n", r.Name))
+		buf.WriteString(fmt.Sprintf("  repo: %s\n", r.URL))
+		buf.WriteString(fmt.Sprintf("  branch: %s\n", branch))
+		if r.Path != "" {
+			buf.WriteString(fmt.Sprintf("  paths:\n  - %s\n", r.Path))
+		}
+		if r.ClientSecretName != "" {
+			buf.WriteString(fmt.Sprintf("  clientSecretName: %s\n", r.ClientSecretName))
+		}
+		// Target all clusters in the local fleet workspace.
+		buf.WriteString("  targets:\n  - clusterSelector: {}\n---\n")
+	}
+
+	cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(buf.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("Fleet GitOps: apply failed: %v: %s", err, out)
+		return
+	}
+	ks.Logger().Infof("Fleet GitOps: applied %d GitRepo(s) from %s", len(cfg.Repos), configPath)
+}
+
 // deployRancherBackup installs the rancher-backup-restore operator and configures
 // a scheduled backup to a Longhorn-backed PVC (longhorn-ha = Retain reclaim policy).
 //
@@ -3062,4 +3179,132 @@ spec:
 		}
 		break
 	}
+}
+
+func buildJupyterHelmValues() string {
+	return `hub:
+  baseUrl: /jupyter
+  config:
+    JupyterHub:
+      authenticator_class: dummy
+    DummyAuthenticator:
+      password: "clusteros"
+
+proxy:
+  service:
+    type: NodePort
+    nodePorts:
+      http: 30888
+
+singleuser:
+  image:
+    name: quay.io/jupyter/scipy-notebook
+    tag: latest
+  storage:
+    dynamic:
+      storageClass: longhorn-ha
+    capacity: 10Gi
+  extraEnv:
+    GRANT_SUDO: "yes"
+
+cull:
+  enabled: true
+  timeout: 3600
+
+scheduling:
+  userScheduler:
+    enabled: false
+`
+}
+
+func (ks *K3sServer) patchJupyterNodePort() {
+	patch := `{"spec":{"ports":[{"name":"http","port":80,"targetPort":8000,"nodePort":30888}]}}`
+	exec.Command("k3s", "kubectl", "-n", "jupyterhub", "patch", "svc", "proxy-public",
+		"--type=merge", "-p", patch).Run() //nolint:errcheck
+}
+
+func (ks *K3sServer) ensureJupyterIngress() {
+	const ingressYAML = `apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jupyterhub-ingress
+  namespace: jupyterhub
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+  - http:
+      paths:
+      - path: /jupyter(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: proxy-public
+            port:
+              number: 80
+`
+	cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(ingressYAML)
+	cmd.Run()
+}
+
+func (ks *K3sServer) deployJupyterHub() {
+	if ks.jupyterDeployed {
+		return
+	}
+	ks.Logger().Info("Deploying JupyterHub...")
+
+	alreadyInstalled := exec.Command("k3s", "kubectl", "-n", "jupyterhub", "get", "deployment", "hub").Run() == nil
+	if alreadyInstalled {
+		ks.jupyterDeployed = true
+		ks.ensureJupyterIngress()
+		return
+	}
+
+	applyNs := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	applyNs.Stdin = bytes.NewReader(jupyterNamespaceManifest)
+	if output, err := applyNs.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("jupyterhub namespace: %v: %s", err, output)
+	}
+
+	repoCmd := exec.Command("bash", "-c",
+		"helm repo add jupyterhub https://hub.jupyter.org/helm-chart/ && helm repo update")
+	repoCmd.Env = append(os.Environ(), "KUBECONFIG=/etc/rancher/k3s/k3s.yaml")
+	if output, err := repoCmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("jupyterhub helm repo: %v: %s", err, output)
+	}
+
+	valuesFile, err := os.CreateTemp("", "jupyter-values-*.yaml")
+	if err != nil {
+		ks.Logger().Warnf("jupyterhub values tempfile: %v", err)
+		return
+	}
+	defer os.Remove(valuesFile.Name())
+	if _, err := valuesFile.WriteString(buildJupyterHelmValues()); err != nil {
+		ks.Logger().Warnf("jupyterhub values write: %v", err)
+		return
+	}
+	valuesFile.Close()
+
+	helmCmd := exec.Command("helm", "upgrade", "--install", "jupyterhub", "jupyterhub/jupyterhub",
+		"--namespace", "jupyterhub",
+		"--version", "3.3.7",
+		"--values", valuesFile.Name(),
+		"--timeout", "10m",
+		"--wait",
+		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
+	)
+	helmCmd.Env = append(os.Environ(), "KUBECONFIG=/etc/rancher/k3s/k3s.yaml")
+	if output, err := helmCmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("jupyterhub helm install: %v: %s", err, output)
+		return
+	}
+
+	ks.patchJupyterNodePort()
+	ks.ensureJupyterIngress()
+	ks.jupyterDeployed = true
+	ks.Logger().Info("JupyterHub deployed — NodePort 30888 + /jupyter")
 }

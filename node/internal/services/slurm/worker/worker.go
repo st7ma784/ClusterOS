@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 
@@ -91,9 +92,30 @@ func (sw *SLURMWorker) Start() error {
 	return nil
 }
 
-// Stop stops slurmd
+// Stop drains this node's SLURM jobs then stops slurmd.
 func (sw *SLURMWorker) Stop(ctx context.Context) error {
 	sw.Logger().Info("Stopping SLURM worker")
+	nodeName := sw.nodeIP
+	if nodeName == "" {
+		nodeName, _ = os.Hostname()
+	}
+	sw.Logger().Infof("Draining SLURM worker node %s before stopping slurmd", nodeName)
+	exec.CommandContext(ctx, "scontrol", "update",
+		"NodeName="+nodeName, "State=DRAIN", "Reason=node-agent shutdown").Run()
+	drainDeadline := time.Now().Add(2 * time.Minute)
+	for time.Now().Before(drainDeadline) {
+		select {
+		case <-ctx.Done():
+			goto stopSlurmd
+		default:
+		}
+		out, _ := exec.Command("squeue", "--noheader", "--nodes="+nodeName, "--states=R").Output()
+		if strings.TrimSpace(string(out)) == "" {
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+stopSlurmd:
 	return sw.stopSlurmd()
 }
 
