@@ -481,6 +481,13 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 	ks.deploySLURMRestAPI(mungeKey)
 	go ks.deployJupyterHub()
 
+	// Deploy host-based Ingress rules for the custom domain if cloudflare.env is present.
+	// This is independent of cloudflared (which runs as a systemd service) — nginx needs
+	// these rules regardless of how traffic arrives.
+	if domain := readCloudflareDomain(); domain != "" {
+		go ks.deployDomainIngresses(domain)
+	}
+
 	ks.servicesDeployed = true
 	ks.Logger().Info("Cluster services deployment complete")
 
@@ -489,6 +496,155 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 	// ports may be blocked on the leader's LAN interface because kube-proxy's rule
 	// ordering interleaves with iptables rules applied at daemon startup.
 	ks.refreshFirewallRules()
+}
+
+// readCloudflareDomain returns the CLOUDFLARE_DOMAIN from /etc/clusteros/cloudflare.env,
+// or an empty string if the file is absent or the key is not set.
+func readCloudflareDomain() string {
+	data, err := os.ReadFile("/etc/clusteros/cloudflare.env")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "CLOUDFLARE_DOMAIN=") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "CLOUDFLARE_DOMAIN="))
+		}
+	}
+	return ""
+}
+
+// deployDomainIngresses creates host-based Ingress rules so each cluster service is
+// reachable at <service>.<domain>.  Called from DeployClusterServices when a custom
+// domain is configured; safe to re-run (kubectl apply is idempotent).
+func (ks *K3sServer) deployDomainIngresses(domain string) {
+	ks.Logger().Infof("Deploying domain Ingress rules for %s", domain)
+
+	apply := func(yaml string) {
+		cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(yaml)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			ks.Logger().Warnf("domain ingress apply: %v: %s", err, out)
+		}
+	}
+
+	// Root domain → landing page
+	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: landing-domain
+  namespace: ingress-nginx
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: %s
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: clusteros-landing
+            port:
+              number: 80
+`, domain))
+
+	// Longhorn
+	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: longhorn-domain
+  namespace: longhorn-system
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: longhorn.%s
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: longhorn-frontend
+            port:
+              number: 80
+`, domain))
+
+	// Rancher — HTTPS backend
+	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rancher-domain
+  namespace: cattle-system
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: rancher.%s
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rancher
+            port:
+              number: 443
+`, domain))
+
+	// SLURM REST API
+	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: slurm-domain
+  namespace: slurm
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: slurm.%s
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: slurmrestd
+            port:
+              number: 6820
+`, domain))
+
+	// JupyterHub — no path rewrite so JupyterHub's absolute redirects stay on the subdomain
+	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jupyter-domain
+  namespace: jupyterhub
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: jupyter.%s
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: proxy-public
+            port:
+              number: 80
+`, domain))
+
+	ks.Logger().Infof("Domain Ingress rules deployed for %s", domain)
 }
 
 // HealthCheck checks if k3s server process is alive, restarting if needed.
@@ -1523,7 +1679,7 @@ roleRef:
 	// CSS {{/}} in the f-string are Python's way of writing literal { } inside an f-string.
 	const pythonScript = `#!/usr/bin/env python3
 """ClusterOS dynamic landing page — auto-discovers every Kubernetes NodePort service."""
-import http.server, json, ssl, urllib.request, os, socket
+import http.server, json, ssl, urllib.request, os, socket, time, threading
 
 TOKEN_FILE  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 CACERT_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
@@ -1536,6 +1692,21 @@ _K8S_HOST = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
 _K8S_PORT = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS",
             os.environ.get("KUBERNETES_SERVICE_PORT", "443"))
 API_BASE   = f"https://{_K8S_HOST}:{_K8S_PORT}"
+
+# Cache k8s API responses for 30s so repeated requests don't add latency.
+_cache_lock = threading.Lock()
+_cache: dict = {}
+_CACHE_TTL = 30
+
+def cached(key, fn):
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and time.monotonic() - entry[0] < _CACHE_TTL:
+            return entry[1]
+    result = fn()
+    with _cache_lock:
+        _cache[key] = (time.monotonic(), result)
+    return result
 
 # Human-readable labels for known ingress paths.
 INGRESS_LABELS = {
@@ -1686,9 +1857,9 @@ def status_dot(up):
 
 
 def build_page(req_host):
-    ingresses         = collect_ingresses()
-    nodeports, np_err = collect_nodeports(req_host)
-    rancher_wls       = collect_rancher_workloads(req_host)
+    ingresses         = cached("ingresses", collect_ingresses)
+    nodeports, np_err = cached("nodeports_" + req_host, lambda: collect_nodeports(req_host))
+    rancher_wls       = cached("rancher_wls_" + req_host, lambda: collect_rancher_workloads(req_host))
 
     # Web interfaces section (ingress-based) with live status dots.
     ing_rows = ""
