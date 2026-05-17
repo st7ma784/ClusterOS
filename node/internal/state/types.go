@@ -14,16 +14,11 @@ type Node struct {
 	Capabilities Capabilities      `json:"capabilities"`
 	Status       NodeStatus        `json:"status"`
 	Address      string            `json:"address"`
-	TailscaleIP  string            `json:"tailscale_ip,omitempty"`
+	TailscaleIP  net.IP            `json:"tailscale_ip,omitempty"`
+	TailscaleName string           `json:"tailscale_name,omitempty"`
 	Tags         map[string]string `json:"tags"`
 	LastSeen     time.Time         `json:"last_seen"`
 	JoinedAt     time.Time         `json:"joined_at"`
-
-	// Deprecated: WireGuard replaced by Tailscale. These fields are populated
-	// locally in daemon.go for bookkeeping only — never published to Serf tags
-	// and not used for cluster networking.
-	WireGuardPubKey string `json:"wireguard_pubkey,omitempty"`
-	WireGuardIP     net.IP `json:"wireguard_ip,omitempty"`
 }
 
 // Capabilities describes node hardware capabilities
@@ -47,7 +42,7 @@ const (
 
 // ClusterState holds basic cluster membership.
 // Secrets are distributed via Serf member tags — read them directly from serf.Members().
-// Leader tracking is kept here for auxiliary services (e.g. ondemand) that need to find leaders.
+// Leader tracking is kept here for auxiliary services that need to find leaders.
 type ClusterState struct {
 	mu          sync.RWMutex
 	nodes       map[string]*Node
@@ -97,7 +92,7 @@ func (cs *ClusterState) RemoveLeader(role string) {
 	delete(cs.leaders, role)
 }
 
-// GetWireGuardIPs returns an empty slice — WireGuard replaced by Tailscale.
+// GetWireGuardIPs returns nil — retained for compile compatibility; WireGuard removed.
 func (cs *ClusterState) GetWireGuardIPs() []net.IP {
 	return nil
 }
@@ -201,11 +196,11 @@ func (cs *ClusterState) UpdateNodeTags(nodeID string, tags map[string]string) {
 }
 
 // UpdateNodeTailscaleIP updates the Tailscale IP of a node
-func (cs *ClusterState) UpdateNodeTailscaleIP(nodeID, tailscaleIP string) {
+func (cs *ClusterState) UpdateNodeTailscaleIP(nodeID string, ip net.IP) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	if node, ok := cs.nodes[nodeID]; ok {
-		node.TailscaleIP = tailscaleIP
+		node.TailscaleIP = ip
 		node.LastSeen = time.Now()
 	}
 }
@@ -234,4 +229,50 @@ func (cs *ClusterState) GetNodesByRole(role string) []*Node {
 		}
 	}
 	return nodes
+}
+
+// GetTailscaleIPs returns a map of nodeID → TailscaleIP for all nodes that have one.
+func (cs *ClusterState) GetTailscaleIPs() map[string]net.IP {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	result := make(map[string]net.IP)
+	for id, node := range cs.nodes {
+		if node.TailscaleIP != nil {
+			result[id] = node.TailscaleIP
+		}
+	}
+	return result
+}
+
+// GetNodeByTailscaleIP finds a node by its Tailscale IP.
+func (cs *ClusterState) GetNodeByTailscaleIP(ip net.IP) (*Node, bool) {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	for _, node := range cs.nodes {
+		if node.TailscaleIP != nil && node.TailscaleIP.Equal(ip) {
+			return node, true
+		}
+	}
+	return nil, false
+}
+
+// FindIPConflicts returns pairs of node IDs that share the same Tailscale IP.
+func (cs *ClusterState) FindIPConflicts() [][2]string {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	// Build IP → nodeIDs index
+	seen := make(map[string]string) // ip string → first nodeID
+	var conflicts [][2]string
+	for id, node := range cs.nodes {
+		if node.TailscaleIP == nil {
+			continue
+		}
+		key := node.TailscaleIP.String()
+		if first, ok := seen[key]; ok {
+			conflicts = append(conflicts, [2]string{first, id})
+		} else {
+			seen[key] = id
+		}
+	}
+	return conflicts
 }

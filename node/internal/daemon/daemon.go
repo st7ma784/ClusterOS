@@ -136,19 +136,9 @@ func (d *Daemon) Start() error {
 		d.logger.Infof("Using hostname-based node name: %s", nodeName)
 	}
 
-	// WireGuardPubKey is derived here for local state bookkeeping only.
-	// It is NOT published to Serf tags (see initSerf — wg_pubkey intentionally omitted)
-	// because WireGuard has been replaced by Tailscale for overlay networking.
-	// The field is retained in state.Node for compatibility with any code that reads it;
-	// it does not affect network connectivity.
-	wgPubKey, err := d.identity.WireGuardPublicKey()
-	if err != nil {
-		return fmt.Errorf("get WireGuard public key: %w", err)
-	}
-
 	localNode := &state.Node{
-		ID:   d.identity.NodeID,
-		Name: nodeName,
+		ID:    d.identity.NodeID,
+		Name:  nodeName,
 		Roles: d.config.Roles.Enabled,
 		Capabilities: state.Capabilities{
 			CPU:  d.config.Roles.Capabilities.CPU,
@@ -156,8 +146,7 @@ func (d *Daemon) Start() error {
 			GPU:  d.config.Roles.Capabilities.GPU,
 			Arch: d.config.Roles.Capabilities.Arch,
 		},
-		Status:          state.StatusAlive,
-		WireGuardPubKey: wgPubKey, // legacy field — not used for networking (Tailscale handles overlay)
+		Status: state.StatusAlive,
 	}
 	d.clusterState.AddNode(localNode)
 
@@ -1291,8 +1280,8 @@ func (d *Daemon) checkAndApplyUpdate() {
 		}
 		if peerBT.After(best.buildTime) {
 			peerIP := m.Addr.String()
-			if wgip := m.Tags["wgip"]; wgip != "" {
-				peerIP = wgip
+			if tsip := m.Tags["tsip"]; tsip != "" {
+				peerIP = tsip
 			}
 			best = candidate{addr: peerIP, ver: peerVer, buildTime: peerBT}
 		}
@@ -1571,8 +1560,8 @@ func (d *Daemon) selectCPServers() []string {
 			}
 		}
 		memberIP := m.Addr.String()
-		if wgip := m.Tags["wgip"]; wgip != "" {
-			memberIP = wgip
+		if tsip := m.Tags["tsip"]; tsip != "" {
+			memberIP = tsip
 		}
 		extras = append(extras, memberIP)
 	}
@@ -1616,8 +1605,8 @@ func (d *Daemon) buildWorkerList() []controller.WorkerInfo {
 		// Exclude the local node — the controller template already registers this
 		// node's IP as a compute node in slurm.conf.
 		memberIP := m.Addr.String()
-		if wgip, ok := m.Tags["wgip"]; ok && wgip != "" {
-			memberIP = wgip
+		if tsip, ok := m.Tags["tsip"]; ok && tsip != "" {
+			memberIP = tsip
 		}
 		if memberIP == localIP {
 			continue
@@ -1900,6 +1889,114 @@ func (d *Daemon) waitForK3sAPIHTTP(host string, timeout time.Duration) error {
 	return fmt.Errorf("timeout after %v: %w", timeout, lastErr)
 }
 
+// getPhysicalLANIP returns the first routable IPv4 address on a physical (non-overlay)
+// interface.  Used to publish the ts-bridge-gw Serf tag so isolated nodes know which
+// LAN address to route Tailscale traffic through when using this node as a bridge.
+func (d *Daemon) getPhysicalLANIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		name := iface.Name
+		if strings.HasPrefix(name, "tailscale") || strings.HasPrefix(name, "wg") ||
+			strings.HasPrefix(name, "tun") || strings.HasPrefix(name, "utun") ||
+			strings.HasPrefix(name, "cni") || strings.HasPrefix(name, "flannel") ||
+			strings.HasPrefix(name, "veth") || strings.HasPrefix(name, "docker") {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP.To4() == nil || ipNet.IP.IsLoopback() {
+				continue
+			}
+			ip := ipNet.IP.String()
+			// Skip Tailscale CGNAT, link-local, and k8s pod/svc CIDRs.
+			if strings.HasPrefix(ip, "100.") || strings.HasPrefix(ip, "169.254.") ||
+				strings.HasPrefix(ip, "10.42.") || strings.HasPrefix(ip, "10.43.") {
+				continue
+			}
+			return ip
+		}
+	}
+	return ""
+}
+
+// checkAndPublishBridgeGateway runs on every membership change.  If this node has a
+// working Tailscale connection AND at least one alive cluster member joined via a
+// non-Tailscale (LAN) address, it publishes a ts-bridge-gw Serf tag containing its
+// physical LAN IP.  Isolated nodes (no Tailscale of their own) read this tag and
+// install a kernel route so they can reach the wider Tailscale mesh through us.
+// When LAN peers disappear the tag is removed so stale routes are cleaned up.
+func (d *Daemon) checkAndPublishBridgeGateway() {
+	tsIP := d.detectTailscaleIP()
+	if tsIP == "" {
+		return // we don't have Tailscale — cannot be a bridge
+	}
+	tsRange := &net.IPNet{IP: net.ParseIP("100.64.0.0"), Mask: net.CIDRMask(10, 32)}
+	hasLANPeers := false
+	for _, m := range d.discovery.GetAliveMembers() {
+		if m.Addr != nil && !tsRange.Contains(m.Addr) && !m.Addr.IsLoopback() {
+			hasLANPeers = true
+			break
+		}
+	}
+	if !hasLANPeers {
+		if cur := d.discovery.LocalMember().Tags["ts-bridge-gw"]; cur != "" {
+			d.logger.Info("[bridge] No LAN peers remain — removing ts-bridge-gw tag")
+			d.discovery.DeleteTags([]string{"ts-bridge-gw"}) //nolint:errcheck
+		}
+		return
+	}
+	lanIP := d.getPhysicalLANIP()
+	if lanIP == "" {
+		return
+	}
+	if cur := d.discovery.LocalMember().Tags["ts-bridge-gw"]; cur == lanIP {
+		return // already published and correct
+	}
+	d.logger.Infof("[bridge] Announcing bridge gateway: LAN %s → Tailscale %s", lanIP, tsIP)
+	if err := d.discovery.UpdateTags(map[string]string{"ts-bridge-gw": lanIP}); err != nil {
+		d.logger.Warnf("[bridge] Failed to publish ts-bridge-gw: %v", err)
+	}
+}
+
+// syncBridgeGatewayRoute runs on every membership change on nodes that do not have
+// their own Tailscale connection.  If any alive member carries a ts-bridge-gw tag
+// (a node with both LAN and Tailscale connectivity), a kernel route is installed so
+// that traffic destined for the Tailscale CGNAT range (100.64.0.0/10) is forwarded
+// through the bridge's physical LAN IP.  When no bridge is visible the route is
+// removed to avoid a black hole.
+func (d *Daemon) syncBridgeGatewayRoute() {
+	if d.detectTailscaleIP() != "" {
+		return // we have our own Tailscale — no bridge route needed
+	}
+	const tsRange = "100.64.0.0/10"
+	for _, m := range d.discovery.GetAliveMembers() {
+		gwIP := m.Tags["ts-bridge-gw"]
+		if gwIP == "" || net.ParseIP(gwIP) == nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		out, err := exec.CommandContext(ctx, "ip", "route", "replace", tsRange, "via", gwIP).CombinedOutput()
+		cancel()
+		if err != nil {
+			d.logger.Debugf("[bridge] ip route replace %s via %s: %v (%s)", tsRange, gwIP, err, strings.TrimSpace(string(out)))
+		} else {
+			d.logger.Infof("[bridge] Routing %s via bridge %s (gateway %s)", tsRange, m.Name, gwIP)
+		}
+		return // one bridge is enough
+	}
+	// No bridge visible — delete any previously injected route so there's no black hole.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	exec.CommandContext(ctx, "ip", "route", "del", tsRange).Run() //nolint:errcheck
+	cancel()
+}
+
 // getLocalIP returns the Tailscale IP if available, otherwise the first usable IP.
 func (d *Daemon) getLocalIP() string {
 	if d.tailscale != nil {
@@ -2027,6 +2124,9 @@ func (d *Daemon) initDiscovery(localNode *state.Node, advertiseAddr string) erro
 	// via Tailscale so the rest of the mesh can route to them.  This handles
 	// nodes connected via a direct Ethernet patch to this node (p2p) that have
 	// no Tailscale of their own — they rely on us as a gateway.
+	// Also manages the bridge gateway role: nodes with Tailscale publish a
+	// ts-bridge-gw tag containing their LAN IP so that isolated (no-Tailscale)
+	// nodes can inject a route and reach the wider Tailscale mesh through them.
 	d.discovery.RegisterMembershipChangeHandler(func() error {
 		tailscaleRange := &net.IPNet{
 			IP:   net.ParseIP("100.64.0.0"),
@@ -2040,6 +2140,8 @@ func (d *Daemon) initDiscovery(localNode *state.Node, advertiseAddr string) erro
 				go d.advertiseNewMemberSubnet(m.Addr)
 			}
 		}
+		go d.checkAndPublishBridgeGateway()
+		go d.syncBridgeGatewayRoute()
 		return nil
 	})
 
@@ -2066,7 +2168,7 @@ func (d *Daemon) initNetworking() error {
 	}
 	d.tailscale = ts
 
-	d.clusterState.UpdateNodeTailscaleIP(d.identity.NodeID, ts.GetLocalIP().String())
+	d.clusterState.UpdateNodeTailscaleIP(d.identity.NodeID, ts.GetLocalIP())
 
 	tailscaleIP := ts.GetLocalIP().String()
 	if tailscaleIP != "" && tailscaleIP != "<nil>" {
@@ -2113,7 +2215,7 @@ func (d *Daemon) updateSerfTailscaleIP(ip net.IP) error {
 	if d.discovery == nil {
 		return nil
 	}
-	return d.discovery.UpdateTags(map[string]string{"wgip": ip.String()})
+	return d.discovery.UpdateTags(map[string]string{"tsip": ip.String()})
 }
 
 func (d *Daemon) setUniqueHostname(tsIP net.IP) error {
@@ -2852,7 +2954,7 @@ func (d *Daemon) readLeaderClusterTags() (leaderClusterTags, error) {
 }
 
 // updateTailscaleIP detects the Tailscale IP (up to 90s) and, if found, updates
-// the wgip Serf tag and returns the IP. Returns empty string if Tailscale is unavailable.
+// the tsip Serf tag and returns the IP. Returns empty string if Tailscale is unavailable.
 func (d *Daemon) updateTailscaleIP(purpose string) string {
 	tsIP := d.detectTailscaleIPWithRetry(90 * time.Second)
 	if tsIP == "" {
@@ -2860,7 +2962,7 @@ func (d *Daemon) updateTailscaleIP(purpose string) string {
 		return ""
 	}
 	d.logger.Infof("Tailscale ready (%s) — proceeding with %s", tsIP, purpose)
-	_ = d.discovery.UpdateTags(map[string]string{"wgip": tsIP})
+	_ = d.discovery.UpdateTags(map[string]string{"tsip": tsIP})
 	return tsIP
 }
 

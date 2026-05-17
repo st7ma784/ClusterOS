@@ -7,6 +7,7 @@ bin/
 *.dylib
 node-agent
 /node/node-agent
+images/ubuntu/node-agent
 
 # Go build artifacts
 *.test
@@ -73,6 +74,8 @@ cloud-init-output.log
 !.env.example
 credentials.json
 secrets/
+patch/authorized_keys
+patch/cloudflare.env
 /home/user/ClusterOS/patch/tailscale.env
 # WireGuard
 wg*.conf

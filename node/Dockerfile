@@ -57,7 +57,7 @@ RUN curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true \
     INSTALL_K3S_EXEC="--snapshotter=fuse-overlayfs" sh -
 
 # k3s ships kubectl; symlink it under the standard name for convenience
-RUN ln -s /usr/local/bin/k3s /usr/local/bin/kubectl
+RUN ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl
 
 # Configure systemd for container environment
 RUN systemctl mask systemd-udevd.service \
@@ -94,9 +94,10 @@ COPY node/systemd/node-agent.service /etc/systemd/system/node-agent.service
 # patch/tailscale.env and cluster.key must exist at build time (run 'make patch' first)
 COPY patch/tailscale-auth /usr/local/bin/clusteros-tailscale-init
 COPY patch/tailscale.env /etc/clusteros/tailscale.env
+COPY patch/cloudflare.env /etc/clusteros/cloudflare.env
 COPY cluster.key /etc/clusteros/cluster.key
 RUN chmod +x /usr/local/bin/clusteros-tailscale-init && \
-    chmod 600 /etc/clusteros/tailscale.env /etc/clusteros/cluster.key
+    chmod 600 /etc/clusteros/tailscale.env /etc/clusteros/cloudflare.env /etc/clusteros/cluster.key
 
 # Copy entrypoint script
 COPY test/docker/entrypoint.sh /entrypoint.sh

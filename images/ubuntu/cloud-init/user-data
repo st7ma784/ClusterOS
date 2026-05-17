@@ -3,14 +3,13 @@
 # User setup
 users:
   - name: clusteros
-    plain_text_passwd: clusteros
     groups: [sudo, adm, docker]
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
-    lock_passwd: false
+    lock_passwd: true
 
-# Enable password auth for SSH
-ssh_pwauth: true
+# Key-only SSH — apply-patch.sh installs authorized_keys from the patch bundle
+ssh_pwauth: false
 
 # Set hostname (overwritten by node-agent setUniqueHostname on first run)
 hostname: cluster-node

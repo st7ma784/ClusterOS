@@ -50,31 +50,6 @@ func TestVerify(t *testing.T) {
 	}
 }
 
-func TestDeriveWireGuardKey(t *testing.T) {
-	identity, err := Generate()
-	if err != nil {
-		t.Fatalf("Generate() failed: %v", err)
-	}
-
-	wgKey, err := identity.DeriveWireGuardKey()
-	if err != nil {
-		t.Fatalf("DeriveWireGuardKey() failed: %v", err)
-	}
-
-	if len(wgKey) != 32 {
-		t.Errorf("WireGuard key should be 32 bytes, got %d", len(wgKey))
-	}
-
-	// Verify derivation is deterministic
-	wgKey2, err := identity.DeriveWireGuardKey()
-	if err != nil {
-		t.Fatalf("DeriveWireGuardKey() failed on second call: %v", err)
-	}
-
-	if string(wgKey) != string(wgKey2) {
-		t.Error("WireGuard key derivation is not deterministic")
-	}
-}
 
 func TestSignAndVerify(t *testing.T) {
 	identity, err := Generate()

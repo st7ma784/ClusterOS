@@ -133,6 +133,93 @@ docker-compose logs -f node1
 docker exec -it cluster-os-node1 /bin/bash
 ```
 
+## Running a Single Container with GPU and Tailscale
+
+For development, testing, or production deployment of a single node with external Tailscale networking and GPU support:
+
+```bash
+docker run -it --rm \
+  --cap-add=NET_ADMIN \
+  --device=/dev/net/tun \
+  --gpus 1 \
+  st7ma784/clusteros:latest
+```
+
+### Command Flags Explained
+
+- `-it`: Interactive terminal (remove for background daemon mode)
+- `--rm`: Auto-cleanup container on exit
+- `--cap-add=NET_ADMIN`: Allows Tailscale to manage network interfaces
+- `--device=/dev/net/tun`: Exposes TUN device for Tailscale VPN tunnel
+- `--gpus 1`: Mount a single GPU (use `--gpus all` for all available GPUs)
+
+### Background Mode with Logging
+
+For production deployment:
+
+```bash
+docker run -d \
+  --name cluster-node \
+  --cap-add=NET_ADMIN \
+  --device=/dev/net/tun \
+  --gpus all \
+  --restart unless-stopped \
+  st7ma784/clusteros:latest
+```
+
+Monitor logs with:
+```bash
+docker logs -f cluster-node
+```
+
+### With Custom Configuration
+
+Mount a custom node configuration:
+
+```bash
+docker run -it --rm \
+  --cap-add=NET_ADMIN \
+  --device=/dev/net/tun \
+  --gpus 1 \
+  -v /path/to/node.yaml:/etc/cluster-os/node.yaml \
+  st7ma784/clusteros:latest
+```
+
+### Environment Variables
+
+Customize the container behavior:
+
+```bash
+docker run -it --rm \
+  --cap-add=NET_ADMIN \
+  --device=/dev/net/tun \
+  --gpus 1 \
+  -e NODE_NAME=my-node \
+  -e NODE_BOOTSTRAP=false \
+  -e NODE_ROLES=slurm-worker,k3s-agent \
+  st7ma784/clusteros:latest
+```
+
+Available environment variables:
+- `NODE_NAME`: Node hostname (default: container hostname)
+- `NODE_BOOTSTRAP`: Bootstrap mode to start cluster (default: false)
+- `NODE_JOIN`: Bootstrap peer address to join existing cluster
+- `NODE_ROLES`: Comma-separated list of roles (e.g., `slurm-worker,k3s-agent`)
+- `SERF_BIND_PORT`: Serf gossip port (default: 7946)
+- `RAFT_BIND_PORT`: Raft consensus port (default: 7373)
+
+### Prerequisites for GPU Support
+
+GPU access requires:
+1. NVIDIA Docker runtime installed (`nvidia-docker` or Docker 19.03+)
+2. NVIDIA GPU drivers on host
+3. NVIDIA container toolkit
+
+Check setup with:
+```bash
+docker run --rm --gpus all ubuntu nvidia-smi
+```
+
 ## Network Architecture
 
 The cluster uses a custom Docker network:

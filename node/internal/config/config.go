@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -86,8 +88,7 @@ type ClusterConfig struct {
 	Name         string `mapstructure:"name"`
 	Region       string `mapstructure:"region"`
 	Datacenter   string `mapstructure:"datacenter"`
-	AuthKey      string `mapstructure:"auth_key"`      // Cluster authentication key (base64)
-	ElectionMode string `mapstructure:"election_mode"` // "serf" (stateless) or "raft" (persistent)
+	AuthKey string `mapstructure:"auth_key"` // Cluster authentication key (base64)
 }
 
 // DefaultConfigPaths are the default paths to search for configuration files
@@ -199,26 +200,73 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("cluster.name", "cluster-os")
 	v.SetDefault("cluster.region", "default")
 	v.SetDefault("cluster.datacenter", "default")
-	v.SetDefault("cluster.auth_key", "")          // Must be set by user
-	v.SetDefault("cluster.election_mode", "serf") // "serf" (stateless) or "raft" (persistent)
+	v.SetDefault("cluster.auth_key", "") // Must be set by user
 }
 
 // autoDetectCapabilities auto-detects hardware capabilities
 func autoDetectCapabilities(config *Config) error {
-	// Auto-detect CPU count
 	if config.Roles.Capabilities.CPU == 0 {
 		config.Roles.Capabilities.CPU = runtime.NumCPU()
 	}
 
-	// Auto-detect architecture
 	if config.Roles.Capabilities.Arch == "" {
 		config.Roles.Capabilities.Arch = runtime.GOARCH
 	}
 
-	// TODO: Implement RAM and GPU detection
-	// For now, these remain as configured
+	if config.Roles.Capabilities.RAM == "" {
+		config.Roles.Capabilities.RAM = detectRAM()
+	}
+
+	if !config.Roles.Capabilities.GPU {
+		config.Roles.Capabilities.GPU = detectGPU()
+	}
 
 	return nil
+}
+
+// detectRAM reads /proc/meminfo and returns a human-readable RAM string (e.g. "16GB").
+// Falls back to "unknown" on any error.
+func detectRAM() string {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return "unknown"
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "MemTotal:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				kb, err := strconv.ParseInt(fields[1], 10, 64)
+				if err == nil {
+					gb := (kb + 1024*1024/2) / (1024 * 1024) // round to nearest GB
+					if gb < 1 {
+						return fmt.Sprintf("%dMB", kb/1024)
+					}
+					return fmt.Sprintf("%dGB", gb)
+				}
+			}
+		}
+	}
+	return "unknown"
+}
+
+// detectGPU returns true if any NVIDIA or AMD GPU is present.
+// NVIDIA: checks for /dev/nvidia[0-9]* character devices.
+// AMD:    checks for render nodes under /sys/class/drm/ with AMD vendor ID 0x1002.
+func detectGPU() bool {
+	if entries, err := filepath.Glob("/dev/nvidia[0-9]*"); err == nil && len(entries) > 0 {
+		return true
+	}
+	renders, err := filepath.Glob("/sys/class/drm/renderD*")
+	if err != nil {
+		return false
+	}
+	for _, r := range renders {
+		vendor, _ := os.ReadFile(filepath.Join(r, "device", "vendor"))
+		if strings.TrimSpace(string(vendor)) == "0x1002" {
+			return true
+		}
+	}
+	return false
 }
 
 // Validate validates the configuration
@@ -315,8 +363,7 @@ func Save(config *Config, configPath string) error {
 			"name":          config.Cluster.Name,
 			"region":        config.Cluster.Region,
 			"datacenter":    config.Cluster.Datacenter,
-			"auth_key":      config.Cluster.AuthKey,
-			"election_mode": config.Cluster.ElectionMode,
+			"auth_key": config.Cluster.AuthKey,
 		},
 	}
 

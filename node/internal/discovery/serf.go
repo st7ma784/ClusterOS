@@ -2,7 +2,9 @@ package discovery
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"os"
@@ -358,10 +360,20 @@ func (sd *SerfDiscovery) memberToNode(member serf.Member) *state.Node {
 			CPU:  cpu,
 			Arch: member.Tags["arch"],
 		},
-		TailscaleIP:     member.Tags["wgip"],
-		WireGuardPubKey: member.Tags["wg_pubkey"],
-		Tags:            member.Tags,
+		TailscaleIP: net.ParseIP(member.Tags["tsip"]),
+		Tags:        member.Tags,
 	}
+}
+
+// ShortNodeID returns the first 16 characters of a node ID unchanged, or a
+// deterministic 16-character hex prefix derived from a SHA-256 hash for longer IDs.
+// This is used for compact display and log labels — not for identity comparison.
+func ShortNodeID(fullID string) string {
+	if len(fullID) <= 16 {
+		return fullID
+	}
+	h := sha256.Sum256([]byte(fullID))
+	return hex.EncodeToString(h[:])[:16]
 }
 
 // UpdateTags updates the local node's tags in Serf.

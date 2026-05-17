@@ -37,7 +37,7 @@ discovery:
 
 networking:
   interface: ""
-  listen_port: 0
+  listen_port: 51820
   subnet: "10.42.0.0/16"
   ipv6: false
   wifi:
