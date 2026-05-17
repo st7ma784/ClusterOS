@@ -11,7 +11,6 @@ on:
       - 'node/Dockerfile'
       - 'node/**'
       - 'patch/**'
-      - 'bin/**'
       - 'test/docker/entrypoint.sh'
   pull_request:
     branches:
@@ -52,6 +51,54 @@ jobs:
       - name: Build node-agent binary
         run: make node
 
+      # Create the three secret files the Dockerfile COPYs.
+      # PR builds skip this (secrets unavailable on forks) and produce a stub image
+      # that won't connect to Tailscale or Cloudflare — useful for compile-only checks.
+      - name: Create secret files for Docker build
+        if: github.event_name != 'pull_request'
+        env:
+          TAILSCALE_ENV: ${{ secrets.TAILSCALE_ENV }}
+          CLUSTER_KEY: ${{ secrets.CLUSTER_KEY }}
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+          CLOUDFLARE_DOMAIN: ${{ secrets.CLOUDFLARE_DOMAIN }}
+        run: |
+          mkdir -p patch
+
+          # tailscale.env — full file content stored as a multi-line secret
+          if [ -n "$TAILSCALE_ENV" ]; then
+            printf '%s\n' "$TAILSCALE_ENV" > patch/tailscale.env
+          else
+            touch patch/tailscale.env
+          fi
+          chmod 600 patch/tailscale.env
+
+          # cluster.key — base64 auth key
+          if [ -n "$CLUSTER_KEY" ]; then
+            printf '%s' "$CLUSTER_KEY" > cluster.key
+          else
+            # Generate a throwaway key so the build doesn't fail
+            head -c 32 /dev/urandom | base64 > cluster.key
+          fi
+          chmod 600 cluster.key
+
+          # cloudflare.env
+          if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
+            printf 'CLOUDFLARE_TUNNEL_TOKEN=%s\nCLOUDFLARE_DOMAIN=%s\n' \
+              "$CLOUDFLARE_TUNNEL_TOKEN" "${CLOUDFLARE_DOMAIN:-stevemander.uk}" \
+              > patch/cloudflare.env
+          else
+            cp patch/cloudflare.env.example patch/cloudflare.env
+          fi
+          chmod 600 patch/cloudflare.env
+
+      - name: Create stub secret files for PR builds
+        if: github.event_name == 'pull_request'
+        run: |
+          mkdir -p patch
+          touch patch/tailscale.env
+          head -c 32 /dev/urandom | base64 > cluster.key
+          cp patch/cloudflare.env.example patch/cloudflare.env
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -72,7 +119,7 @@ jobs:
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=
+            type=sha,prefix=,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push Docker image
@@ -85,6 +132,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Image digest
-        run: echo ${{ steps.docker_build.outputs.digest }}

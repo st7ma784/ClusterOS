@@ -5,11 +5,11 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_TIME := $(shell date -u '+%Y-%m-%d_%H:%M:%S')
 
-# Go configuration
-GOPATH := $(shell $(HOME)/go/bin/go env GOPATH)
+# Go configuration — prefer ~/go/bin/go (local dev), fall back to PATH (CI)
+GO    := $(shell [ -x $(HOME)/go/bin/go ] && echo $(HOME)/go/bin/go || echo go)
+GOFMT := $(shell [ -x $(HOME)/go/bin/gofmt ] && echo $(HOME)/go/bin/gofmt || echo gofmt)
+GOPATH := $(shell $(GO) env GOPATH)
 GOBIN := $(GOPATH)/bin
-GO := $(HOME)/go/bin/go
-GOFMT := $(HOME)/go/bin/gofmt
 
 # Build configuration
 BINARY_NAME := node-agent
@@ -402,6 +402,25 @@ setup-ssh-keys:
 	done; \
 	echo ""; \
 	echo "Done. Future deploys use key auth only."
+
+DOCKER_IMAGE ?= st7ma784/clusteros
+
+# docker-push — build and push the Docker image to Docker Hub from your dev machine.
+# Requires: docker login (or DOCKERHUB_USERNAME/TOKEN env vars).
+# Run 'make patch' first so all credential files are present.
+# Usage:  make docker-push
+#         make docker-push DOCKER_IMAGE=myuser/clusteros TAG=v1.2.3
+TAG ?= latest
+docker-push: patch
+	@echo "Building $(DOCKER_IMAGE):$(TAG)..."
+	docker build -t $(DOCKER_IMAGE):$(TAG) -f node/Dockerfile .
+	@echo "Pushing $(DOCKER_IMAGE):$(TAG)..."
+	docker push $(DOCKER_IMAGE):$(TAG)
+	@if [ "$(TAG)" != "latest" ]; then \
+		docker tag $(DOCKER_IMAGE):$(TAG) $(DOCKER_IMAGE):latest && \
+		docker push $(DOCKER_IMAGE):latest; \
+	fi
+	@echo "Pushed: $(DOCKER_IMAGE):$(TAG)"
 
 # deploy-status — quick status check across all nodes after deploy.
 check-services:
