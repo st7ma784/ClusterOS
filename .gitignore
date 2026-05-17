@@ -5,7 +5,6 @@ bin/
 *.dll
 *.so
 *.dylib
-node-agent
 /node/node-agent
 images/ubuntu/node-agent
 
