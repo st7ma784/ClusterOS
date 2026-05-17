@@ -1,0 +1,21 @@
+[Unit]
+Description=Cloudflare Tunnel (ClusterOS)
+After=network-online.target tailscaled.service node-agent.service
+Wants=network-online.target
+# Start after node-agent so ingress-nginx NodePort 30080 is up
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/clusteros/cloudflare.env
+ExecStart=/usr/local/bin/cloudflared tunnel \
+    --no-autoupdate \
+    --loglevel info \
+    --config /etc/cloudflared/config.yaml \
+    run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

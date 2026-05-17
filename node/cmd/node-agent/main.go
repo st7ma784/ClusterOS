@@ -410,19 +410,6 @@ func showDashboard(clusterState *state.ClusterState) {
 		}
 	}
 
-	// Show service endpoints
-	fmt.Println("\n🔗 SERVICE ENDPOINTS:")
-	endpoints := clusterState.GetAllServiceEndpoints()
-	services := []string{"kubernetes-api", "rancher", "slurm-dashboard", "jupyterhub"}
-	for _, service := range services {
-		if endpoint, ok := endpoints[service]; ok {
-			status := getStatusIcon(endpoint.Status)
-			fmt.Printf("  %-20s: %s %s:%d\n", service, status, endpoint.Address, endpoint.Port)
-		} else {
-			fmt.Printf("  %-20s: 🔴 not available\n", service)
-		}
-	}
-
 	// Show node status summary
 	fmt.Println("\n🖥️  CLUSTER NODES:")
 	nodes := clusterState.GetAllNodes()
@@ -447,18 +434,6 @@ func showDashboard(clusterState *state.ClusterState) {
 	}
 }
 
-func getStatusIcon(status string) string {
-	switch status {
-	case "running":
-		return "🟢"
-	case "stopped":
-		return "🔴"
-	case "error":
-		return "🟠"
-	default:
-		return "⚪"
-	}
-}
 
 // getTailscaleIP attempts to get the local Tailscale IP
 func getTailscaleIP() (string, error) {

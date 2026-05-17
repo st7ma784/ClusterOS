@@ -10,7 +10,7 @@ It MUST support:
 - Distributed control plane (no fixed head node)
 - SLURM, Kubernetes, and Jupyter integration
 - Full testing in containers prior to VM or bare-metal deployment
-- connect via wired network or wifi by default to SSID: TALKTALK665317 key: NXJP7U39 
+- connect via wired network or wifi by default (WiFi credentials configured in images/ubuntu/.env, not hardcoded)
 - have a USB installer/OS Image for quick deployment to hardware
 
 The OS image is a delivery mechanism; the core product is the **node control plane**.

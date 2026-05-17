@@ -54,18 +54,8 @@ write_files:
   # This is the primary uplink for nodes without ethernet.
   # netplan applies this on every boot; the node gets internet access
   # before cloud-init's runcmd phase so Tailscale can authenticate.
-  - path: /etc/netplan/60-clusteros-wifi.yaml
-    permissions: '0600'
-    content: |
-      network:
-        version: 2
-        wifis:
-          wlan0:
-            dhcp4: true
-            optional: true
-            access-points:
-              "TALKTALK665317":
-                password: "NXJP7U39"
+  # WiFi credentials are injected at image-build time from images/ubuntu/.env
+  # (WIFI_SSID / WIFI_PASSWORD variables) — never hardcoded here.
 
   # Tailscale first-boot auth script.
   # Reads /etc/clusteros/tailscale.env (written by cluster-make-usb or make deploy).

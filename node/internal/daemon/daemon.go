@@ -685,7 +685,6 @@ func (d *Daemon) runProvisioning() error {
 
 	serverURL := fmt.Sprintf("https://%s:6443", nodeIP)
 
-	// Record in cluster state so ondemand can find the K3s leader.
 	d.clusterState.SetLeader("k3s-server", d.identity.NodeID)
 
 	// --- Munge key ---

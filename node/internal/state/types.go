@@ -92,23 +92,6 @@ func (cs *ClusterState) RemoveLeader(role string) {
 	delete(cs.leaders, role)
 }
 
-// GetWireGuardIPs returns nil — retained for compile compatibility; WireGuard removed.
-func (cs *ClusterState) GetWireGuardIPs() []net.IP {
-	return nil
-}
-
-// ServiceEndpoint describes a reachable cluster service endpoint.
-type ServiceEndpoint struct {
-	Address string
-	Port    int
-	Status  string
-}
-
-// GetAllServiceEndpoints returns an empty map — endpoints are discovered via Serf tags.
-func (cs *ClusterState) GetAllServiceEndpoints() map[string]ServiceEndpoint {
-	return map[string]ServiceEndpoint{}
-}
-
 // SetLocalNodeID sets the local node ID
 func (cs *ClusterState) SetLocalNodeID(nodeID string) {
 	cs.mu.Lock()

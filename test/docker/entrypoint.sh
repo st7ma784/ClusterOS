@@ -15,7 +15,7 @@ CLUSTER_AUTH_KEY="${CLUSTER_AUTH_KEY:-$(cat /etc/clusteros/cluster.key 2>/dev/nu
 echo "Node Name: $NODE_NAME"
 echo "Bootstrap Mode: $NODE_BOOTSTRAP"
 echo "Join Address: ${NODE_JOIN:-none}"
-echo "Cluster Auth: ${CLUSTER_AUTH_KEY:0:16}..."
+echo "Cluster Auth: $([ -n "$CLUSTER_AUTH_KEY" ] && echo "[set]" || echo "[missing]")"
 echo "Tailscale: $([ -f /etc/clusteros/tailscale.env ] && echo "credentials baked in" || echo "no credentials — LAN-only")"
 
 # Create configuration directory if it doesn't exist
