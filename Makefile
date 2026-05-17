@@ -304,6 +304,7 @@ patch: node
 	@mkdir -p patch/systemd
 	@cp -f systemd/clear-stale-redirects.service patch/systemd/ 2>/dev/null || true
 	@cp -f systemd/clusteros-make-usb.service patch/systemd/ 2>/dev/null || true
+	@cp -f systemd/cloudflared.service patch/systemd/ 2>/dev/null || true
 	@chmod +x patch/create-usb-installer.sh 2>/dev/null || true
 	@echo ""
 	@echo "Patch staged:"
@@ -434,6 +435,28 @@ deploy-status:
 		$(_SSH_AUTH) -o ConnectTimeout=5 $(SSH_USER)@$$node \
 			"cluster status 2>/dev/null | grep -E 'Phase|Members|Leader' | tr '\n' ' '" 2>/dev/null || \
 		echo "(unreachable)"; \
+	done
+
+cloudflare-status:
+	@if [ -z "$(NODES)" ]; then echo "No nodes (set NODES=...)"; exit 1; fi
+	@for node in $(NODES); do \
+		echo ""; \
+		echo "==> $$node"; \
+		$(_SSH_AUTH) -o ConnectTimeout=5 $(SSH_USER)@$$node \
+		"echo '--- cloudflare.env (requires sudo) ---'; \
+		 sudo cat /etc/clusteros/cloudflare.env 2>/dev/null | sed 's/TOKEN=.*/TOKEN=[redacted]/' || echo 'MISSING'; \
+		 echo '--- cluster phase ---'; \
+		 sudo cat /var/lib/cluster-os/status.json 2>/dev/null | python3 -c 'import sys,json; d=json.load(sys.stdin); print(\"phase:\",d.get(\"phase\",\"?\"), \"leader:\",d.get(\"leader_name\",\"?\"))' 2>/dev/null || echo 'no status'; \
+		 echo '--- cloudflared namespace ---'; \
+		 sudo k3s kubectl get all -n cloudflared 2>/dev/null || echo 'namespace not found (not leader or k3s not ready)'; \
+		 echo '--- cloudflared pod logs (last 30 lines) ---'; \
+		 sudo k3s kubectl logs -n cloudflared -l app=cloudflared --tail=30 2>/dev/null || echo 'no pods'; \
+		 echo '--- node-agent cloudflare log entries ---'; \
+		 sudo journalctl -u node-agent --no-pager -n 300 2>/dev/null | grep -i cloudflare | tail -20 || echo 'none'; \
+		 echo '--- ingress-nginx service ---'; \
+		 sudo k3s kubectl get svc -n ingress-nginx 2>/dev/null || echo 'not found'; \
+		 echo '--- flannel subnet.env ---'; \
+		 ls -la /run/flannel/subnet.env 2>/dev/null || echo 'MISSING (flannel not ready)'" 2>/dev/null || echo "(unreachable)"; \
 	done
 
 release: clean node test

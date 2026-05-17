@@ -804,6 +804,29 @@ func (d *Daemon) runJoining() error {
 	d.roleManager.UnregisterRole("k3s-server")
 	d.roleManager.UnregisterRole("slurm-controller")
 
+	// If leaderName was cleared (e.g. after ghost-leader detection), re-discover
+	// a reachable leader before waiting for tags.  Without this, waitForLeaderTag
+	// would query a stale member whose phase=ready tag may still be visible in
+	// gossip even though the node is offline.
+	if d.storedLeaderName() == "" {
+		d.logger.Info("No leader stored — running fresh leader discovery before joining")
+		newLeader, _ := d.computeReachableLeader()
+		if newLeader == "" {
+			newLeader = d.leaderElector.ComputeLeader()
+		}
+		if newLeader != "" {
+			d.mu.Lock()
+			d.leaderName = newLeader
+			d.mu.Unlock()
+			d.logger.Infof("Fresh leader elected: %s", newLeader)
+		} else {
+			// No reachable leader yet — go back to electing.
+			d.logger.Warn("No reachable leader found — returning to electing phase")
+			d.setPhase(PhaseElecting)
+			return nil
+		}
+	}
+
 	// Wait for leader to publish phase=ready.
 	d.logger.Info("Waiting for leader to reach ready phase...")
 	if _, err := d.waitForLeaderTag("phase", "ready", 10*time.Minute); err != nil {
@@ -1055,6 +1078,11 @@ func (d *Daemon) runReady() {
 					if serverUnreachable >= 10 {
 						d.logger.Warnf("k3s server %s unreachable for %d consecutive checks (~5 min) — forcing re-join to refresh leader", joinedURL, serverUnreachable)
 						serverUnreachable = 0
+						// Clear stored leader so runJoining re-runs computeReachableLeader()
+						// rather than immediately finding the dead node's stale phase=ready tag.
+						d.mu.Lock()
+						d.leaderName = ""
+						d.mu.Unlock()
 						d.setPhase(PhaseJoining)
 						return
 					}

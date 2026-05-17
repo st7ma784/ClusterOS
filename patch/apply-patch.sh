@@ -1699,6 +1699,53 @@ if [ -f "$SCRIPT_DIR/systemd/clusteros-make-usb.service" ]; then
     ok "clusteros-make-usb.service installed (trigger: sudo systemctl start clusteros-make-usb)"
 fi
 
+# ── Cloudflare Tunnel (systemd service, no k8s/flannel dependency) ─────────────
+# Runs cloudflared directly on the host — routes all *.domain traffic to
+# ingress-nginx on localhost:30080.  Starts after node-agent so the NodePort
+# is bound, but does NOT depend on k3s being healthy.
+if [ -f /etc/clusteros/cloudflare.env ]; then
+    CF_TOKEN=$(grep '^CLOUDFLARE_TUNNEL_TOKEN=' /etc/clusteros/cloudflare.env | cut -d= -f2-)
+    if [ -n "$CF_TOKEN" ]; then
+        # Install cloudflared binary if absent
+        if ! command -v cloudflared >/dev/null 2>&1; then
+            step "8b/10" "Installing cloudflared"
+            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+                -o /usr/local/bin/cloudflared 2>/dev/null || \
+            curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 \
+                -o /usr/local/bin/cloudflared 2>/dev/null || true
+            chmod +x /usr/local/bin/cloudflared 2>/dev/null || true
+            ok "cloudflared installed ($(cloudflared --version 2>/dev/null | head -1))"
+        fi
+
+        # Write ingress config — routes *.domain and bare domain to nginx on port 80
+        # (ingress-nginx DaemonSet uses hostNetwork:true and binds port 80 directly)
+        CF_DOMAIN=$(grep '^CLOUDFLARE_DOMAIN=' /etc/clusteros/cloudflare.env | cut -d= -f2-)
+        if [ -n "$CF_DOMAIN" ]; then
+            mkdir -p /etc/cloudflared
+            cat > /etc/cloudflared/config.yaml <<EOF
+ingress:
+  - hostname: "*.${CF_DOMAIN}"
+    service: http://localhost:80
+  - hostname: "${CF_DOMAIN}"
+    service: http://localhost:80
+  - service: http_status:404
+EOF
+            chmod 644 /etc/cloudflared/config.yaml
+            ok "cloudflared ingress config → /etc/cloudflared/config.yaml (domain: $CF_DOMAIN)"
+        fi
+
+        if [ -f "$SCRIPT_DIR/systemd/cloudflared.service" ]; then
+            install -m 644 "$SCRIPT_DIR/systemd/cloudflared.service" \
+                /etc/systemd/system/cloudflared.service
+            systemctl daemon-reload 2>/dev/null || true
+            systemctl enable cloudflared 2>/dev/null || true
+            ok "cloudflared.service installed and enabled"
+        fi
+    fi
+else
+    warn "cloudflare.env not found — Cloudflare Tunnel not configured"
+fi
+
 # ── 9. Start and verify ────────────────────────────────────────────────────────
 
 step "9/10" "Starting node-agent and verifying"
