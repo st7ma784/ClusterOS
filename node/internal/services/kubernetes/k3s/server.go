@@ -2812,11 +2812,13 @@ func (ks *K3sServer) deployRancher() error {
 		ks.Logger().Warnf("rancher-data PVC: %v (continuing)", err)
 	}
 
-	// Use nip.io to turn the raw IP into a valid DNS hostname.
-	// Kubernetes 1.28+ rejects raw IPs in Ingress spec.rules[0].host.
-	// nip.io is a public wildcard DNS: 100-102-126-31.nip.io → 100.102.126.31.
+	// Prefer the custom domain (rancher.<domain>) when cloudflare.env is configured,
+	// so that CATTLE_SERVER_URL is publicly reachable and the Rancher UI works without
+	// Axios errors.  Fall back to nip.io for local/LAN-only deployments.
 	rancherHost := "rancher.cluster.local"
-	if ks.nodeIP != "" {
+	if customDomain := readCloudflareDomain(); customDomain != "" {
+		rancherHost = "rancher." + customDomain
+	} else if ks.nodeIP != "" {
 		rancherHost = strings.ReplaceAll(ks.nodeIP, ".", "-") + ".nip.io"
 	}
 
