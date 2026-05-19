@@ -1306,16 +1306,31 @@ if [ -f /etc/default/ufw ] && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' /etc/defa
     ok "UFW FORWARD policy set to ACCEPT (was DROP — required for pod routing)"
 fi
 
+# Kernel modules for CNI pod networking (overlay for containerd, vxlan for flannel VTEP).
+# NOTE: br_netfilter is intentionally NOT loaded here. While it's a standard k8s prerequisite,
+# enabling it on a running k3s cluster causes kube-router's KUBE-ROUTER-FORWARD chain to
+# intercept bridge traffic (pod→host), breaking nginx-ingress→pod connectivity and CoreDNS
+# ClusterIP DNAT. k3s manages its own CNI networking without br_netfilter.
+for mod in overlay vxlan; do
+    modprobe "$mod" 2>/dev/null || true
+done
+# Ensure br_netfilter is OFF — if a previous patch enabled it, disable it cleanly.
+sysctl -w net.bridge.bridge-nf-call-iptables=0 &>/dev/null || true
+sysctl -w net.bridge.bridge-nf-call-ip6tables=0 &>/dev/null || true
+ok "Kernel modules loaded: overlay, vxlan (br_netfilter intentionally disabled)"
+
 # IP forwarding — nodes must route packets between LAN, Tailscale, and pod network.
 sysctl -w net.ipv4.ip_forward=1 &>/dev/null || true
 cat > /etc/sysctl.d/99-clusteros.conf <<'EOF'
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
+net.bridge.bridge-nf-call-iptables = 0
+net.bridge.bridge-nf-call-ip6tables = 0
 EOF
 sysctl -p /etc/sysctl.d/99-clusteros.conf &>/dev/null || true
-ok "IP forwarding enabled (persistent via /etc/sysctl.d/99-clusteros.conf)"
+ok "IP forwarding enabled, br_netfilter disabled (persistent)"
 
-# Pod CIDR FORWARD rules — Flannel VXLAN packets must traverse the FORWARD chain.
+# Pod CIDR FORWARD rules — flannel VXLAN packets and pod traffic traverse the FORWARD chain.
 for cidr in "10.42.0.0/16" "10.43.0.0/16"; do
     iptables -C FORWARD -d "$cidr" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -d "$cidr" -j ACCEPT 2>/dev/null || true
     iptables -C FORWARD -s "$cidr" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -s "$cidr" -j ACCEPT 2>/dev/null || true
@@ -1699,48 +1714,39 @@ if [ -f "$SCRIPT_DIR/systemd/clusteros-make-usb.service" ]; then
     ok "clusteros-make-usb.service installed (trigger: sudo systemctl start clusteros-make-usb)"
 fi
 
-# ── Cloudflare Tunnel (systemd service, no k8s/flannel dependency) ─────────────
-# Runs cloudflared directly on the host — routes all *.domain traffic to
-# ingress-nginx on localhost:30080.  Starts after node-agent so the NodePort
-# is bound, but does NOT depend on k3s being healthy.
+# ── Cloudflare Tunnel ───────────────────────────────────────────────────────────
+# cloudflared is now deployed as a Kubernetes Deployment by node-agent (server.go
+# deployCloudflared). It runs with hostNetwork:true and routes *.domain → localhost:80
+# (ingress-nginx DaemonSet). node-agent also stops/disables the systemd service after
+# the Deployment is applied, so the two don't conflict on port 2000 (metrics).
+#
+# This patch step just ensures cloudflare.env is in place and pre-installs the
+# cloudflared binary so the k8s image pull has a fallback on air-gapped nodes.
 if [ -f /etc/clusteros/cloudflare.env ]; then
     CF_TOKEN=$(grep '^CLOUDFLARE_TUNNEL_TOKEN=' /etc/clusteros/cloudflare.env | cut -d= -f2-)
     if [ -n "$CF_TOKEN" ]; then
-        # Install cloudflared binary if absent
+        # Pre-install cloudflared binary — used as fallback if k8s image pull fails
+        # and also required by the legacy systemd service on nodes not yet running k3s.
         if ! command -v cloudflared >/dev/null 2>&1; then
-            step "8b/10" "Installing cloudflared"
+            step "8b/10" "Installing cloudflared binary"
             curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
                 -o /usr/local/bin/cloudflared 2>/dev/null || \
             curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 \
                 -o /usr/local/bin/cloudflared 2>/dev/null || true
             chmod +x /usr/local/bin/cloudflared 2>/dev/null || true
-            ok "cloudflared installed ($(cloudflared --version 2>/dev/null | head -1))"
+            ok "cloudflared binary installed ($(cloudflared --version 2>/dev/null | head -1))"
         fi
 
-        # Write ingress config — routes *.domain and bare domain to nginx on port 80
-        # (ingress-nginx DaemonSet uses hostNetwork:true and binds port 80 directly)
-        CF_DOMAIN=$(grep '^CLOUDFLARE_DOMAIN=' /etc/clusteros/cloudflare.env | cut -d= -f2-)
-        if [ -n "$CF_DOMAIN" ]; then
-            mkdir -p /etc/cloudflared
-            cat > /etc/cloudflared/config.yaml <<EOF
-ingress:
-  - hostname: "*.${CF_DOMAIN}"
-    service: http://localhost:80
-  - hostname: "${CF_DOMAIN}"
-    service: http://localhost:80
-  - service: http_status:404
-EOF
-            chmod 644 /etc/cloudflared/config.yaml
-            ok "cloudflared ingress config → /etc/cloudflared/config.yaml (domain: $CF_DOMAIN)"
+        # Stop and disable the legacy systemd service if it is still active.
+        # node-agent's deployCloudflared() also does this after the k8s Deployment
+        # is applied; this step ensures it is removed even on nodes that never ran
+        # a k3s leader (e.g. pure workers).
+        if systemctl is-active --quiet cloudflared 2>/dev/null; then
+            systemctl stop cloudflared 2>/dev/null || true
+            ok "cloudflared systemd service stopped (k8s Deployment takes over)"
         fi
-
-        if [ -f "$SCRIPT_DIR/systemd/cloudflared.service" ]; then
-            install -m 644 "$SCRIPT_DIR/systemd/cloudflared.service" \
-                /etc/systemd/system/cloudflared.service
-            systemctl daemon-reload 2>/dev/null || true
-            systemctl enable cloudflared 2>/dev/null || true
-            ok "cloudflared.service installed and enabled"
-        fi
+        systemctl disable cloudflared 2>/dev/null || true
+        ok "cloudflare.env present — cloudflared will be deployed by node-agent once k3s is ready"
     fi
 else
     warn "cloudflare.env not found — Cloudflare Tunnel not configured"

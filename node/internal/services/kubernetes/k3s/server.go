@@ -35,12 +35,13 @@ type K3sServer struct {
 	dataDir             string
 	tokenPath           string
 	k3sCmd              *exec.Cmd
-	manifestsDir        string
-	slurmdbdDeployed    bool
-	slurmRestDeployed   bool
-	jupyterDeployed     bool
-	servicesDeployed    bool
-	startCount          int // number of times Start() has been called
+	manifestsDir         string
+	slurmdbdDeployed     bool
+	slurmRestDeployed    bool
+	jupyterDeployed      bool
+	cloudflaredDeployed  bool
+	servicesDeployed     bool
+	startCount           int // number of times Start() has been called
 }
 
 // NewK3sServerRole creates a K3sServer for the cluster leader (--cluster-init).
@@ -165,7 +166,7 @@ func (ks *K3sServer) Start() error {
 	// Note: --flannel-iface tailscale0 is set via /etc/rancher/k3s/config.yaml.
 	// Do NOT add it here to avoid duplicate flags.
 
-	// etcd-arg is server-only and must NOT be in config.yaml (shared with k3s agent).
+	// etcd-arg is a SERVER-ONLY flag and must NOT be in config.yaml (shared with k3s agent).
 	// Passing it to k3s agent causes a fatal "flag provided but not defined" crash-loop.
 	// Inject it here for the server command line only.
 	args = append(args, "--etcd-arg=--max-request-bytes=8388608")
@@ -481,11 +482,12 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 	ks.deploySLURMRestAPI(mungeKey)
 	go ks.deployJupyterHub()
 
-	// Deploy host-based Ingress rules for the custom domain if cloudflare.env is present.
-	// This is independent of cloudflared (which runs as a systemd service) — nginx needs
-	// these rules regardless of how traffic arrives.
+	// Deploy host-based Ingress rules and cloudflared tunnel for the custom domain.
 	if domain := readCloudflareDomain(); domain != "" {
 		go ks.deployDomainIngresses(domain)
+		if token := readCloudflareToken(); token != "" {
+			go ks.deployCloudflared(domain, token)
+		}
 	}
 
 	ks.servicesDeployed = true
@@ -514,6 +516,156 @@ func readCloudflareDomain() string {
 	return ""
 }
 
+// readCloudflareToken returns the CLOUDFLARE_TUNNEL_TOKEN from /etc/clusteros/cloudflare.env.
+func readCloudflareToken() string {
+	data, err := os.ReadFile("/etc/clusteros/cloudflare.env")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "CLOUDFLARE_TUNNEL_TOKEN=") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "CLOUDFLARE_TUNNEL_TOKEN="))
+		}
+	}
+	return ""
+}
+
+// deployCloudflared deploys cloudflared as a Kubernetes Deployment, replacing the
+// systemd-managed tunnel service. The Deployment uses hostNetwork:true so it can
+// reach ingress-nginx on localhost:80 regardless of which node it schedules on
+// (ingress-nginx is a DaemonSet with hostNetwork on every node). Once the Deployment
+// is applied, the systemd cloudflared.service is stopped and disabled so the two
+// don't fight over port 2000 (cloudflared metrics endpoint).
+func (ks *K3sServer) deployCloudflared(domain, token string) {
+	if ks.cloudflaredDeployed {
+		return
+	}
+	ks.Logger().Infof("Deploying cloudflared tunnel for %s", domain)
+
+	apply := func(yaml string) bool {
+		cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(yaml)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			ks.Logger().Warnf("cloudflared apply: %v: %s", err, out)
+			return false
+		}
+		return true
+	}
+
+	apply(`apiVersion: v1
+kind: Namespace
+metadata:
+  name: cloudflared
+`)
+
+	// Store token as a Secret so it doesn't appear in pod specs or logs.
+	apply(fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: cloudflared-token
+  namespace: cloudflared
+type: Opaque
+stringData:
+  token: "%s"
+`, token))
+
+	// Ingress routing config — same targets as the systemd service.
+	// localhost:80 reaches ingress-nginx because the Deployment runs with hostNetwork:true.
+	apply(fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflared-config
+  namespace: cloudflared
+data:
+  config.yaml: |
+    ingress:
+      - hostname: "*.%s"
+        service: http://localhost:80
+      - hostname: "%s"
+        service: http://localhost:80
+      - service: http_status:404
+`, domain, domain))
+
+	apply(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: cloudflared
+  labels:
+    app: cloudflared
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloudflared
+  template:
+    metadata:
+      labels:
+        app: cloudflared
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: cloudflared
+        image: cloudflare/cloudflared:latest
+        args:
+          - tunnel
+          - --no-autoupdate
+          - --loglevel
+          - info
+          - --metrics
+          - 0.0.0.0:2000
+          - --config
+          - /etc/cloudflared/config.yaml
+          - run
+          - --token
+          - $(TUNNEL_TOKEN)
+        env:
+        - name: TUNNEL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: cloudflared-token
+              key: token
+        volumeMounts:
+        - name: config
+          mountPath: /etc/cloudflared
+          readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /ready
+            port: 2000
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 10
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            memory: 128Mi
+      volumes:
+      - name: config
+        configMap:
+          name: cloudflared-config
+`)
+
+	ks.cloudflaredDeployed = true
+	ks.Logger().Infof("cloudflared Deployment applied for %s", domain)
+
+	// Stop and disable the systemd cloudflared service to avoid port 2000 conflict.
+	// The k8s Deployment now owns the tunnel; systemd is no longer needed.
+	if out, err := exec.Command("systemctl", "stop", "cloudflared").CombinedOutput(); err != nil {
+		ks.Logger().Debugf("stop cloudflared.service: %v: %s", err, out)
+	}
+	if out, err := exec.Command("systemctl", "disable", "cloudflared").CombinedOutput(); err != nil {
+		ks.Logger().Debugf("disable cloudflared.service: %v: %s", err, out)
+	}
+	ks.Logger().Info("cloudflared systemd service stopped and disabled — k8s Deployment owns the tunnel")
+}
+
 // deployDomainIngresses creates host-based Ingress rules so each cluster service is
 // reachable at <service>.<domain>.  Called from DeployClusterServices when a custom
 // domain is configured; safe to re-run (kubectl apply is idempotent).
@@ -528,7 +680,8 @@ func (ks *K3sServer) deployDomainIngresses(domain string) {
 		}
 	}
 
-	// Root domain → landing page
+	// Root domain → landing page. ssl-redirect disabled — Cloudflare terminates TLS.
+	// Longer proxy timeouts because the Python server makes k8s API calls on each request.
 	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -537,6 +690,9 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
 spec:
   ingressClassName: nginx
   rules:
@@ -552,7 +708,11 @@ spec:
               number: 80
 `, domain))
 
-	// Longhorn
+	// Longhorn — ssl-redirect disabled so nginx-ingress doesn't generate a broken
+	// http:///v1 redirect. Cloudflare terminates TLS; the tunnel only uses HTTP
+	// internally, so forcing HTTPS here creates an empty-host redirect loop.
+	// A separate Ingress (longhorn-v1-redirect) handles the /v1/ → /v1 redirect
+	// at the nginx level to avoid the Longhorn backend's broken relative redirect.
 	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -560,6 +720,8 @@ metadata:
   namespace: longhorn-system
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
 spec:
   ingressClassName: nginx
   rules:
@@ -574,6 +736,35 @@ spec:
             port:
               number: 80
 `, domain))
+
+	// Separate ingress to fix Longhorn /v1/ → /v1 redirect at nginx level.
+	// The Longhorn backend sends Location: /v1 (relative) which nginx-ingress
+	// transforms to Location: http:///v1 (broken empty-host). The permanent-redirect
+	// annotation generates a proper nginx return 301 that resolves to the correct URL.
+	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: longhorn-v1-redirect
+  namespace: longhorn-system
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/permanent-redirect: "https://longhorn.%s/v1"
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: longhorn.%s
+    http:
+      paths:
+      - path: /v1/$
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: longhorn-frontend
+            port:
+              number: 80
+`, domain, domain))
 
 	// Rancher — HTTPS backend
 	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
@@ -623,12 +814,17 @@ spec:
               number: 6820
 `, domain))
 
-	// JupyterHub — no path rewrite so JupyterHub's absolute redirects stay on the subdomain
+	// JupyterHub — ssl-redirect disabled (Cloudflare handles TLS).
+	// No path rewrite so JupyterHub's absolute redirects stay on the subdomain.
 	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: jupyter-domain
   namespace: jupyterhub
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
 spec:
   ingressClassName: nginx
   rules:
@@ -636,6 +832,106 @@ spec:
     http:
       paths:
       - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: proxy-public
+            port:
+              number: 80
+`, domain))
+
+	// Path-based ingresses under the ROOT domain so that the landing page links
+	// (/slurm, /longhorn, /jupyter) work when accessed via the custom domain.
+	// Without these, the landing-domain ingress (path: / Prefix) captures every
+	// sub-path and the landing page redirects them to Rancher's port instead.
+	// Services are in different namespaces, so each needs its own Ingress object.
+
+	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: slurmweb-path-domain
+  namespace: slurm
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: %s
+    http:
+      paths:
+      - path: /slurm(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: slurmweb
+            port:
+              number: 80
+`, domain))
+
+	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: slurmrestd-path-domain
+  namespace: slurm
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: %s
+    http:
+      paths:
+      - path: /slurm/api(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: slurmrestd
+            port:
+              number: 6820
+`, domain))
+
+	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: longhorn-path-domain
+  namespace: longhorn-system
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: %s
+    http:
+      paths:
+      - path: /longhorn(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: longhorn-frontend
+            port:
+              number: 80
+`, domain))
+
+	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jupyter-path-domain
+  namespace: jupyterhub
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: %s
+    http:
+      paths:
+      - path: /jupyter
         pathType: Prefix
         backend:
           service:
@@ -1355,6 +1651,15 @@ func (ks *K3sServer) deployIngressNginx() error {
 
 	ks.Logger().Info("nginx-ingress DaemonSet ready — port 80/443 bound on every cluster node")
 
+	// Configure the nginx-ingress ConfigMap:
+	// - allow-snippet-annotations: enables server-snippet / configuration-snippet on Ingress objects
+	// - use-forwarded-headers: trusts X-Forwarded-Proto from Cloudflare so backends (Rancher,
+	//   JupyterHub) see "https" and don't redirect back to HTTPS themselves (infinite 308 loop)
+	// - proxy-read/send-timeout: 120s for slow backends (Rancher, landing page k8s API calls)
+	exec.Command("k3s", "kubectl", "patch", "configmap", "ingress-nginx-controller",
+		"-n", "ingress-nginx", "--type", "merge",
+		"-p", `{"data":{"allow-snippet-annotations":"true","use-forwarded-headers":"true","proxy-real-ip-cidr":"0.0.0.0/0","proxy-read-timeout":"120","proxy-send-timeout":"120"}}`).Run()
+
 	// Delete the admission webhook — it uses a certgen Job that only runs once and
 	// its TLS cert gets out of sync with rolling pod replacements.  Without this
 	// deletion, kubectl apply for any Ingress resource will hit a 502 Bad Gateway
@@ -1683,7 +1988,8 @@ import http.server, json, ssl, urllib.request, os, socket, time, threading
 
 TOKEN_FILE  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 CACERT_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
-NODE_IP     = os.environ.get("NODE_IP", "localhost")  # fallback only
+NODE_IP        = os.environ.get("NODE_IP", "localhost")  # fallback only
+CLUSTER_DOMAIN = os.environ.get("CLUSTEROS_DOMAIN", "")
 
 # Use KUBERNETES_SERVICE_HOST env var (always injected by k3s into every pod)
 # so we bypass CoreDNS entirely.  This prevents readiness-probe timeouts after
@@ -1708,7 +2014,7 @@ def cached(key, fn):
         _cache[key] = (time.monotonic(), result)
     return result
 
-# Human-readable labels for known ingress paths.
+# Human-readable labels for known built-in ClusterOS services (path-based).
 INGRESS_LABELS = {
     "/longhorn":  ("Longhorn Storage",     "Storage UI"),
     "/rancher":   ("Rancher",              "K8s Management UI"),
@@ -1717,8 +2023,11 @@ INGRESS_LABELS = {
     "/jupyter":   ("JupyterHub",           "Notebook UI"),
 }
 
-# NodePort to probe (TCP connect) for each ingress path.
-# Used to show live up/down status on the landing page.
+# Subdomains that correspond to known built-in services — skip when auto-discovering
+# subdomains to avoid duplicating entries already shown via INGRESS_LABELS.
+_KNOWN_SUBDOMAINS = {p.strip("/").split("/")[0] for p in INGRESS_LABELS}
+
+# NodePort to probe (TCP connect) for known services — shows live up/down status.
 PROBE_PORT = {
     "/rancher":   30444,
     "/longhorn":  30900,
@@ -1752,24 +2061,75 @@ def k8s_get(path):
 
 
 def collect_ingresses():
-    """Return list of (path, label, desc) for every ingress rule."""
+    """Return list of (href, display, label, desc) for all discoverable Ingress rules.
+
+    Built-in ClusterOS services (in INGRESS_LABELS) keep their friendly names.
+    Any other Ingress with a host matching *.CLUSTER_DOMAIN is auto-discovered —
+    this picks up services deployed via Rancher Fleet / GitOps without any manual
+    configuration on the landing page.
+    """
     try:
         items = k8s_get("/apis/networking.k8s.io/v1/ingresses").get("items", [])
     except Exception:
         return []
+
     seen, rows = set(), []
     for ing in items:
+        ns   = ing.get("metadata", {}).get("namespace", "")
+        anns = ing.get("metadata", {}).get("annotations", {})
+
+        # Skip routing-only helper ingresses (e.g. longhorn-v1-redirect).
+        if "nginx.ingress.kubernetes.io/permanent-redirect" in anns:
+            continue
+
         for rule in ing.get("spec", {}).get("rules", []):
+            host = rule.get("host", "")
+            is_subdomain = bool(
+                CLUSTER_DOMAIN and host
+                and host != CLUSTER_DOMAIN
+                and host.endswith("." + CLUSTER_DOMAIN)
+            )
+
             for po in rule.get("http", {}).get("paths", []):
                 raw = po.get("path", "/")
-                # strip regex suffixes like (/|$)(.*) to get the clean prefix
-                clean = raw.split("(")[0].rstrip("/") or "/"
-                if clean in seen:
+                # Skip regex/routing paths.
+                if any(c in raw for c in ("(", "$", "?", "*")):
                     continue
-                seen.add(clean)
-                label, desc = INGRESS_LABELS.get(clean, (clean, "Web service"))
-                rows.append((clean, label, desc))
-    rows.sort()
+
+                clean = raw.rstrip("/") or "/"
+
+                if is_subdomain:
+                    href    = f"https://{host}/"
+                    display = host
+                    sub     = host[:-(len(CLUSTER_DOMAIN) + 1)]
+                    # Skip subdomains already covered by a path in INGRESS_LABELS
+                    # (longhorn, rancher, slurm, jupyter) — would be duplicate rows.
+                    if sub in _KNOWN_SUBDOMAINS:
+                        continue
+                    label = sub.replace("-", " ").title()
+                    desc  = ns
+                else:
+                    href    = clean
+                    display = clean
+                    entry   = INGRESS_LABELS.get(clean)
+                    if entry:
+                        label, desc = entry
+                    elif clean == "/":
+                        continue  # root path = the landing page itself
+                    else:
+                        # Path-based user service not in built-in list — show it.
+                        label = clean.strip("/").replace("-", " ").replace("/", " / ").title()
+                        desc  = ns
+
+                if href in seen:
+                    continue
+                seen.add(href)
+                rows.append((href, display, label, desc))
+
+    # Built-in services first (INGRESS_LABELS paths), then new services alphabetically.
+    def _key(r):
+        return (0 if INGRESS_LABELS.get(r[0]) else 1, r[0])
+    rows.sort(key=_key)
     return rows
 
 
@@ -1784,7 +2144,7 @@ def collect_rancher_workloads(req_host):
         # Query Rancher for deployed workloads (Deployments, StatefulSets, DaemonSets)
         for wl_type in ["deployments", "statefulsets", "daemonsets"]:
             try:
-                wls = k8s_get(f"/api/v1/{wl_type}").get("items", [])
+                wls = k8s_get(f"/apis/apps/v1/{wl_type}").get("items", [])
             except:
                 continue
             
@@ -1862,17 +2222,19 @@ def build_page(req_host):
     rancher_wls       = cached("rancher_wls_" + req_host, lambda: collect_rancher_workloads(req_host))
 
     # Web interfaces section (ingress-based) with live status dots.
+    # ingresses is now a list of (href, display, label, desc) — href may be a full
+    # https:// URL for subdomain-based services or a relative path for path-based ones.
     ing_rows = ""
-    for path, label, desc in ingresses:
-        probe = PROBE_PORT.get(path)
+    for href, display, label, desc in ingresses:
+        probe = PROBE_PORT.get(href)
         up    = port_open(req_host, probe) if probe else None
         dot   = status_dot(up)
         dim   = " style='opacity:.45'" if up is False else ""
         ing_rows += (
             f"<tr>"
-            f"<td>{dot} <b><a href='{path}' target='_blank'{dim}>{label}</a></b></td>"
+            f"<td>{dot} <b><a href='{href}' target='_blank'{dim}>{label}</a></b></td>"
             f"<td><span class='desc'>{desc}</span></td>"
-            f"<td><a href='{path}' target='_blank'{dim}>{path}</a></td>"
+            f"<td><a href='{href}' target='_blank'{dim}>{display}</a></td>"
             f"</tr>"
         )
     if not ing_rows:
@@ -1964,25 +2326,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             or self.headers.get("Host", NODE_IP)
         ).split(":")[0]
         path = self.path.split("?")[0].rstrip("/")
-        # /rancher redirect — bounce the browser to Rancher's NodePort using
-        # the same IP the client used to reach us, so the redirect works
-        # regardless of whether the user is on LAN or Tailscale.
+        # /rancher redirect — use the rancher subdomain when a domain is configured
+        # (Cloudflare tunnel only proxies 80/443, so port 30444 is inaccessible externally).
         if path in ("/rancher", "/rancher/"):
-            location = f"https://{req_host}:30444"
+            if CLUSTER_DOMAIN:
+                location = f"https://rancher.{CLUSTER_DOMAIN}"
+            else:
+                location = f"https://{req_host}:30444"
             self.send_response(302)
             self.send_header("Location", location)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        
-        # For unknown paths (not "/" or "/index.html"), forward to Rancher.
-        # This allows services to be discoverable via Rancher's UI even if
-        # they don't have explicit ingress rules — the landing page auto-discovers
-        # them and shows links to their NodePorts.
+
+        # For any path that doesn't match an ingress rule and lands here as the
+        # default backend, redirect back to the landing page root rather than
+        # guessing Rancher handles it (Rancher is at rancher.{domain} or :30444).
         if path not in ("", "/", "/index.html", "/favicon.ico"):
-            location = f"https://{req_host}:30444{self.path}"
-            self.send_response(302)
-            self.send_header("Location", location)
+            self.send_response(301)
+            self.send_header("Location", "/")
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -2020,7 +2382,12 @@ http.server.HTTPServer(("", 8080), Handler).serve_forever()`
 		"data:\n  server.py: |\n" + indented.String()
 
 	// Service (ClusterIP :80 → :8080) + Deployment (python:3.12-alpine).
-	const deployYAML = `apiVersion: v1
+	// Single replica so all nginx requests hit the same pod — the Python server caches
+	// k8s API responses for 30 s, so a second pod would have its own cold cache and
+	// serve slow (30 s) responses every other request. One pod = one cache = fast.
+	// CLUSTEROS_DOMAIN is injected so the Rancher redirect uses the subdomain.
+	clusterDomain := readCloudflareDomain()
+	deployYAML := fmt.Sprintf(`apiVersion: v1
 kind: Service
 metadata:
   name: clusteros-landing
@@ -2033,11 +2400,12 @@ spec:
     targetPort: 8080
 ---
 apiVersion: apps/v1
-kind: DaemonSet
+kind: Deployment
 metadata:
   name: clusteros-landing
   namespace: ingress-nginx
 spec:
+  replicas: 1
   selector:
     matchLabels:
       app: clusteros-landing
@@ -2061,6 +2429,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.hostIP
+        - name: CLUSTEROS_DOMAIN
+          value: %q
         ports:
         - containerPort: 8080
         readinessProbe:
@@ -2077,7 +2447,7 @@ spec:
       volumes:
       - name: script
         configMap:
-          name: clusteros-landing-script`
+          name: clusteros-landing-script`, clusterDomain)
 
 	for _, manifest := range []string{rbacYAML, scriptYAML, deployYAML} {
 		cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
