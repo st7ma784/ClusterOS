@@ -166,10 +166,17 @@ func (ks *K3sServer) Start() error {
 	// Note: --flannel-iface tailscale0 is set via /etc/rancher/k3s/config.yaml.
 	// Do NOT add it here to avoid duplicate flags.
 
-	// etcd-arg is a SERVER-ONLY flag and must NOT be in config.yaml (shared with k3s agent).
-	// Passing it to k3s agent causes a fatal "flag provided but not defined" crash-loop.
-	// Inject it here for the server command line only.
-	args = append(args, "--etcd-arg=--max-request-bytes=8388608")
+	// etcd-arg and kube-apiserver-arg are SERVER-ONLY and must NOT be in config.yaml.
+	// Passing server-only flags to k3s agent causes "flag provided but not defined" crash-loop.
+	//
+	// Increase the max request body size on both etcd and the k8s API server to 20MB.
+	// The default 3MB etcd limit causes Fleet GitRepo bundles to fail with
+	// "Request entity too large" when deploying repos that contain non-trivial Helm charts
+	// or multiple YAML resources. Fleet bundles the entire deployable tree into a single
+	// Bundle CRD stored in etcd; 20MB is generous but still protects etcd from accidental
+	// abuse (e.g. repos that embed large binary blobs in their manifests).
+	args = append(args, "--etcd-arg=--max-request-bytes=20971520")
+	args = append(args, "--kube-apiserver-arg=max-request-body-bytes=20971520")
 
 	cmd := exec.Command("k3s", args...)
 	cmd.Stdout = os.Stdout
