@@ -565,6 +565,11 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 	ks.deploySLURMRestAPI(mungeKey)
 	go ks.deployJupyterHub()
 
+	// Deploy GitHub Actions self-hosted runners if credentials are configured.
+	if org, pat := readGithubEnv(); org != "" && pat != "" {
+		go ks.deployActionsRunners(org, pat)
+	}
+
 	// Deploy host-based Ingress rules and cloudflared tunnel for the custom domain.
 	if domain := readCloudflareDomain(); domain != "" {
 		go ks.deployDomainIngresses(domain)
@@ -4163,4 +4168,114 @@ func (ks *K3sServer) deployJupyterHub() {
 	ks.ensureJupyterIngress()
 	ks.jupyterDeployed = true
 	ks.Logger().Info("JupyterHub deployed — NodePort 30888 + /jupyter")
+}
+
+// readGithubEnv returns (org, pat) from /etc/clusteros/github.env, or ("","") if absent.
+func readGithubEnv() (string, string) {
+	data, err := os.ReadFile("/etc/clusteros/github.env")
+	if err != nil {
+		return "", ""
+	}
+	var org, pat string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "GITHUB_ORG=") {
+			org = strings.TrimPrefix(line, "GITHUB_ORG=")
+		} else if strings.HasPrefix(line, "GITHUB_PAT=") {
+			pat = strings.TrimPrefix(line, "GITHUB_PAT=")
+		}
+	}
+	return org, pat
+}
+
+// deployActionsRunners installs actions-runner-controller (ARC) v2 and a runner scale set
+// scoped to the given GitHub org. Runners scale from 0 to 4; each job gets a fresh ephemeral
+// container. The PAT is stored only in a k8s Secret and is not exposed to runner pods.
+//
+// Workflows opt-in with: runs-on: clusteros-runner
+func (ks *K3sServer) deployActionsRunners(org, pat string) {
+	const (
+		controllerNS  = "arc-systems"
+		runnerNS      = "arc-runners"
+		secretName    = "arc-github-secret"
+		scaleSetName  = "clusteros-runner"
+		controllerRel = "arc-controller"
+		scaleSetRel   = "arc-runner-set"
+		controllerChart = "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller"
+		scaleSetChart   = "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set"
+	)
+
+	alreadyInstalled := exec.Command("k3s", "kubectl", "-n", runnerNS,
+		"get", "autoscalingrunnersets", scaleSetName).Run() == nil
+	if alreadyInstalled {
+		ks.Logger().Info("GitHub Actions runners already installed — skipping")
+		return
+	}
+
+	ks.Logger().Infof("Deploying GitHub Actions runners for org %s...", org)
+
+	kubeEnv := append(os.Environ(), "KUBECONFIG=/etc/rancher/k3s/k3s.yaml")
+
+	// Ensure namespaces exist.
+	for _, ns := range []string{controllerNS, runnerNS} {
+		exec.Command("k3s", "kubectl", "create", "namespace", ns,
+			"--dry-run=client", "-o", "yaml").Run()
+		exec.Command("k3s", "kubectl", "apply", "-f", "-").Stdin = nil
+		cmd := exec.Command("k3s", "kubectl", "create", "namespace", ns, "--dry-run=client", "-o", "yaml")
+		out, _ := cmd.Output()
+		apply := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+		apply.Stdin = strings.NewReader(string(out))
+		apply.Env = kubeEnv
+		apply.Run()
+	}
+
+	// Create the Secret that ARC uses to authenticate with GitHub.
+	// kubectl apply so re-runs are idempotent.
+	secretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: Opaque
+stringData:
+  github_token: "%s"
+`, secretName, runnerNS, pat)
+	applySecret := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	applySecret.Stdin = strings.NewReader(secretYAML)
+	applySecret.Env = kubeEnv
+	if out, err := applySecret.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("GitHub runner secret: %v: %s", err, out)
+		return
+	}
+
+	// Install the ARC controller (manages runner lifecycle).
+	controllerCmd := exec.Command("helm", "upgrade", "--install", controllerRel, controllerChart,
+		"--namespace", controllerNS,
+		"--create-namespace",
+		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
+	)
+	controllerCmd.Env = kubeEnv
+	if out, err := controllerCmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("ARC controller helm install: %v: %s", err, out)
+		return
+	}
+
+	// Install the runner scale set pointing at the org.
+	scaleSetCmd := exec.Command("helm", "upgrade", "--install", scaleSetRel, scaleSetChart,
+		"--namespace", runnerNS,
+		"--create-namespace",
+		"--set", fmt.Sprintf("githubConfigUrl=https://github.com/%s", org),
+		"--set", fmt.Sprintf("githubConfigSecret=%s", secretName),
+		"--set", "minRunners=0",
+		"--set", "maxRunners=4",
+		"--set", fmt.Sprintf("runnerScaleSetName=%s", scaleSetName),
+		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
+	)
+	scaleSetCmd.Env = kubeEnv
+	if out, err := scaleSetCmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("ARC runner scale set helm install: %v: %s", err, out)
+		return
+	}
+
+	ks.Logger().Infof("GitHub Actions runners deployed — label: %s (min=0, max=4)", scaleSetName)
 }

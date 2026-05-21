@@ -86,7 +86,7 @@ gres.conf
 slurm_state/
 slurmctld.log
 slurmd.log
-
+/patch/github.env
 # Kubernetes
 kubeconfig
 *.kubeconfig

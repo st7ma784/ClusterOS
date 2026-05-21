@@ -276,6 +276,13 @@ if [ -f "$SCRIPT_DIR/cloudflare.env" ]; then
     ok "Cloudflare tunnel config installed → /etc/clusteros/cloudflare.env"
 fi
 
+# ── GitHub Actions runner credentials ─────────────────────────────────────────
+if [ -f "$SCRIPT_DIR/github.env" ]; then
+    mkdir -p /etc/clusteros
+    install -m 600 "$SCRIPT_DIR/github.env" /etc/clusteros/github.env
+    ok "GitHub runner config installed → /etc/clusteros/github.env"
+fi
+
 # cluster CLI.
 if [ -f "$SCRIPT_DIR/cluster" ]; then
     install -m 755 "$SCRIPT_DIR/cluster" /usr/local/bin/cluster

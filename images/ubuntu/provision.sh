@@ -260,6 +260,18 @@ if [ -f /etc/clusteros/tailscale.env ]; then
     fi
 fi
 
+# ── GitHub Actions runner credentials ─────────────────────────────────────────
+if [ -n "${GITHUB_ORG:-}" ] && [ -n "${GITHUB_PAT:-}" ]; then
+    sudo mkdir -p /etc/clusteros
+    sudo tee /etc/clusteros/github.env > /dev/null <<GHENV
+# GitHub Actions runner configuration — generated during image build
+GITHUB_ORG=${GITHUB_ORG}
+GITHUB_PAT=${GITHUB_PAT}
+GHENV
+    sudo chmod 600 /etc/clusteros/github.env
+    echo "  GitHub runner config written → /etc/clusteros/github.env"
+fi
+
 # ------------------------------------------------------------------------------
 # Network configuration
 # ------------------------------------------------------------------------------
