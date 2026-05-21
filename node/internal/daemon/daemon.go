@@ -1560,9 +1560,17 @@ func (d *Daemon) getLeaderTags() map[string]string {
 	return nil
 }
 
-// selectCPServers picks up to 3 nodes to run k3s server (control-plane).
-// The leader is always first; remaining slots are filled from alive same-version
-// members sorted lexicographically by Tailscale IP for determinism.
+// selectCPServers picks which nodes should run k3s server (control-plane with embedded etcd).
+//
+// Quorum rule: etcd requires a majority of members to be alive. With 2 members quorum is 2
+// (both must be up), which is WORSE than 1 member (quorum 1). We therefore only scale to
+// 3 control-plane nodes — never 2. Clusters with exactly 1 extra node stay single-CP.
+//
+//   1 node  → 1 CP  (leader only)
+//   2 nodes → 1 CP  (leader only; worker joins as k3s agent)
+//   3 nodes → 3 CPs (majority quorum = 2; tolerates 1 CP failure)
+//   4 nodes → 3 CPs (same; 4th node is pure worker)
+//   5+      → 3 CPs (capped; additional nodes are pure workers)
 func (d *Daemon) selectCPServers() []string {
 	myIP := d.getLocalIP()
 	result := []string{myIP}
@@ -1593,11 +1601,10 @@ func (d *Daemon) selectCPServers() []string {
 		extras = append(extras, memberIP)
 	}
 	sort.Strings(extras)
-	for _, ip := range extras {
-		if len(result) >= 3 {
-			break
-		}
-		result = append(result, ip)
+
+	// Only promote to 3 CPs when we have ≥2 extra peers (never 2-node etcd).
+	if len(extras) >= 2 {
+		result = append(result, extras[0], extras[1])
 	}
 	return result
 }

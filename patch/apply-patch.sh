@@ -1082,6 +1082,9 @@ for render in /sys/class/drm/renderD*; do
     vendor=$(cat "$render/device/vendor" 2>/dev/null || true)
     if [ "$vendor" = "0x1002" ]; then
         dev_node="/dev/$(basename "$render")"
+        # Only include if the device node actually exists — integrated AMD graphics
+        # appear in sysfs but /dev/renderD* is never created without the full DRM stack.
+        [ -c "$dev_node" ] || continue
         GPU_GRES_LINES="${GPU_GRES_LINES}Name=gpu Type=amd File=${dev_node}\n"
         AMD_COUNT=$((AMD_COUNT + 1))
     fi

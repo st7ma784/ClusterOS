@@ -3,13 +3,16 @@ package k3s
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	_ "embed"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,7 +44,9 @@ type K3sServer struct {
 	jupyterDeployed      bool
 	cloudflaredDeployed  bool
 	servicesDeployed     bool
-	startCount           int // number of times Start() has been called
+	startCount           int  // number of times Start() has been called
+	quorumRecoveryDone   bool // prevents double etcd wipe on repeated 503s
+	mu                   sync.Mutex
 }
 
 // NewK3sServerRole creates a K3sServer for the cluster leader (--cluster-init).
@@ -166,17 +171,11 @@ func (ks *K3sServer) Start() error {
 	// Note: --flannel-iface tailscale0 is set via /etc/rancher/k3s/config.yaml.
 	// Do NOT add it here to avoid duplicate flags.
 
-	// etcd-arg and kube-apiserver-arg are SERVER-ONLY and must NOT be in config.yaml.
-	// Passing server-only flags to k3s agent causes "flag provided but not defined" crash-loop.
-	//
-	// Increase the max request body size on both etcd and the k8s API server to 20MB.
-	// The default 3MB etcd limit causes Fleet GitRepo bundles to fail with
-	// "Request entity too large" when deploying repos that contain non-trivial Helm charts
-	// or multiple YAML resources. Fleet bundles the entire deployable tree into a single
-	// Bundle CRD stored in etcd; 20MB is generous but still protects etcd from accidental
-	// abuse (e.g. repos that embed large binary blobs in their manifests).
+	// --etcd-arg is SERVER-ONLY and must NOT be in config.yaml.
+	// Increase the etcd max request size to 20MB (default 1.5MB).
+	// Fleet GitRepo bundles the entire chart tree into a single etcd object; the default
+	// limit causes "Request entity too large" for any repo with non-trivial Helm charts.
 	args = append(args, "--etcd-arg=--max-request-bytes=20971520")
-	args = append(args, "--kube-apiserver-arg=max-request-body-bytes=20971520")
 
 	cmd := exec.Command("k3s", args...)
 	cmd.Stdout = os.Stdout
@@ -304,18 +303,84 @@ func ensurePauseImageInContainerd(log *logrus.Logger) {
 }
 
 // WaitForAPIReady blocks until the K3s API server responds to kubectl, or timeout.
+// For leader nodes (--cluster-init), it also detects etcd quorum failure (persistent 503s)
+// and auto-recovers by wiping stale peer data so HealthCheck can restart as single-node.
 func (ks *K3sServer) WaitForAPIReady(timeout time.Duration) error {
 	ks.Logger().Infof("Waiting up to %s for K3s API server to be ready...", timeout)
-	deadline := time.Now().Add(timeout)
+	start := time.Now()
+	deadline := start.Add(timeout)
+	consecutive503 := 0
+
 	for time.Now().Before(deadline) {
 		if exec.Command("k3s", "kubectl", "get", "nodes").Run() == nil {
 			ks.Logger().Info("K3s API server is ready")
 			ks.patchKubeconfigForLocalAccess()
 			return nil
 		}
+
+		// After 90s without the API coming up, check if this is an etcd quorum
+		// failure (returns HTTP 503) vs a normal slow start (connection refused).
+		// 503 means k3s is running but etcd has a dead peer and can't reach quorum.
+		// This happens when a previous run added a secondary CP that is now gone.
+		// Recovery: wipe the stale etcd data so HealthCheck restarts as single-node.
+		if ks.serverURL == "" && !ks.quorumRecoveryDone && time.Since(start) > 90*time.Second {
+			if ks.probeAPIHTTPStatus() == 503 {
+				consecutive503++
+				if consecutive503 >= 3 {
+					ks.quorumRecoveryDone = true
+					ks.Logger().Warn("Etcd quorum failure detected (persistent 503) — wiping stale peer data")
+					ks.wipeEtcdAndKillK3s()
+					return fmt.Errorf("etcd quorum failure: wiped stale data, HealthCheck will restart as single-node")
+				}
+			} else {
+				consecutive503 = 0
+			}
+		}
+
 		time.Sleep(5 * time.Second)
 	}
 	return fmt.Errorf("K3s API server not ready after %s", timeout)
+}
+
+// probeAPIHTTPStatus does a raw HTTPS probe to 127.0.0.1:6443/healthz and returns
+// the HTTP status code, or 0 if the connection was refused / timed out.
+func (ks *K3sServer) probeAPIHTTPStatus() int {
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		},
+	}
+	resp, err := client.Get("https://127.0.0.1:6443/healthz")
+	if err != nil {
+		return 0 // connection refused
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
+}
+
+// wipeEtcdAndKillK3s terminates the running k3s server and removes the etcd data
+// directory so that the next start initialises a fresh single-member cluster.
+func (ks *K3sServer) wipeEtcdAndKillK3s() {
+	ks.mu.Lock()
+	cmd := ks.k3sCmd
+	ks.k3sCmd = nil
+	ks.SetRunning(false)
+	ks.mu.Unlock()
+
+	if cmd != nil && cmd.Process != nil {
+		ks.Logger().Info("Sending SIGTERM to k3s server for etcd quorum recovery...")
+		cmd.Process.Signal(syscall.SIGTERM) //nolint:errcheck
+		time.Sleep(5 * time.Second)
+		cmd.Process.Kill() //nolint:errcheck
+		cmd.Wait()         //nolint:errcheck
+	}
+
+	etcdDir := filepath.Join(ks.dataDir, "server/db/etcd")
+	ks.Logger().Infof("Wiping etcd data dir: %s", etcdDir)
+	if err := os.RemoveAll(etcdDir); err != nil {
+		ks.Logger().Warnf("Failed to wipe etcd dir: %v", err)
+	}
 }
 
 // patchKubeconfigForLocalAccess rewrites the k3s kubeconfig server URL to use
@@ -415,6 +480,11 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 	// handshake warm-up and etcd initialisation.
 	ks.waitForAPIStable()
 
+	// Publish cluster-wide metadata as a ConfigMap so any pod or Helm chart can
+	// discover the domain without reading node-local files or being hardcoded at
+	// deploy time.  Must run before any service deployer that needs the domain.
+	ks.publishClusterConfigMap()
+
 	if err := ks.deploySlurmdbd(mungeKey); err != nil {
 		ks.Logger().Warnf("Failed to deploy slurmdbd: %v", err)
 	}
@@ -473,6 +543,12 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 		// Install rancher-backup operator and configure scheduled snapshots.
 		// Runs in background; also triggers auto-restore if a backup exists in the PVC.
 		go ks.deployRancherBackup()
+
+		// Label the local cluster with the configured domain so Rancher Fleet/policies
+		// can target it by domain without manual UI steps.
+		if domain := readCloudflareDomain(); domain != "" {
+			go ks.labelRancherCluster(domain)
+		}
 	}
 
 	// NOTE: we deliberately do NOT deploy a path:/ catchall Rancher ingress here.
@@ -536,6 +612,103 @@ func readCloudflareToken() string {
 		}
 	}
 	return ""
+}
+
+// publishClusterConfigMap writes cluster-wide metadata into two ConfigMaps:
+//
+//  1. clusteros-config (kube-system) — flat key/value for pod envFrom and kubectl queries.
+//     Pods use it via valueFrom.configMapKeyRef; scripts via kubectl get cm.
+//
+//  2. clusteros-helm-values (fleet-default) — Fleet-compatible values.yaml blob.
+//     fleet.yaml references it via helm.valuesFrom so any GitRepo chart gets the
+//     domain without hardcoding it at deploy time.
+func (ks *K3sServer) publishClusterConfigMap() {
+	domain := readCloudflareDomain()
+	mode := "nip"
+	rancherHost := ""
+	sslRedirect := "true" // nginx redirects HTTP→HTTPS when no Cloudflare in front
+	if domain != "" {
+		mode = "domain"
+		rancherHost = "rancher." + domain
+		sslRedirect = "false" // Cloudflare terminates TLS; nginx must NOT redirect
+	} else if ks.nodeIP != "" {
+		rancherHost = strings.ReplaceAll(ks.nodeIP, ".", "-") + ".nip.io"
+	}
+
+	// 1. Flat metadata ConfigMap — consumed by pods and shell scripts.
+	flatCM := fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clusteros-config
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/managed-by: node-agent
+data:
+  domain: %q
+  rancher-host: %q
+  mode: %q
+  ssl-redirect: %q
+`, domain, rancherHost, mode, sslRedirect)
+
+	apply := func(yaml string, desc string) {
+		cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-",
+			"--kubeconfig", "/etc/rancher/k3s/k3s.yaml")
+		cmd.Stdin = strings.NewReader(yaml)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			ks.Logger().Warnf("publishClusterConfigMap %s: %v: %s", desc, err, out)
+		}
+	}
+	apply(flatCM, "clusteros-config")
+
+	// 2. Fleet-compatible values ConfigMap — consumed by fleet.yaml helm.valuesFrom.
+	// The values.yaml key contains valid Helm values YAML that Fleet merges into
+	// every chart install, giving charts access to the cluster domain without any
+	// deploy-time templating or --set escaping.
+	//
+	// Placed in fleet-default so GitRepo-scoped valuesFrom can reference it without
+	// needing a cross-namespace reference (Fleet only allows same-namespace CM refs).
+	helmValues := fmt.Sprintf(`global:
+  clusterDomain: %q
+  clusterMode: %q
+  rancherHost: %q
+  sslRedirect: %q
+  ingressAnnotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: %q
+    nginx.ingress.kubernetes.io/force-ssl-redirect: %q
+`, domain, mode, rancherHost, sslRedirect, sslRedirect, sslRedirect)
+
+	// fleet-default namespace is created by Rancher; ensure it exists before writing.
+	exec.Command("k3s", "kubectl", "create", "namespace", "fleet-default",
+		"--dry-run=client", "-o", "yaml",
+		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml").Run()
+
+	fleetCM := fmt.Sprintf(`apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clusteros-helm-values
+  namespace: fleet-default
+  labels:
+    app.kubernetes.io/managed-by: node-agent
+data:
+  values.yaml: |
+%s`, indentBlock(helmValues, "    "))
+	apply(fleetCM, "clusteros-helm-values")
+
+	ks.Logger().Infof("cluster ConfigMaps published (domain=%q, mode=%s, ssl-redirect=%s)",
+		domain, mode, sslRedirect)
+}
+
+// indentBlock prefixes every non-empty line in s with prefix.
+func indentBlock(s, prefix string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		if line == "" {
+			b.WriteString("\n")
+		} else {
+			b.WriteString(prefix + line + "\n")
+		}
+	}
+	return b.String()
 }
 
 // deployCloudflared deploys cloudflared as a Kubernetes Deployment, replacing the
@@ -1916,9 +2089,35 @@ spec:
 }
 
 func (ks *K3sServer) createLonghornIngress() {
-	// rewrite-target strips the /longhorn prefix before forwarding to the Longhorn UI,
-	// which serves its assets from /, not from /longhorn.
-	ingressYAML := `apiVersion: networking.k8s.io/v1
+	var ingressYAML string
+	if customDomain := readCloudflareDomain(); customDomain != "" {
+		// Subdomain ingress — no path rewrite needed; Longhorn serves from /
+		ingressYAML = fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: longhorn-ingress
+  namespace: longhorn-system
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: longhorn.%s
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: longhorn-frontend
+            port:
+              number: 80
+`, customDomain)
+	} else {
+		// Path-based fallback for LAN/no-domain clusters.
+		// rewrite-target strips /longhorn prefix before forwarding to the UI.
+		ingressYAML = `apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: longhorn-ingress
@@ -1927,6 +2126,7 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-body-size: "0"
     nginx.ingress.kubernetes.io/use-regex: "true"
     nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
 spec:
   ingressClassName: nginx
   rules:
@@ -1940,6 +2140,7 @@ spec:
             port:
               number: 80
 `
+	}
 	cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
 	cmd.Stdin = strings.NewReader(ingressYAML)
 	cmd.Run()
@@ -1953,6 +2154,16 @@ func (ks *K3sServer) deployClusterOSLandingPage() {
 	// Always re-apply the ConfigMap so script changes take effect on existing clusters.
 	// The Deployment and RBAC are idempotent (kubectl apply is a no-op when unchanged).
 	ks.Logger().Info("Deploying ClusterOS dynamic landing page (auto-discovers all NodePort services)...")
+
+	// Compute rancherHost using the same logic as deployRancher() so that the
+	// /rancher redirect in the landing page always sends the browser to the same
+	// origin as CATTLE_SERVER_URL — preventing CORS AxiosErrors.
+	rancherHost := "rancher.cluster.local"
+	if customDomain := readCloudflareDomain(); customDomain != "" {
+		rancherHost = "rancher." + customDomain
+	} else if ks.nodeIP != "" {
+		rancherHost = strings.ReplaceAll(ks.nodeIP, ".", "-") + ".nip.io"
+	}
 
 	// RBAC — ServiceAccount + ClusterRole + ClusterRoleBinding.
 	const rbacYAML = `apiVersion: v1
@@ -1997,6 +2208,7 @@ TOKEN_FILE  = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 CACERT_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 NODE_IP        = os.environ.get("NODE_IP", "localhost")  # fallback only
 CLUSTER_DOMAIN = os.environ.get("CLUSTEROS_DOMAIN", "")
+RANCHER_HOST   = os.environ.get("RANCHER_HOST", "")
 
 # Use KUBERNETES_SERVICE_HOST env var (always injected by k3s into every pod)
 # so we bypass CoreDNS entirely.  This prevents readiness-probe timeouts after
@@ -2338,6 +2550,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path in ("/rancher", "/rancher/"):
             if CLUSTER_DOMAIN:
                 location = f"https://rancher.{CLUSTER_DOMAIN}"
+            elif RANCHER_HOST:
+                location = f"https://{RANCHER_HOST}:30444"
             else:
                 location = f"https://{req_host}:30444"
             self.send_response(302)
@@ -2438,6 +2652,8 @@ spec:
               fieldPath: status.hostIP
         - name: CLUSTEROS_DOMAIN
           value: %q
+        - name: RANCHER_HOST
+          value: %q
         ports:
         - containerPort: 8080
         readinessProbe:
@@ -2454,7 +2670,7 @@ spec:
       volumes:
       - name: script
         configMap:
-          name: clusteros-landing-script`, clusterDomain)
+          name: clusteros-landing-script`, clusterDomain, rancherHost)
 
 	for _, manifest := range []string{rbacYAML, scriptYAML, deployYAML} {
 		cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
@@ -3177,6 +3393,19 @@ spec:
 func (ks *K3sServer) deployRancher() error {
 	alreadyInstalled := exec.Command("k3s", "kubectl", "-n", "cattle-system", "get", "deployment", "rancher").Run() == nil
 
+	// Compute rancherHost and rancherURL here so they're available for both fresh
+	// installs and the unconditional patches that run on every invocation.
+	// rancherURL omits :30444 for custom domains — Cloudflare only proxies 80/443.
+	rancherHost := "rancher.cluster.local"
+	rancherURL := "https://rancher.cluster.local:30444"
+	if customDomain := readCloudflareDomain(); customDomain != "" {
+		rancherHost = "rancher." + customDomain
+		rancherURL = "https://" + rancherHost // standard 443 via domain ingress
+	} else if ks.nodeIP != "" {
+		rancherHost = strings.ReplaceAll(ks.nodeIP, ".", "-") + ".nip.io"
+		rancherURL = "https://" + rancherHost + ":30444"
+	}
+
 	if !alreadyInstalled {
 	ks.Logger().Info("Installing Rancher management UI...")
 
@@ -3187,16 +3416,6 @@ func (ks *K3sServer) deployRancher() error {
 	// (including repos, API keys) without running helm install from scratch.
 	if err := ks.ensureRancherDataPVC(); err != nil {
 		ks.Logger().Warnf("rancher-data PVC: %v (continuing)", err)
-	}
-
-	// Prefer the custom domain (rancher.<domain>) when cloudflare.env is configured,
-	// so that CATTLE_SERVER_URL is publicly reachable and the Rancher UI works without
-	// Axios errors.  Fall back to nip.io for local/LAN-only deployments.
-	rancherHost := "rancher.cluster.local"
-	if customDomain := readCloudflareDomain(); customDomain != "" {
-		rancherHost = "rancher." + customDomain
-	} else if ks.nodeIP != "" {
-		rancherHost = strings.ReplaceAll(ks.nodeIP, ".", "-") + ".nip.io"
 	}
 
 	helmPath := "/usr/local/bin/helm"
@@ -3226,7 +3445,7 @@ func (ks *K3sServer) deployRancher() error {
 		"--set", "replicas=1",
 		"--set", "global.cattle.psp.enabled=false",
 		"--set", fmt.Sprintf("extraEnv[0].name=CATTLE_SERVER_URL"),
-		"--set", fmt.Sprintf("extraEnv[0].value=https://%s:30444", rancherHost),
+		"--set", "extraEnv[0].value="+rancherURL,
 		"--set", "extraEnv[1].name=CATTLE_FEATURES",
 		"--set", "extraEnv[1].value=unsupported-storage-drivers=true",
 		"--set-string", `ingress.extraAnnotations.nginx\.ingress\.kubernetes\.io/backend-protocol=HTTPS`,
@@ -3246,13 +3465,63 @@ func (ks *K3sServer) deployRancher() error {
 	}
 	} // end if !alreadyInstalled
 
-	// Ensure the Rancher ingress uses HTTPS to talk to the backend.
+	// Patch CATTLE_SERVER_URL only when the value has actually changed.
+	// An unconditional patch triggers a pod rollout on every leader restart — if the
+	// leader re-elects and the nip.io hostname changes, Rancher restarts, drops all
+	// in-flight sessions, and shows the "first time visit / bootstrap password" screen.
+	currentURL, _ := exec.Command("k3s", "kubectl", "get", "deployment", "rancher",
+		"-n", "cattle-system",
+		"-o", `jsonpath={.spec.template.spec.containers[?(@.name=="rancher")].env[?(@.name=="CATTLE_SERVER_URL")].value}`,
+		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
+	).Output()
+	if strings.TrimSpace(string(currentURL)) != rancherURL {
+		cattleURLPatch := fmt.Sprintf(
+			`{"spec":{"template":{"spec":{"containers":[{"name":"rancher","env":[{"name":"CATTLE_SERVER_URL","value":"%s"}]}]}}}}`,
+			rancherURL,
+		)
+		if out, err := exec.Command("k3s", "kubectl", "patch", "deployment", "rancher",
+			"-n", "cattle-system", "--type=strategic",
+			"-p="+cattleURLPatch,
+			"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
+		).CombinedOutput(); err != nil {
+			ks.Logger().Warnf("patch CATTLE_SERVER_URL: %v: %s", err, out)
+		} else {
+			ks.Logger().Infof("Updated CATTLE_SERVER_URL to %s", rancherURL)
+		}
+	}
+
+	// Patch the Rancher server-url CRD setting only when it differs.  CATTLE_SERVER_URL
+	// env var only sets the initial default; once Rancher has bootstrapped it reads the
+	// settings.management.cattle.io resource — the env var is ignored after that.
+	currentSetting, _ := exec.Command("k3s", "kubectl", "get", "settings.management.cattle.io", "server-url",
+		"-o", "jsonpath={.value}",
+		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
+	).Output()
+	if strings.TrimSpace(string(currentSetting)) != rancherURL {
+		serverURLPatch := fmt.Sprintf(`{"value":"%s"}`, rancherURL)
+		if out, err := exec.Command("k3s", "kubectl", "patch", "settings.management.cattle.io", "server-url",
+			"--type=merge",
+			"-p="+serverURLPatch,
+			"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
+		).CombinedOutput(); err != nil {
+			ks.Logger().Warnf("patch Rancher server-url setting: %v: %s (will self-heal on next Rancher startup)", err, out)
+		}
+	}
+
+	// Ensure the Rancher ingress uses HTTPS and has cookie-based session affinity.
 	// The helm chart's extraAnnotations flag doesn't reliably apply due to
 	// dot-in-key escaping; a post-install patch is the safe fallback.
+	// Session affinity prevents the "first time visit" screen when nginx routes
+	// subsequent requests to a different Rancher pod after a pod restart.
 	exec.Command("k3s", "kubectl", "patch", "ingress", "rancher",
 		"-n", "cattle-system",
 		"--type=json",
-		`-p=[{"op":"add","path":"/metadata/annotations/nginx.ingress.kubernetes.io~1backend-protocol","value":"HTTPS"},`+
+		`-p=[`+
+			`{"op":"add","path":"/metadata/annotations/nginx.ingress.kubernetes.io~1backend-protocol","value":"HTTPS"},`+
+			`{"op":"add","path":"/metadata/annotations/nginx.ingress.kubernetes.io~1affinity","value":"cookie"},`+
+			`{"op":"add","path":"/metadata/annotations/nginx.ingress.kubernetes.io~1session-cookie-name","value":"RANCHER_INGRESSCOOKIE"},`+
+			`{"op":"add","path":"/metadata/annotations/nginx.ingress.kubernetes.io~1session-cookie-expires","value":"172800"},`+
+			`{"op":"add","path":"/metadata/annotations/nginx.ingress.kubernetes.io~1session-cookie-max-age","value":"172800"},`+
 			`{"op":"replace","path":"/spec/rules/0/http/paths/0/backend/service/port/number","value":443}]`,
 	).Run()
 
@@ -3260,6 +3529,8 @@ func (ks *K3sServer) deployRancher() error {
 	// node-agent restarts where Rancher is already installed.
 
 	// Expose Rancher via NodePort 30444 (HTTPS direct access by IP — no hostname needed).
+	// sessionAffinity: ClientIP ensures kube-proxy always routes a given client to the
+	// same pod, preventing session loss when Rancher has multiple replicas.
 	rancherNPYAML := `apiVersion: v1
 kind: Service
 metadata:
@@ -3269,6 +3540,10 @@ spec:
   type: NodePort
   selector:
     app: rancher
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
   ports:
   - name: https
     port: 443
@@ -3486,6 +3761,27 @@ func (ks *K3sServer) applyFleetGitRepos() {
 //   5. applyRancherCatalogs() re-applies repos declaratively as a safety net
 //
 // Backup files are stored as <timestamp>.tar.gz in the PVC; the 5 most recent are kept.
+
+// labelRancherCluster patches the Rancher "local" cluster CRD with a domain label so
+// Fleet policies and other tooling can target it without manual UI steps.
+func (ks *K3sServer) labelRancherCluster(domain string) {
+	// Wait until the clusters.management.cattle.io CRD exists (Rancher registers it on startup).
+	for i := 0; i < 60; i++ {
+		if exec.Command("k3s", "kubectl", "get", "clusters.management.cattle.io", "local").Run() == nil {
+			break
+		}
+		time.Sleep(10 * time.Second)
+	}
+	patch := fmt.Sprintf(`{"metadata":{"labels":{"domain":%q}}}`, domain)
+	out, err := exec.Command("k3s", "kubectl", "patch", "clusters.management.cattle.io", "local",
+		"--type=merge", "-p", patch).CombinedOutput()
+	if err != nil {
+		ks.Logger().Warnf("labelRancherCluster: %v: %s", err, out)
+	} else {
+		ks.Logger().Infof("Rancher local cluster labelled with domain=%s", domain)
+	}
+}
+
 func (ks *K3sServer) deployRancherBackup() {
 	// Install rancher-backup CRDs + operator via Helm.
 	exec.Command("helm", "repo", "add", "rancher-charts",
@@ -3695,6 +3991,12 @@ metadata:
     nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
     nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "RANCHER_INGRESSCOOKIE"
+    nginx.ingress.kubernetes.io/session-cookie-expires: "172800"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "172800"
+    nginx.ingress.kubernetes.io/session-cookie-samesite: "None"
+    nginx.ingress.kubernetes.io/session-cookie-secure: "true"
 spec:
   ingressClassName: nginx
   defaultBackend:
