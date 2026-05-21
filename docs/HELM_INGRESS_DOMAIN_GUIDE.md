@@ -39,7 +39,13 @@ data:
 
 ### `clusteros-helm-values` — for Fleet `valuesFrom`
 
+Published into **both** Fleet namespaces — use whichever matches your GitRepo:
+
 ```bash
+# GitRepos targeting the local cluster (most common on ClusterOS)
+k3s kubectl get cm clusteros-helm-values -n fleet-local -o yaml
+
+# GitRepos targeting remote/external clusters
 k3s kubectl get cm clusteros-helm-values -n fleet-default -o yaml
 ```
 
@@ -388,7 +394,7 @@ helm:
   valuesFrom:
   - configMapKeyRef:
       name: clusteros-helm-values
-      namespace: fleet-default
+      namespace: fleet-local    # or fleet-default for remote-cluster GitRepos
       key: values.yaml
 
   # Chart-specific values — layered on top of valuesFrom.
@@ -426,7 +432,7 @@ helm:
   valuesFrom:
   - configMapKeyRef:
       name: clusteros-helm-values
-      namespace: fleet-default
+      namespace: fleet-local    # or fleet-default for remote-cluster GitRepos
       key: values.yaml
   values:
     ingress:
@@ -523,8 +529,9 @@ env:
 ### Namespace RBAC for cross-namespace ConfigMap reference
 
 Fleet's `valuesFrom` only resolves ConfigMaps in the **same namespace as the
-GitRepo** (`fleet-default`). The `clusteros-helm-values` ConfigMap is already
-placed there by node-agent, so no extra RBAC is needed.
+GitRepo**. Node-agent publishes `clusteros-helm-values` into both `fleet-local`
+and `fleet-default`, so whichever namespace your GitRepo lives in, no extra RBAC
+is needed — just reference the matching namespace.
 
 The `clusteros-config` ConfigMap (in `kube-system`) is for pods and scripts only
 — pods need a ServiceAccount with `get` on ConfigMaps in `kube-system` if they

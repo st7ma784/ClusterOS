@@ -677,22 +677,27 @@ data:
     nginx.ingress.kubernetes.io/force-ssl-redirect: %q
 `, domain, mode, rancherHost, sslRedirect, sslRedirect, sslRedirect)
 
-	// fleet-default namespace is created by Rancher; ensure it exists before writing.
-	exec.Command("k3s", "kubectl", "create", "namespace", "fleet-default",
-		"--dry-run=client", "-o", "yaml",
-		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml").Run()
+	// Publish clusteros-helm-values into both Fleet namespaces:
+	//   fleet-default — GitRepos targeting remote/external clusters
+	//   fleet-local   — GitRepos targeting the local cluster itself (most common on ClusterOS)
+	// Both namespaces are created by Rancher; ensure they exist before writing.
+	for _, ns := range []string{"fleet-default", "fleet-local"} {
+		exec.Command("k3s", "kubectl", "create", "namespace", ns,
+			"--dry-run=client", "-o", "yaml",
+			"--kubeconfig", "/etc/rancher/k3s/k3s.yaml").Run()
 
-	fleetCM := fmt.Sprintf(`apiVersion: v1
+		fleetCM := fmt.Sprintf(`apiVersion: v1
 kind: ConfigMap
 metadata:
   name: clusteros-helm-values
-  namespace: fleet-default
+  namespace: %s
   labels:
     app.kubernetes.io/managed-by: node-agent
 data:
   values.yaml: |
-%s`, indentBlock(helmValues, "    "))
-	apply(fleetCM, "clusteros-helm-values")
+%s`, ns, indentBlock(helmValues, "    "))
+		apply(fleetCM, "clusteros-helm-values/"+ns)
+	}
 
 	ks.Logger().Infof("cluster ConfigMaps published (domain=%q, mode=%s, ssl-redirect=%s)",
 		domain, mode, sslRedirect)
