@@ -521,6 +521,10 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 	// restarts without this unconditional call.
 	ks.createLonghornIngress()
 
+	// Run storage GC in the background so it doesn't delay cert-manager / Rancher.
+	// After several restarts Released PVs accumulate and fill nodes; this cleans them up.
+	go ks.cleanupOrphanedStorage()
+
 	if err := ks.deployCertManager(); err != nil {
 		ks.Logger().Warnf("Failed to deploy cert-manager: %v (skipping Rancher)", err)
 		ks.deploySLURMRestAPI(mungeKey)
@@ -956,30 +960,12 @@ spec:
               number: 80
 `, domain, domain))
 
-	// Rancher — HTTPS backend
-	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: rancher-domain
-  namespace: cattle-system
-  annotations:
-    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
-    nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
-    nginx.ingress.kubernetes.io/ssl-redirect: "false"
-spec:
-  ingressClassName: nginx
-  rules:
-  - host: rancher.%s
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: rancher
-            port:
-              number: 443
-`, domain))
+	// Rancher is served by the helm-created "rancher" ingress (cattle-system), which is
+	// patched with backend-protocol=HTTPS and cookie session affinity in deployRancher().
+	// A separate rancher-domain ingress for the same host/path conflicts with it and
+	// strips session affinity on every restart, causing intermittent logouts.
+	exec.Command("k3s", "kubectl", "-n", "cattle-system", "delete", "ingress",
+		"rancher-domain", "--ignore-not-found=true").Run()
 
 	// SLURM REST API
 	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
@@ -1976,6 +1962,122 @@ func (ks *K3sServer) patchIngressForMetalLB() {
 	ks.Logger().Warn("MetalLB VIP not assigned after 2m — ingress-nginx remains on NodePort fallback")
 }
 
+// cleanupOrphanedStorage finds PVs in Released state whose original PVC no longer
+// exists (or was never recreated after an etcd wipe) and frees the backing Longhorn
+// storage.  It is called as a goroutine from DeployClusterServices so it never
+// blocks the main deployment path.
+//
+// PVCs explicitly recovered by ensureRancherDataPVC() are skipped so we don't
+// race with that recovery logic.
+func (ks *K3sServer) cleanupOrphanedStorage() {
+	ks.Logger().Info("[storage-gc] Scanning for orphaned PVs and Longhorn volumes...")
+
+	out, err := exec.Command("k3s", "kubectl", "get", "pv",
+		"-o", `jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.spec.claimRef.namespace}{"\t"}{.spec.claimRef.name}{"\t"}{.spec.storageClassName}{"\n"}{end}`).Output()
+	if err != nil {
+		ks.Logger().Warnf("[storage-gc] Could not list PVs: %v", err)
+		return
+	}
+
+	// PVCs actively recovered by known service deployers — leave them alone.
+	managedPVCs := map[string]bool{
+		"cattle-system/rancher-data": true,
+	}
+
+	var cleaned int
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) < 5 {
+			continue
+		}
+		pvName, phase, claimNS, claimName := fields[0], fields[1], fields[2], fields[3]
+		if pvName == "" || phase != "Released" {
+			continue
+		}
+		if managedPVCs[claimNS+"/"+claimName] {
+			continue
+		}
+
+		// Skip if the PVC was recreated and is already Bound to a different PV.
+		pvcPhase, _ := exec.Command("k3s", "kubectl", "get", "pvc", claimName,
+			"-n", claimNS, "-o", "jsonpath={.status.phase}").Output()
+		if strings.TrimSpace(string(pvcPhase)) == "Bound" {
+			continue
+		}
+
+		ks.Logger().Infof("[storage-gc] Orphaned PV %s (was %s/%s) — reclaiming", pvName, claimNS, claimName)
+
+		// Switch reclaim policy to Delete so Longhorn removes the volume on PV deletion.
+		patchOut, err := exec.Command("k3s", "kubectl", "patch", "pv", pvName,
+			"--type=json",
+			`-p=[{"op":"replace","path":"/spec/persistentVolumeReclaimPolicy","value":"Delete"}]`).CombinedOutput()
+		if err != nil {
+			ks.Logger().Warnf("[storage-gc] patch PV %s: %v — %s", pvName, err, patchOut)
+			continue
+		}
+		delOut, err := exec.Command("k3s", "kubectl", "delete", "pv", pvName).CombinedOutput()
+		if err != nil {
+			ks.Logger().Warnf("[storage-gc] delete PV %s: %v — %s", pvName, err, delOut)
+			continue
+		}
+		cleaned++
+	}
+	if cleaned > 0 {
+		ks.Logger().Infof("[storage-gc] Reclaimed %d orphaned PV(s)", cleaned)
+	}
+
+	ks.cleanupOrphanedLonghornVolumes()
+}
+
+// cleanupOrphanedLonghornVolumes removes Longhorn Volume CRD objects that are in
+// Detached state with no corresponding PV — these are volumes whose PV was already
+// deleted (or never created) and whose storage would otherwise be leaked forever.
+func (ks *K3sServer) cleanupOrphanedLonghornVolumes() {
+	out, err := exec.Command("k3s", "kubectl", "get", "volumes.longhorn.io",
+		"-n", "longhorn-system",
+		"-o", `jsonpath={range .items[*]}{.metadata.name}{"\t"}{.status.state}{"\t"}{.status.kubernetesStatus.pvName}{"\n"}{end}`).Output()
+	if err != nil {
+		// Longhorn CRDs may not be installed yet on a fresh cluster — suppress noise.
+		ks.Logger().Debugf("[storage-gc] Could not list Longhorn volumes: %v", err)
+		return
+	}
+
+	// Build a set of all volume handles referenced by existing PVs.
+	pvHandles := map[string]bool{}
+	pvOut, _ := exec.Command("k3s", "kubectl", "get", "pv",
+		"-o", `jsonpath={range .items[*]}{.spec.csi.volumeHandle}{"\n"}{end}`).Output()
+	for _, h := range strings.Split(string(pvOut), "\n") {
+		if h = strings.TrimSpace(h); h != "" {
+			pvHandles[h] = true
+		}
+	}
+
+	var cleaned int
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) < 3 {
+			continue
+		}
+		volName, state, pvName := fields[0], fields[1], strings.TrimSpace(fields[2])
+		if volName == "" || state != "detached" || pvName != "" || pvHandles[volName] {
+			continue
+		}
+		ks.Logger().Infof("[storage-gc] Orphaned Longhorn volume %s (detached, no PV) — deleting", volName)
+		delOut, err := exec.Command("k3s", "kubectl", "delete", "volumes.longhorn.io",
+			volName, "-n", "longhorn-system").CombinedOutput()
+		if err != nil {
+			ks.Logger().Warnf("[storage-gc] delete Longhorn volume %s: %v — %s", volName, err, delOut)
+			continue
+		}
+		cleaned++
+	}
+	if cleaned > 0 {
+		ks.Logger().Infof("[storage-gc] Deleted %d orphaned Longhorn volume(s)", cleaned)
+	} else {
+		ks.Logger().Info("[storage-gc] No orphaned Longhorn volumes found")
+	}
+}
+
 func (ks *K3sServer) deployLonghorn() error {
 	if exec.Command("k3s", "kubectl", "-n", "longhorn-system", "get", "deployment", "longhorn-driver-deployer").Run() == nil {
 		return nil // already installed
@@ -2884,6 +2986,7 @@ spec:
 	}
 
 	ks.deploySLURMWebDash(mungeKey)
+	ks.deploySLURMQueuePoller()
 
 	ks.slurmRestDeployed = true
 	ks.Logger().Info("SLURM deployed — REST API NodePort 30819 + /slurm/api, web dashboard /slurm")
@@ -3167,6 +3270,112 @@ func (ks *K3sServer) deployCertManager() error {
 	return nil
 }
 
+// deploySLURMQueuePoller deploys a single-replica Deployment on the SLURM
+// controller node that polls squeue/sinfo every 30 s and writes the output
+// to a ConfigMap (slurm/slurm-queue-state).  Rancher Explorer surfaces the
+// ConfigMap so operators can see job queue state without SSHing into a node.
+// The pod reuses the same host-binary mount pattern as slurmrestd so it
+// authenticates to SLURM via the local munge socket.
+func (ks *K3sServer) deploySLURMQueuePoller() {
+	const pollerYAML = `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: slurm-queue-exporter
+  namespace: slurm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: slurm-queue-exporter
+  template:
+    metadata:
+      labels:
+        app: slurm-queue-exporter
+    spec:
+      nodeSelector:
+        clusteros.io/slurm-controller: "true"
+      tolerations:
+      - operator: Exists
+      hostNetwork: true
+      volumes:
+      - name: munge-socket
+        hostPath:
+          path: /var/run/munge
+          type: Directory
+      - name: slurm-conf
+        hostPath:
+          path: /etc/slurm
+          type: DirectoryOrCreate
+      - name: host-usr
+        hostPath:
+          path: /usr
+          type: Directory
+      - name: k3s-kubeconfig
+        hostPath:
+          path: /etc/rancher/k3s
+          type: DirectoryOrCreate
+      initContainers:
+      - name: wait-munge
+        image: busybox:latest
+        command: ['sh', '-c', 'until [ -S /var/run/munge/munge.socket.2 ]; do sleep 2; done']
+        volumeMounts:
+        - name: munge-socket
+          mountPath: /var/run/munge
+      containers:
+      - name: exporter
+        image: ubuntu:24.04
+        command:
+        - /bin/sh
+        - -c
+        - |
+          groupadd -g 64030 slurm 2>/dev/null || true
+          useradd -u 64030 -g 64030 -M -s /usr/sbin/nologin slurm 2>/dev/null || true
+          mkdir -p /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu
+          ln -sfn /hostfs/usr/lib/x86_64-linux-gnu/slurm-wlm /usr/lib/x86_64-linux-gnu/slurm-wlm 2>/dev/null || true
+          ln -sfn /hostfs/usr/lib/aarch64-linux-gnu/slurm-wlm /usr/lib/aarch64-linux-gnu/slurm-wlm 2>/dev/null || true
+          K3S=/hostfs/usr/local/bin/k3s
+          KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          while true; do
+            su -s /bin/sh slurm -c '/hostfs/usr/bin/squeue --json 2>/dev/null' \
+              > /tmp/jobs.json || printf '{"jobs":[]}' > /tmp/jobs.json
+            su -s /bin/sh slurm -c '/hostfs/usr/bin/sinfo --json 2>/dev/null' \
+              > /tmp/sinfo.json || printf '{"nodes":[]}' > /tmp/sinfo.json
+            date -u +%Y-%m-%dT%H:%M:%SZ > /tmp/updated.txt
+            "$K3S" kubectl --kubeconfig="$KUBECONFIG" \
+              create configmap slurm-queue-state \
+              --namespace=slurm \
+              --from-file=jobs.json=/tmp/jobs.json \
+              --from-file=sinfo.json=/tmp/sinfo.json \
+              --from-file=updated=/tmp/updated.txt \
+              --dry-run=client -o yaml | \
+            "$K3S" kubectl --kubeconfig="$KUBECONFIG" apply -f - 2>/dev/null || true
+            sleep 30
+          done
+        env:
+        - name: LD_LIBRARY_PATH
+          value: /hostfs/usr/lib/x86_64-linux-gnu/slurm-wlm:/hostfs/usr/lib/x86_64-linux-gnu:/hostfs/usr/lib/aarch64-linux-gnu/slurm-wlm:/hostfs/usr/lib/aarch64-linux-gnu
+        volumeMounts:
+        - name: munge-socket
+          mountPath: /var/run/munge
+        - name: slurm-conf
+          mountPath: /etc/slurm
+          readOnly: true
+        - name: host-usr
+          mountPath: /hostfs/usr
+          readOnly: true
+        - name: k3s-kubeconfig
+          mountPath: /etc/rancher/k3s
+          readOnly: true
+`
+	cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(pollerYAML)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("slurm-queue-exporter deploy: %v: %s", err, out)
+		return
+	}
+	ks.Logger().Info("SLURM queue exporter deployed — ConfigMap slurm/slurm-queue-state updated every 30s")
+}
+
 // ensureRancherDataPVC ensures the rancher-data PVC exists in cattle-system.
 // On a normal deploy this is a no-op (PVC already Bound).
 // On a fresh cluster after an etcd wipe the PV object is gone, but longhorn-ha
@@ -3400,6 +3609,93 @@ spec:
 	}
 }
 
+// ensureRancherBootstrapSecret pre-creates cattle-system/bootstrap-secret as a k8s
+// Secret (stored in distributed etcd) before Rancher is first deployed.
+//
+// Why: Without this, the admin password lives only in Rancher's embedded SQLite cache.
+// If the pod is rescheduled to a node that can't reattach the PVC (or after PVC removal),
+// Rancher starts with an empty cache and shows the "first time setup" screen.
+// With the Secret in etcd — replicated across all control-plane nodes — the password
+// is always available, even on a completely cold start.
+func (ks *K3sServer) ensureRancherBootstrapSecret() {
+	kubeArgs := []string{"--kubeconfig", "/etc/rancher/k3s/k3s.yaml"}
+
+	// Ensure the namespace exists first.
+	nsYAML := "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: cattle-system\n"
+	nsCmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	nsCmd.Args = append(nsCmd.Args, kubeArgs...)
+	nsCmd.Stdin = strings.NewReader(nsYAML)
+	nsCmd.Run()
+
+	// Skip if the secret already exists — don't overwrite a password the admin may have changed.
+	check := exec.Command("k3s", "kubectl", "get", "secret", "bootstrap-secret",
+		"-n", "cattle-system")
+	check.Args = append(check.Args, kubeArgs...)
+	if check.Run() == nil {
+		return
+	}
+
+	secretYAML := `apiVersion: v1
+kind: Secret
+metadata:
+  name: bootstrap-secret
+  namespace: cattle-system
+type: Opaque
+stringData:
+  bootstrapPassword: "admin"
+`
+	cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	cmd.Args = append(cmd.Args, kubeArgs...)
+	cmd.Stdin = strings.NewReader(secretYAML)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		ks.Logger().Warnf("create bootstrap-secret: %v: %s", err, out)
+	} else {
+		ks.Logger().Info("Created cattle-system/bootstrap-secret (admin password persisted in etcd)")
+	}
+}
+
+// ensureRancherStateless ensures the Rancher deployment:
+//   1. Does NOT mount the rancher-data PVC — Rancher is stateless across rescheduling.
+//      All durable state (users, passwords, settings, clusters) is in management.cattle.io
+//      CRDs stored in k3s etcd.  The embedded SQLite is a cache rebuilt on cold start.
+//   2. Runs with 3 replicas so any single-node failure leaves 2 pods still serving traffic.
+//
+// Idempotent: safe to call on every leader startup.
+func (ks *K3sServer) ensureRancherStateless() {
+	kubeArgs := []string{"--kubeconfig", "/etc/rancher/k3s/k3s.yaml"}
+
+	// Check whether the deployment still carries the rancher-data volume.
+	volOut, _ := exec.Command("k3s", "kubectl", "get", "deployment", "rancher",
+		"-n", "cattle-system",
+		"-o", `jsonpath={.spec.template.spec.volumes[?(@.name=="rancher-data")].name}`,
+		kubeArgs[0], kubeArgs[1]).Output()
+
+	if strings.TrimSpace(string(volOut)) == "rancher-data" {
+		ks.Logger().Info("Removing rancher-data PVC mount from Rancher deployment (stateless migration)...")
+		// Strategic merge patch: the $patch:delete directive removes an item from a named list
+		// by its merge key ("name" for volumes, "mountPath" for volumeMounts) without
+		// affecting other volumes/mounts that Rancher may have added internally.
+		removePatch := `{"spec":{"template":{"spec":{` +
+			`"volumes":[{"$patch":"delete","name":"rancher-data"}],` +
+			`"containers":[{"name":"rancher","volumeMounts":[{"$patch":"delete","mountPath":"/var/lib/rancher"}]}]` +
+			`}}}}`
+		cmd := exec.Command("k3s", "kubectl", "patch", "deployment", "rancher",
+			"-n", "cattle-system", "--type=strategic", "-p", removePatch,
+			kubeArgs[0], kubeArgs[1])
+		if out, err := cmd.CombinedOutput(); err != nil {
+			ks.Logger().Warnf("remove rancher-data volume from deployment: %v: %s", err, out)
+		} else {
+			ks.Logger().Info("Rancher deployment is now stateless — pod can schedule on any node instantly")
+		}
+	}
+
+	// Always ensure 3 replicas (idempotent — no rollout triggered if already 3).
+	replicasPatch := `{"spec":{"replicas":3}}`
+	exec.Command("k3s", "kubectl", "patch", "deployment", "rancher",
+		"-n", "cattle-system", "--type=merge", "-p", replicasPatch,
+		kubeArgs[0], kubeArgs[1]).Run()
+}
+
 func (ks *K3sServer) deployRancher() error {
 	alreadyInstalled := exec.Command("k3s", "kubectl", "-n", "cattle-system", "get", "deployment", "rancher").Run() == nil
 
@@ -3416,17 +3712,13 @@ func (ks *K3sServer) deployRancher() error {
 		rancherURL = "https://" + rancherHost + ":30444"
 	}
 
+	// Always pre-create the bootstrap secret before installing Rancher.
+	// Stored as a k8s Secret in etcd (replicated across all control-plane nodes),
+	// so the admin password survives any single-node failure and PVC loss.
+	ks.ensureRancherBootstrapSecret()
+
 	if !alreadyInstalled {
 	ks.Logger().Info("Installing Rancher management UI...")
-
-	// Pre-create the rancher-data PVC backed by Longhorn (2 replicas, Retain reclaim).
-	// On a fresh cluster after an etcd wipe the PV object is gone but the Longhorn
-	// volume may still have data on disk.  We check for Released PVs first and
-	// re-bind to any that were the rancher-data PVC — this recovers the SQLite DB
-	// (including repos, API keys) without running helm install from scratch.
-	if err := ks.ensureRancherDataPVC(); err != nil {
-		ks.Logger().Warnf("rancher-data PVC: %v (continuing)", err)
-	}
 
 	helmPath := "/usr/local/bin/helm"
 	if _, err := os.Stat(helmPath); os.IsNotExist(err) {
@@ -3452,7 +3744,11 @@ func (ks *K3sServer) deployRancher() error {
 		"--set", "bootstrapPassword=admin",
 		"--set", "ingress.tls.source=rancher",
 		"--set", "ingress.ingressClassName=nginx",
-		"--set", "replicas=1",
+		// 3 replicas: Rancher stays available even when 1–2 nodes fail.
+		// All critical state (users, passwords, settings, clusters) is stored in
+		// management.cattle.io CRDs in k3s etcd, which is already replicated.
+		// The embedded SQLite is a local cache; each pod rebuilds it from etcd on startup.
+		"--set", "replicas=3",
 		"--set", "global.cattle.psp.enabled=false",
 		"--set", fmt.Sprintf("extraEnv[0].name=CATTLE_SERVER_URL"),
 		"--set", "extraEnv[0].value="+rancherURL,
@@ -3460,12 +3756,6 @@ func (ks *K3sServer) deployRancher() error {
 		"--set", "extraEnv[1].value=unsupported-storage-drivers=true",
 		"--set-string", `ingress.extraAnnotations.nginx\.ingress\.kubernetes\.io/backend-protocol=HTTPS`,
 		"--set-string", `ingress.extraAnnotations.nginx\.ingress\.kubernetes\.io/proxy-ssl-verify=off`,
-		// Mount rancher-data PVC at /var/lib/rancher so the embedded SQLite DB
-		// (cattle.db) survives pod rescheduling to a different node.
-		"--set", "volumes[0].name=rancher-data",
-		"--set", "volumes[0].persistentVolumeClaim.claimName=rancher-data",
-		"--set", "volumeMounts[0].name=rancher-data",
-		"--set", "volumeMounts[0].mountPath=/var/lib/rancher",
 		"--wait", "--timeout", "5m0s",
 		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
 	)
@@ -3479,15 +3769,28 @@ func (ks *K3sServer) deployRancher() error {
 	// An unconditional patch triggers a pod rollout on every leader restart — if the
 	// leader re-elects and the nip.io hostname changes, Rancher restarts, drops all
 	// in-flight sessions, and shows the "first time visit / bootstrap password" screen.
-	currentURL, _ := exec.Command("k3s", "kubectl", "get", "deployment", "rancher",
+	currentURLBytes, _ := exec.Command("k3s", "kubectl", "get", "deployment", "rancher",
 		"-n", "cattle-system",
 		"-o", `jsonpath={.spec.template.spec.containers[?(@.name=="rancher")].env[?(@.name=="CATTLE_SERVER_URL")].value}`,
 		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
 	).Output()
-	if strings.TrimSpace(string(currentURL)) != rancherURL {
+	currentURL := strings.TrimSpace(string(currentURLBytes))
+
+	// Anti-regression guard: never patch CATTLE_SERVER_URL *to* a nip.io address if
+	// Rancher is already running with a proper custom domain.  This prevents the URL
+	// from flip-flopping back to nip.io on restarts where cloudflare.env is temporarily
+	// unreadable (e.g. early in the boot sequence before the filesystem is fully mounted).
+	effectiveURL := rancherURL
+	if strings.Contains(rancherURL, ".nip.io") && currentURL != "" && !strings.Contains(currentURL, ".nip.io") {
+		ks.Logger().Infof("Keeping existing custom-domain Rancher URL %s (cloudflare.env not loaded yet)", currentURL)
+		effectiveURL = currentURL
+	}
+
+	rolloutTriggered := false
+	if currentURL != effectiveURL {
 		cattleURLPatch := fmt.Sprintf(
 			`{"spec":{"template":{"spec":{"containers":[{"name":"rancher","env":[{"name":"CATTLE_SERVER_URL","value":"%s"}]}]}}}}`,
-			rancherURL,
+			effectiveURL,
 		)
 		if out, err := exec.Command("k3s", "kubectl", "patch", "deployment", "rancher",
 			"-n", "cattle-system", "--type=strategic",
@@ -3496,27 +3799,17 @@ func (ks *K3sServer) deployRancher() error {
 		).CombinedOutput(); err != nil {
 			ks.Logger().Warnf("patch CATTLE_SERVER_URL: %v: %s", err, out)
 		} else {
-			ks.Logger().Infof("Updated CATTLE_SERVER_URL to %s", rancherURL)
+			ks.Logger().Infof("Updated CATTLE_SERVER_URL to %s", effectiveURL)
+			rolloutTriggered = true
 		}
 	}
 
-	// Patch the Rancher server-url CRD setting only when it differs.  CATTLE_SERVER_URL
-	// env var only sets the initial default; once Rancher has bootstrapped it reads the
-	// settings.management.cattle.io resource — the env var is ignored after that.
-	currentSetting, _ := exec.Command("k3s", "kubectl", "get", "settings.management.cattle.io", "server-url",
-		"-o", "jsonpath={.value}",
-		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
-	).Output()
-	if strings.TrimSpace(string(currentSetting)) != rancherURL {
-		serverURLPatch := fmt.Sprintf(`{"value":"%s"}`, rancherURL)
-		if out, err := exec.Command("k3s", "kubectl", "patch", "settings.management.cattle.io", "server-url",
-			"--type=merge",
-			"-p="+serverURLPatch,
-			"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
-		).CombinedOutput(); err != nil {
-			ks.Logger().Warnf("patch Rancher server-url setting: %v: %s (will self-heal on next Rancher startup)", err, out)
-		}
-	}
+	// Patch the Rancher server-url CRD setting.  CATTLE_SERVER_URL env var only sets
+	// the initial default; once Rancher has bootstrapped it reads this resource instead.
+	// If we just triggered a rollout, wait for the pods to be ready before patching —
+	// the CRD becomes temporarily unavailable during restart, causing a silent failure
+	// that leaves the setting pointing at the old (nip.io) URL → "Unknown schema" error.
+	go ks.patchRancherServerURLSetting(effectiveURL, rolloutTriggered)
 
 	// Ensure the Rancher ingress uses HTTPS and has cookie-based session affinity.
 	// The helm chart's extraAnnotations flag doesn't reliably apply due to
@@ -3597,14 +3890,54 @@ spec:
 		ks.Logger().Warnf("rancher-path-ingress: %v: %s", err, out)
 	}
 
-	// Ensure the rancher-data PVC is mounted on the Rancher deployment.
-	// This is a no-op for fresh installs (already set via helm --set flags) but
-	// patches existing deployments that were installed before this code was added.
-	// Must run after the PVC is guaranteed to exist (ensureRancherDataPVC called above).
-	ks.ensureRancherDataMounted()
+	// Ensure Rancher is stateless (no PVC mount) and running 3 replicas.
+	// Idempotent: no-op for fresh installs; migrates existing PVC-based deployments.
+	ks.ensureRancherStateless()
 
 	ks.Logger().Infof("Rancher NodePort 30444 applied (admin/admin)")
 	return nil
+}
+
+// patchRancherServerURLSetting updates settings.management.cattle.io/server-url with retries.
+// If waitForRollout is true it first waits for the Rancher deployment to finish rolling out —
+// the CRD is temporarily unavailable while pods restart, which causes a silent patch failure
+// that leaves the setting pointing at the old (nip.io) address and triggers "Unknown schema".
+func (ks *K3sServer) patchRancherServerURLSetting(url string, waitForRollout bool) {
+	kubeArgs := []string{"--kubeconfig", "/etc/rancher/k3s/k3s.yaml"}
+
+	if waitForRollout {
+		ks.Logger().Info("Waiting for Rancher rollout before patching server-url setting...")
+		exec.Command("k3s", "kubectl", "rollout", "status", "deployment/rancher",
+			"-n", "cattle-system", "--timeout=5m",
+			kubeArgs[0], kubeArgs[1],
+		).Run()
+	}
+
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		currentBytes, _ := exec.Command("k3s", "kubectl", "get",
+			"settings.management.cattle.io", "server-url",
+			"-o", "jsonpath={.value}",
+			kubeArgs[0], kubeArgs[1],
+		).Output()
+		if strings.TrimSpace(string(currentBytes)) == url {
+			ks.Logger().Infof("Rancher server-url setting already correct: %s", url)
+			return
+		}
+		out, err := exec.Command("k3s", "kubectl", "patch",
+			"settings.management.cattle.io", "server-url",
+			"--type=merge",
+			fmt.Sprintf(`-p={"value":"%s"}`, url),
+			kubeArgs[0], kubeArgs[1],
+		).CombinedOutput()
+		if err == nil {
+			ks.Logger().Infof("Rancher server-url setting updated to %s", url)
+			return
+		}
+		ks.Logger().Debugf("Rancher server-url patch attempt failed (Rancher may still be starting): %v: %s", err, out)
+		time.Sleep(15 * time.Second)
+	}
+	ks.Logger().Warnf("Failed to patch Rancher server-url setting to %s after 5min", url)
 }
 
 // applyRancherCatalogs re-applies Helm repository definitions as ClusterRepo CRDs on every

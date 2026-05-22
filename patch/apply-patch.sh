@@ -1108,6 +1108,75 @@ else
     printf "" > /etc/slurm/gres.conf
 fi
 
+# ---------------------------------------------------------------------------
+# SLURM ↔ k8s scheduler coordination — prolog/epilog scripts
+# SlurmctldProlog runs on the controller (= k3s leader) when a job is
+# allocated; it taints the assigned k8s nodes so k8s won't schedule new pods
+# on a busy SLURM node.  SlurmctldEpilog removes the per-job taint on finish.
+# Multiple concurrent jobs on the same node each get their own taint key so
+# the node is only un-tainted when ALL its SLURM jobs have completed.
+# ---------------------------------------------------------------------------
+mkdir -p /etc/slurm/prolog.d /etc/slurm/epilog.d
+
+cat > /etc/slurm/prolog.d/k8s-taint.sh << 'PROLOG_EOF'
+#!/bin/bash
+# SlurmctldProlog: taint k8s nodes for the duration of a SLURM job.
+# Runs on the SLURM controller (k3s leader) — kubeconfig is available there.
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+command -v k3s &>/dev/null || exit 0
+[ -f "$KUBECONFIG" ] || exit 0
+
+# Build Tailscale-IP -> k8s node-name map.
+declare -A IP_TO_NODE
+while IFS=' ' read -r ip nodename; do
+    [[ -n "$ip" ]] && IP_TO_NODE["$ip"]="$nodename"
+done < <(k3s kubectl get nodes \
+    -o 'jsonpath={range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{" "}{.metadata.name}{"\n"}{end}' \
+    2>/dev/null)
+
+while IFS= read -r node_ip; do
+    [[ -z "$node_ip" ]] && continue
+    k8s_name="${IP_TO_NODE[$node_ip]:-}"
+    [[ -z "$k8s_name" ]] && continue
+    k3s kubectl taint node "$k8s_name" \
+        "clusteros.io/slurm-job-${SLURM_JOB_ID}=active:NoSchedule" \
+        --overwrite 2>/dev/null || true
+done < <(scontrol show hostnames "${SLURM_JOB_NODELIST:-}" 2>/dev/null \
+         || printf '%s\n' "${SLURM_JOB_NODELIST:-}")
+exit 0
+PROLOG_EOF
+chmod +x /etc/slurm/prolog.d/k8s-taint.sh
+
+cat > /etc/slurm/epilog.d/k8s-untaint.sh << 'EPILOG_EOF'
+#!/bin/bash
+# SlurmctldEpilog: remove the per-job NoSchedule taint after the job exits.
+# Each job uses a unique taint key so concurrent jobs are handled correctly.
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+command -v k3s &>/dev/null || exit 0
+[ -f "$KUBECONFIG" ] || exit 0
+
+declare -A IP_TO_NODE
+while IFS=' ' read -r ip nodename; do
+    [[ -n "$ip" ]] && IP_TO_NODE["$ip"]="$nodename"
+done < <(k3s kubectl get nodes \
+    -o 'jsonpath={range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{" "}{.metadata.name}{"\n"}{end}' \
+    2>/dev/null)
+
+while IFS= read -r node_ip; do
+    [[ -z "$node_ip" ]] && continue
+    k8s_name="${IP_TO_NODE[$node_ip]:-}"
+    [[ -z "$k8s_name" ]] && continue
+    # Trailing '-' on the taint key removes it; k8s ignores unknown taint keys.
+    k3s kubectl taint node "$k8s_name" \
+        "clusteros.io/slurm-job-${SLURM_JOB_ID}:NoSchedule-" \
+        2>/dev/null || true
+done < <(scontrol show hostnames "${SLURM_JOB_NODELIST:-}" 2>/dev/null \
+         || printf '%s\n' "${SLURM_JOB_NODELIST:-}")
+exit 0
+EPILOG_EOF
+chmod +x /etc/slurm/epilog.d/k8s-untaint.sh
+ok "SLURM prolog/epilog scripts installed (k8s node taint coordination)"
+
 # Serf status file — stale phase/leader values would confuse the new daemon
 rm -f /run/clusteros/status.json 2>/dev/null || true
 

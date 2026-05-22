@@ -425,6 +425,8 @@ TaskPlugin=task/none
 MpiDefault=pmix
 MpiParams=ports=12000-12999
 PrologFlags=Alloc
+SlurmctldProlog=/etc/slurm/prolog.d/k8s-taint.sh
+SlurmctldEpilog=/etc/slurm/epilog.d/k8s-untaint.sh
 
 # Controller node — also participates as a compute node so jobs can run on it.
 # slurmd on the controller uses -N {{.ControllerNode}} to register with this exact NodeName.
