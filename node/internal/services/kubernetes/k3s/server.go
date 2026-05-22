@@ -4551,9 +4551,6 @@ func (ks *K3sServer) deployActionsRunners(org, pat string) {
 
 	// Ensure namespaces exist.
 	for _, ns := range []string{controllerNS, runnerNS} {
-		exec.Command("k3s", "kubectl", "create", "namespace", ns,
-			"--dry-run=client", "-o", "yaml").Run()
-		exec.Command("k3s", "kubectl", "apply", "-f", "-").Stdin = nil
 		cmd := exec.Command("k3s", "kubectl", "create", "namespace", ns, "--dry-run=client", "-o", "yaml")
 		out, _ := cmd.Output()
 		apply := exec.Command("k3s", "kubectl", "apply", "-f", "-")
