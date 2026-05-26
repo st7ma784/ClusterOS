@@ -3,8 +3,10 @@ package k3s
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	_ "embed"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/http"
@@ -101,8 +103,23 @@ func (ks *K3sServer) Start() error {
 		}
 	}
 
-	if err := ks.resetEtcdIfStale(); err != nil {
-		ks.Logger().Warnf("etcd reset: %v", err)
+	if ks.serverURL != "" {
+		// Joining (secondary CP) mode: always wipe local etcd before joining.
+		// The leader may have started a fresh single-member cluster (new cluster ID)
+		// after wiping its own stale data on reboot. Our local etcd still holds the
+		// old cluster ID → "Waiting to retrieve etcd cluster member list" deadlock.
+		// Wiping is safe: all canonical state lives in the leader's etcd and k3s
+		// will re-sync the full dataset when we join as a learner.
+		etcdDir := filepath.Join(ks.dataDir, "server", "db", "etcd")
+		if err := os.RemoveAll(etcdDir); err != nil {
+			ks.Logger().Warnf("wipe secondary CP etcd: %v", err)
+		} else {
+			ks.Logger().Info("Wiped secondary CP etcd data — will re-sync from leader")
+		}
+	} else {
+		if err := ks.resetEtcdIfStale(); err != nil {
+			ks.Logger().Warnf("etcd reset: %v", err)
+		}
 	}
 
 	// Determine the address k3s will advertise in the kubeconfig.
@@ -125,10 +142,9 @@ func (ks *K3sServer) Start() error {
 		// and accessible from most networks.  Every pod sandbox requires this image,
 		// so a pull failure here blocks ALL pod scheduling.
 		"--pause-image", "registry.k8s.io/pause:3.6",
-		// Write the kubeconfig world-readable so non-root users (e.g. the
-		// 'clusteros' service account running 'cluster test') can call kubectl
-		// without sudo.  All nodes are on a trusted Tailscale mesh so this is safe.
-		"--write-kubeconfig-mode", "0644",
+		// Kubeconfig is root-only: any shell user (e.g. a JupyterHub notebook)
+		// could otherwise read it and gain cluster-admin via the k8s API.
+		"--write-kubeconfig-mode", "0600",
 		// Always set an explicit advertise address so the kubeconfig server URL
 		// is never written as 0.0.0.0:6443 (happens when nodeIP is empty and
 		// --bind-address defaults to 0.0.0.0, making the kubeconfig useless).
@@ -569,11 +585,6 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 	ks.deploySLURMRestAPI(mungeKey)
 	go ks.deployJupyterHub()
 
-	// Deploy GitHub Actions self-hosted runners if credentials are configured.
-	if org, pat := readGithubEnv(); org != "" && pat != "" {
-		go ks.deployActionsRunners(org, pat)
-	}
-
 	// Deploy host-based Ingress rules and cloudflared tunnel for the custom domain.
 	if domain := readCloudflareDomain(); domain != "" {
 		go ks.deployDomainIngresses(domain)
@@ -590,6 +601,58 @@ func (ks *K3sServer) DeployClusterServices(mungeKey []byte) {
 	// ports may be blocked on the leader's LAN interface because kube-proxy's rule
 	// ordering interleaves with iptables rules applied at daemon startup.
 	ks.refreshFirewallRules()
+}
+
+// generateSecurePassword returns a random alphanumeric string of length n.
+func generateSecurePassword(n int) string {
+	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("cluster-%d", time.Now().UnixNano())
+	}
+	for i := range b {
+		b[i] = chars[int(b[i])%len(chars)]
+	}
+	return string(b)
+}
+
+// ensureBasicAuthSecret creates (or no-ops if present) a nginx basic-auth Secret
+// in the given namespace. The Secret key "auth" holds an htpasswd line generated
+// via `openssl passwd -apr1`. Returns the plaintext password on first creation,
+// empty string if the secret already exists (password was set on a previous run).
+func ensureBasicAuthSecret(namespace, secretName, username string, log *logrus.Logger) string {
+	check := exec.Command("k3s", "kubectl", "-n", namespace, "get", "secret", secretName)
+	if check.Run() == nil {
+		return "" // already exists, don't regenerate
+	}
+
+	password := generateSecurePassword(20)
+
+	hash, err := exec.Command("openssl", "passwd", "-apr1", password).Output()
+	if err != nil {
+		log.Warnf("ensureBasicAuthSecret: openssl passwd failed: %v — skipping auth secret creation", err)
+		return ""
+	}
+	htpasswd := username + ":" + strings.TrimSpace(string(hash))
+	encoded := base64.StdEncoding.EncodeToString([]byte(htpasswd))
+
+	secretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: %s
+  namespace: %s
+type: Opaque
+data:
+  auth: %s
+`, secretName, namespace, encoded)
+
+	cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(secretYAML)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Warnf("ensureBasicAuthSecret %s/%s: %v: %s", namespace, secretName, err, out)
+		return ""
+	}
+	return password
 }
 
 // readCloudflareDomain returns the CLOUDFLARE_DOMAIN from /etc/clusteros/cloudflare.env,
@@ -916,6 +979,9 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-body-size: "0"
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
     nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: longhorn-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "Longhorn — ClusterOS"
 spec:
   ingressClassName: nginx
   rules:
@@ -960,12 +1026,39 @@ spec:
               number: 80
 `, domain, domain))
 
-	// Rancher is served by the helm-created "rancher" ingress (cattle-system), which is
-	// patched with backend-protocol=HTTPS and cookie session affinity in deployRancher().
-	// A separate rancher-domain ingress for the same host/path conflicts with it and
-	// strips session affinity on every restart, causing intermittent logouts.
-	exec.Command("k3s", "kubectl", "-n", "cattle-system", "delete", "ingress",
-		"rancher-domain", "--ignore-not-found=true").Run()
+	// Rancher — custom domain hostname with full session affinity.
+	// The helm "rancher" ingress hostname is baked in at install time (may be nip.io).
+	// This ingress adds the proper rancher.<domain> route. Session affinity annotations
+	// must be present here too — without them nginx load-balances across 3 Rancher pods
+	// which don't share session state, causing random logouts.
+	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rancher-domain
+  namespace: cattle-system
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "RANCHER_INGRESSCOOKIE"
+    nginx.ingress.kubernetes.io/session-cookie-expires: "172800"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "172800"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: rancher.%s
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rancher
+            port:
+              number: 443
+`, domain))
 
 	// SLURM REST API
 	apply(fmt.Sprintf(`apiVersion: networking.k8s.io/v1
@@ -975,6 +1068,9 @@ metadata:
   namespace: slurm
   annotations:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: slurm-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "SLURM REST — ClusterOS"
 spec:
   ingressClassName: nginx
   rules:
@@ -1332,10 +1428,48 @@ func killOrphanedContainerd(graceDelay time.Duration) {
 func (ks *K3sServer) refreshFirewallRules() {
 	ks.Logger().Info("Refreshing firewall rules on leader (post-deployment)")
 
-	rules := [][2]string{
-		{"22", "tcp"},
+	// Ports open to ALL interfaces (public internet via Cloudflare tunnel).
+	// SSH and NodePorts are intentionally omitted here — see below.
+	publicRules := [][2]string{
 		{"80", "tcp"},
 		{"443", "tcp"},
+	}
+	for _, r := range publicRules {
+		port, proto := r[0], r[1]
+		exec.Command("ufw", "allow", port+"/"+proto).Run()
+		check := exec.Command("iptables", "-C", "INPUT", "-p", proto, "--dport", port, "-j", "ACCEPT")
+		if check.Run() != nil {
+			exec.Command("iptables", "-I", "INPUT", "1", "-p", proto, "--dport", port, "-j", "ACCEPT").Run()
+		}
+	}
+
+	// Trust Tailscale interface fully — all cluster traffic (k3s API, etcd,
+	// SLURM, Serf, NodePorts, SSH) travels over the encrypted Tailscale mesh.
+	// Nothing in this block reaches the public internet.
+	for _, iface := range []string{"tailscale0", "ts0"} {
+		exec.Command("ufw", "allow", "in", "on", iface).Run()
+	}
+	checkCGNAT := exec.Command("iptables", "-C", "INPUT", "-s", "100.64.0.0/10", "-j", "ACCEPT")
+	if checkCGNAT.Run() != nil {
+		exec.Command("iptables", "-I", "INPUT", "1", "-s", "100.64.0.0/10", "-j", "ACCEPT").Run()
+	}
+
+	// SSH — Tailscale only. Removes the global port-22 rule so brute-force
+	// scanners cannot reach sshd from the public internet.
+	exec.Command("ufw", "delete", "allow", "22/tcp").Run()
+	exec.Command("ufw", "allow", "in", "on", "tailscale0", "to", "any", "port", "22", "proto", "tcp").Run()
+	exec.Command("ufw", "allow", "in", "on", "ts0", "to", "any", "port", "22", "proto", "tcp").Run()
+	// Drop any existing catch-all INPUT ACCEPT for port 22 so iptables matches
+	// the more-specific Tailscale CGNAT rule above instead.
+	for {
+		if exec.Command("iptables", "-C", "INPUT", "-p", "tcp", "--dport", "22", "-j", "ACCEPT").Run() != nil {
+			break
+		}
+		exec.Command("iptables", "-D", "INPUT", "-p", "tcp", "--dport", "22", "-j", "ACCEPT").Run()
+	}
+
+	// Cluster-internal ports — Tailscale only (k3s API, etcd, SLURM, Serf).
+	clusterPorts := [][2]string{
 		{"6443", "tcp"},
 		{"6444", "tcp"},
 		{"6817", "tcp"},
@@ -1347,26 +1481,33 @@ func (ks *K3sServer) refreshFirewallRules() {
 		{"8472", "udp"},
 		{"10250", "tcp"},
 		{"2379:2380", "tcp"},
-		{"30000:32767", "tcp"},
-		{"30000:32767", "udp"},
 	}
-
-	for _, r := range rules {
+	for _, r := range clusterPorts {
 		port, proto := r[0], r[1]
-		exec.Command("ufw", "allow", port+"/"+proto).Run()
-		check := exec.Command("iptables", "-C", "INPUT", "-p", proto, "--dport", port, "-j", "ACCEPT")
-		if check.Run() != nil {
-			exec.Command("iptables", "-I", "INPUT", "1", "-p", proto, "--dport", port, "-j", "ACCEPT").Run()
-		}
+		// ufw: allow only from Tailscale CGNAT range
+		exec.Command("ufw", "allow", "in", "on", "tailscale0",
+			"to", "any", "port", port, "proto", proto).Run()
+		exec.Command("ufw", "allow", "in", "on", "ts0",
+			"to", "any", "port", port, "proto", proto).Run()
 	}
 
-	// Trust Tailscale interface (covers all overlay traffic without per-port rules).
-	for _, iface := range []string{"tailscale0", "ts0"} {
-		exec.Command("ufw", "allow", "in", "on", iface).Run()
-	}
-	checkCGNAT := exec.Command("iptables", "-C", "INPUT", "-s", "100.64.0.0/10", "-j", "ACCEPT")
-	if checkCGNAT.Run() != nil {
-		exec.Command("iptables", "-I", "INPUT", "1", "-s", "100.64.0.0/10", "-j", "ACCEPT").Run()
+	// NodePorts (30000-32767) — Tailscale only.
+	// Binding these globally would expose every k8s NodePort service directly
+	// to the internet, bypassing the Cloudflare tunnel and nginx ingress.
+	for _, proto := range []string{"tcp", "udp"} {
+		exec.Command("ufw", "allow", "in", "on", "tailscale0",
+			"to", "any", "port", "30000:32767", "proto", proto).Run()
+		exec.Command("ufw", "allow", "in", "on", "ts0",
+			"to", "any", "port", "30000:32767", "proto", proto).Run()
+		// Remove any pre-existing global NodePort ACCEPT rules.
+		for {
+			if exec.Command("iptables", "-C", "INPUT", "-p", proto,
+				"--dport", "30000:32767", "-j", "ACCEPT").Run() != nil {
+				break
+			}
+			exec.Command("iptables", "-D", "INPUT", "-p", proto,
+				"--dport", "30000:32767", "-j", "ACCEPT").Run()
+		}
 	}
 
 	// Remove stale NAT REDIRECT rules for port 80/443 if they were added by a
@@ -2201,9 +2342,13 @@ spec:
 }
 
 func (ks *K3sServer) createLonghornIngress() {
+	pw := ensureBasicAuthSecret("longhorn-system", "longhorn-basic-auth", "admin", ks.Logger())
+	if pw != "" {
+		ks.Logger().Infof("=== LONGHORN UI CREDENTIALS: admin / %s (stored in longhorn-system/longhorn-basic-auth) ===", pw)
+	}
+
 	var ingressYAML string
 	if customDomain := readCloudflareDomain(); customDomain != "" {
-		// Subdomain ingress — no path rewrite needed; Longhorn serves from /
 		ingressYAML = fmt.Sprintf(`apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -2212,6 +2357,9 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/proxy-body-size: "0"
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: longhorn-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "Longhorn — ClusterOS"
 spec:
   ingressClassName: nginx
   rules:
@@ -2227,8 +2375,6 @@ spec:
               number: 80
 `, customDomain)
 	} else {
-		// Path-based fallback for LAN/no-domain clusters.
-		// rewrite-target strips /longhorn prefix before forwarding to the UI.
 		ingressYAML = `apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -2239,6 +2385,9 @@ metadata:
     nginx.ingress.kubernetes.io/use-regex: "true"
     nginx.ingress.kubernetes.io/rewrite-target: /$2
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: longhorn-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "Longhorn — ClusterOS"
 spec:
   ingressClassName: nginx
   rules:
@@ -2871,6 +3020,7 @@ metadata:
   namespace: slurm
 spec:
   replicas: 1
+  progressDeadlineSeconds: 1800
   selector:
     matchLabels:
       app: slurmrestd
@@ -2901,7 +3051,14 @@ spec:
       initContainers:
       - name: wait-munge
         image: busybox:latest
-        command: ['sh', '-c', 'until [ -S /var/run/munge/munge.socket.2 ]; do sleep 2; done']
+        command:
+        - sh
+        - -c
+        - |
+          i=0; until [ -S /var/run/munge/munge.socket.2 ]; do
+            i=$((i+1)); [ $i -ge 60 ] && echo "munged socket not ready after 120s" && exit 1
+            sleep 2
+          done
         volumeMounts:
         - name: munge-socket
           mountPath: /var/run/munge
@@ -2912,13 +3069,26 @@ spec:
         - /bin/sh
         - -c
         - |
+          # Verify the host binary exists before attempting to start.
+          if [ ! -x /hostfs/usr/sbin/slurmrestd ]; then
+            echo "ERROR: /usr/sbin/slurmrestd not found on host — is slurm-wlm installed?"
+            exit 1
+          fi
           # Create slurm user matching host UID — slurmrestd refuses to run as root
           groupadd -g 64030 slurm 2>/dev/null || true
           useradd -u 64030 -g 64030 -M -s /usr/sbin/nologin slurm 2>/dev/null || true
           # slurm.conf PluginDir uses the host path; symlink so it resolves inside the container
-          mkdir -p /usr/lib/x86_64-linux-gnu
-          ln -sfn /hostfs/usr/lib/x86_64-linux-gnu/slurm-wlm /usr/lib/x86_64-linux-gnu/slurm-wlm
-          exec su -s /bin/sh slurm -c 'exec /hostfs/usr/sbin/slurmrestd -f /etc/slurm/slurm.conf -a rest_auth/local 0.0.0.0:6820'
+          mkdir -p /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu
+          ln -sfn /hostfs/usr/lib/x86_64-linux-gnu/slurm-wlm /usr/lib/x86_64-linux-gnu/slurm-wlm 2>/dev/null || true
+          ln -sfn /hostfs/usr/lib/aarch64-linux-gnu/slurm-wlm /usr/lib/aarch64-linux-gnu/slurm-wlm 2>/dev/null || true
+          # slurmrestd's parser rejects or mishandles several controller-only keys.
+          # Strip them to avoid cascading fatals:
+          #   SlurmctldParameters — enable_configless makes restd ignore -f and try
+          #                         to pull config from slurmctld, causing a deadlock
+          #   MpiDefault/MpiParams — restd has no MPI context; pmix plugin load fails
+          grep -v -E '^\s*(SlurmctldParameters|MpiDefault|MpiParams)\s*=' \
+            /etc/slurm/slurm.conf > /tmp/slurmrestd.conf
+          exec su -s /bin/sh slurm -c 'exec /hostfs/usr/sbin/slurmrestd -f /tmp/slurmrestd.conf -a rest_auth/local 0.0.0.0:6820'
         env:
         - name: LD_LIBRARY_PATH
           value: /hostfs/usr/lib/x86_64-linux-gnu/slurm-wlm:/hostfs/usr/lib/x86_64-linux-gnu:/hostfs/usr/lib/aarch64-linux-gnu/slurm-wlm:/hostfs/usr/lib/aarch64-linux-gnu
@@ -2957,6 +3127,10 @@ spec:
 	}
 
 	// Ingress for slurmrestd REST API at /slurm/api/ (browser-facing UI is at /slurm/).
+	slurmPW := ensureBasicAuthSecret("slurm", "slurm-basic-auth", "admin", ks.Logger())
+	if slurmPW != "" {
+		ks.Logger().Infof("=== SLURM UI/API CREDENTIALS: admin / %s (stored in slurm/slurm-basic-auth) ===", slurmPW)
+	}
 	const slurmIngressYAML = `apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -2966,6 +3140,9 @@ metadata:
     nginx.ingress.kubernetes.io/use-regex: "true"
     nginx.ingress.kubernetes.io/rewrite-target: /$2
     nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: slurm-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "SLURM REST — ClusterOS"
 spec:
   ingressClassName: nginx
   rules:
@@ -3228,6 +3405,9 @@ metadata:
   annotations:
     nginx.ingress.kubernetes.io/use-regex: "true"
     nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: slurm-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "SLURM Dashboard — ClusterOS"
 spec:
   ingressClassName: nginx
   rules:
@@ -3635,15 +3815,17 @@ func (ks *K3sServer) ensureRancherBootstrapSecret() {
 		return
 	}
 
-	secretYAML := `apiVersion: v1
+	rancherPW := generateSecurePassword(24)
+	ks.Logger().Infof("=== RANCHER BOOTSTRAP PASSWORD: %s (first login only — change immediately in the UI) ===", rancherPW)
+	secretYAML := fmt.Sprintf(`apiVersion: v1
 kind: Secret
 metadata:
   name: bootstrap-secret
   namespace: cattle-system
 type: Opaque
 stringData:
-  bootstrapPassword: "admin"
-`
+  bootstrapPassword: %q
+`, rancherPW)
 	cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
 	cmd.Args = append(cmd.Args, kubeArgs...)
 	cmd.Stdin = strings.NewReader(secretYAML)
@@ -3811,22 +3993,18 @@ func (ks *K3sServer) deployRancher() error {
 	// that leaves the setting pointing at the old (nip.io) URL → "Unknown schema" error.
 	go ks.patchRancherServerURLSetting(effectiveURL, rolloutTriggered)
 
-	// Ensure the Rancher ingress uses HTTPS and has cookie-based session affinity.
-	// The helm chart's extraAnnotations flag doesn't reliably apply due to
-	// dot-in-key escaping; a post-install patch is the safe fallback.
-	// Session affinity prevents the "first time visit" screen when nginx routes
-	// subsequent requests to a different Rancher pod after a pod restart.
-	exec.Command("k3s", "kubectl", "patch", "ingress", "rancher",
-		"-n", "cattle-system",
-		"--type=json",
-		`-p=[`+
-			`{"op":"add","path":"/metadata/annotations/nginx.ingress.kubernetes.io~1backend-protocol","value":"HTTPS"},`+
-			`{"op":"add","path":"/metadata/annotations/nginx.ingress.kubernetes.io~1affinity","value":"cookie"},`+
-			`{"op":"add","path":"/metadata/annotations/nginx.ingress.kubernetes.io~1session-cookie-name","value":"RANCHER_INGRESSCOOKIE"},`+
-			`{"op":"add","path":"/metadata/annotations/nginx.ingress.kubernetes.io~1session-cookie-expires","value":"172800"},`+
-			`{"op":"add","path":"/metadata/annotations/nginx.ingress.kubernetes.io~1session-cookie-max-age","value":"172800"},`+
-			`{"op":"replace","path":"/spec/rules/0/http/paths/0/backend/service/port/number","value":443}]`,
-	).Run()
+	// Remove the helm-created "rancher" ingress — its hostname is baked in at install
+	// time and may be a nip.io address. The "rancher-domain" ingress in deployDomainIngresses
+	// owns the rancher.<domain> route with correct session affinity. Keeping both causes
+	// nginx to non-deterministically pick one, which breaks sticky sessions.
+	// In nip.io mode (no custom domain) the helm ingress is the only route, so only
+	// delete it when a custom domain is configured.
+	if domain := readCloudflareDomain(); domain != "" {
+		exec.Command("k3s", "kubectl", "-n", "cattle-system", "delete", "ingress",
+			"rancher", "--ignore-not-found=true",
+			"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
+		).Run()
+	}
 
 	// Always (re-)apply the NodePort service and redirect ingress so they survive
 	// node-agent restarts where Rancher is already installed.
@@ -4375,14 +4553,46 @@ spec:
 	}
 }
 
-func buildJupyterHelmValues() string {
-	return `hub:
+func (ks *K3sServer) buildJupyterHelmValues() string {
+	// Read existing password or generate a new one, storing it as a k8s Secret
+	// so it survives node-agent restarts without rotating the credential.
+	jupyterPW := ""
+	out, err := exec.Command("k3s", "kubectl", "-n", "jupyterhub",
+		"get", "secret", "jupyterhub-admin-creds",
+		"-o", "jsonpath={.data.password}").Output()
+	if err == nil && len(out) > 0 {
+		decoded, derr := base64.StdEncoding.DecodeString(strings.TrimSpace(string(out)))
+		if derr == nil {
+			jupyterPW = string(decoded)
+		}
+	}
+	if jupyterPW == "" {
+		jupyterPW = generateSecurePassword(20)
+		encoded := base64.StdEncoding.EncodeToString([]byte(jupyterPW))
+		secretYAML := fmt.Sprintf(`apiVersion: v1
+kind: Secret
+metadata:
+  name: jupyterhub-admin-creds
+  namespace: jupyterhub
+type: Opaque
+data:
+  password: %s
+`, encoded)
+		cmd := exec.Command("k3s", "kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(secretYAML)
+		if sout, serr := cmd.CombinedOutput(); serr != nil {
+			ks.Logger().Warnf("jupyterhub-admin-creds secret: %v: %s", serr, sout)
+		}
+		ks.Logger().Infof("=== JUPYTERHUB CREDENTIALS: admin / %s (stored in jupyterhub/jupyterhub-admin-creds) ===", jupyterPW)
+	}
+
+	return fmt.Sprintf(`hub:
   baseUrl: /jupyter
   config:
     JupyterHub:
       authenticator_class: dummy
     DummyAuthenticator:
-      password: "clusteros"
+      password: %q
 
 proxy:
   service:
@@ -4398,8 +4608,6 @@ singleuser:
     dynamic:
       storageClass: longhorn-ha
     capacity: 10Gi
-  extraEnv:
-    GRANT_SUDO: "yes"
 
 cull:
   enabled: true
@@ -4408,7 +4616,7 @@ cull:
 scheduling:
   userScheduler:
     enabled: false
-`
+`, jupyterPW)
 }
 
 func (ks *K3sServer) patchJupyterNodePort() {
@@ -4477,7 +4685,7 @@ func (ks *K3sServer) deployJupyterHub() {
 		return
 	}
 	defer os.Remove(valuesFile.Name())
-	if _, err := valuesFile.WriteString(buildJupyterHelmValues()); err != nil {
+	if _, err := valuesFile.WriteString(ks.buildJupyterHelmValues()); err != nil {
 		ks.Logger().Warnf("jupyterhub values write: %v", err)
 		return
 	}
@@ -4501,111 +4709,4 @@ func (ks *K3sServer) deployJupyterHub() {
 	ks.ensureJupyterIngress()
 	ks.jupyterDeployed = true
 	ks.Logger().Info("JupyterHub deployed — NodePort 30888 + /jupyter")
-}
-
-// readGithubEnv returns (org, pat) from /etc/clusteros/github.env, or ("","") if absent.
-func readGithubEnv() (string, string) {
-	data, err := os.ReadFile("/etc/clusteros/github.env")
-	if err != nil {
-		return "", ""
-	}
-	var org, pat string
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "GITHUB_ORG=") {
-			org = strings.TrimPrefix(line, "GITHUB_ORG=")
-		} else if strings.HasPrefix(line, "GITHUB_PAT=") {
-			pat = strings.TrimPrefix(line, "GITHUB_PAT=")
-		}
-	}
-	return org, pat
-}
-
-// deployActionsRunners installs actions-runner-controller (ARC) v2 and a runner scale set
-// scoped to the given GitHub org. Runners scale from 0 to 4; each job gets a fresh ephemeral
-// container. The PAT is stored only in a k8s Secret and is not exposed to runner pods.
-//
-// Workflows opt-in with: runs-on: clusteros-runner
-func (ks *K3sServer) deployActionsRunners(org, pat string) {
-	const (
-		controllerNS  = "arc-systems"
-		runnerNS      = "arc-runners"
-		secretName    = "arc-github-secret"
-		scaleSetName  = "clusteros-runner"
-		controllerRel = "arc-controller"
-		scaleSetRel   = "arc-runner-set"
-		controllerChart = "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set-controller"
-		scaleSetChart   = "oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set"
-	)
-
-	alreadyInstalled := exec.Command("k3s", "kubectl", "-n", runnerNS,
-		"get", "autoscalingrunnersets", scaleSetName).Run() == nil
-	if alreadyInstalled {
-		ks.Logger().Info("GitHub Actions runners already installed — skipping")
-		return
-	}
-
-	ks.Logger().Infof("Deploying GitHub Actions runners for org %s...", org)
-
-	kubeEnv := append(os.Environ(), "KUBECONFIG=/etc/rancher/k3s/k3s.yaml")
-
-	// Ensure namespaces exist.
-	for _, ns := range []string{controllerNS, runnerNS} {
-		cmd := exec.Command("k3s", "kubectl", "create", "namespace", ns, "--dry-run=client", "-o", "yaml")
-		out, _ := cmd.Output()
-		apply := exec.Command("k3s", "kubectl", "apply", "-f", "-")
-		apply.Stdin = strings.NewReader(string(out))
-		apply.Env = kubeEnv
-		apply.Run()
-	}
-
-	// Create the Secret that ARC uses to authenticate with GitHub.
-	// kubectl apply so re-runs are idempotent.
-	secretYAML := fmt.Sprintf(`apiVersion: v1
-kind: Secret
-metadata:
-  name: %s
-  namespace: %s
-type: Opaque
-stringData:
-  github_token: "%s"
-`, secretName, runnerNS, pat)
-	applySecret := exec.Command("k3s", "kubectl", "apply", "-f", "-")
-	applySecret.Stdin = strings.NewReader(secretYAML)
-	applySecret.Env = kubeEnv
-	if out, err := applySecret.CombinedOutput(); err != nil {
-		ks.Logger().Warnf("GitHub runner secret: %v: %s", err, out)
-		return
-	}
-
-	// Install the ARC controller (manages runner lifecycle).
-	controllerCmd := exec.Command("helm", "upgrade", "--install", controllerRel, controllerChart,
-		"--namespace", controllerNS,
-		"--create-namespace",
-		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
-	)
-	controllerCmd.Env = kubeEnv
-	if out, err := controllerCmd.CombinedOutput(); err != nil {
-		ks.Logger().Warnf("ARC controller helm install: %v: %s", err, out)
-		return
-	}
-
-	// Install the runner scale set pointing at the org.
-	scaleSetCmd := exec.Command("helm", "upgrade", "--install", scaleSetRel, scaleSetChart,
-		"--namespace", runnerNS,
-		"--create-namespace",
-		"--set", fmt.Sprintf("githubConfigUrl=https://github.com/%s", org),
-		"--set", fmt.Sprintf("githubConfigSecret=%s", secretName),
-		"--set", "minRunners=0",
-		"--set", "maxRunners=4",
-		"--set", fmt.Sprintf("runnerScaleSetName=%s", scaleSetName),
-		"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
-	)
-	scaleSetCmd.Env = kubeEnv
-	if out, err := scaleSetCmd.CombinedOutput(); err != nil {
-		ks.Logger().Warnf("ARC runner scale set helm install: %v: %s", err, out)
-		return
-	}
-
-	ks.Logger().Infof("GitHub Actions runners deployed — label: %s (min=0, max=4)", scaleSetName)
 }
