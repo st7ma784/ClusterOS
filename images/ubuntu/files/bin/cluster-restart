@@ -1,0 +1,10 @@
+#!/bin/bash
+# ClusterOS - Restart the node agent service
+# Usage: cluster-restart [--force-identity]
+
+if [ "$EUID" -ne 0 ]; then
+    echo "This command must be run as root (use sudo)"
+    exit 1
+fi
+
+exec node-agent restart "$@"

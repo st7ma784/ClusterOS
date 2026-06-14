@@ -1,0 +1,68 @@
+#!/bin/bash
+# Tailscale Debug Script
+# Diagnoses common Tailscale startup issues
+
+echo "=========================================="
+echo "Tailscale Debug Information"
+echo "=========================================="
+
+echo "1. Service Status:"
+systemctl status tailscaled.service --no-pager -l || true
+echo ""
+
+echo "2. Service Enabled/Disabled:"
+systemctl is-enabled tailscaled.service 2>/dev/null || echo "Service not found or disabled"
+echo ""
+
+echo "3. Service Dependencies:"
+systemctl list-dependencies tailscaled.service || true
+echo ""
+
+echo "4. Recent Service Logs:"
+journalctl -u tailscaled.service --no-pager -n 20 || true
+echo ""
+
+echo "5. Tailscale Socket:"
+ls -la /var/run/tailscale/ 2>/dev/null || echo "/var/run/tailscale/ does not exist"
+echo ""
+
+echo "6. Tailscale Binary:"
+which tailscale || echo "tailscale binary not found"
+which tailscaled || echo "tailscaled binary not found"
+tailscale version 2>/dev/null || echo "Cannot execute tailscale command"
+echo ""
+
+echo "7. Network Status:"
+ip route show default 2>/dev/null | head -3
+ping -c1 -W2 8.8.8.8 >/dev/null 2>&1 && echo "Internet: OK" || echo "Internet: FAIL"
+echo ""
+
+echo "8. DNS Resolution:"
+nslookup login.tailscale.com 2>/dev/null | head -5 || echo "DNS lookup failed"
+echo ""
+
+echo "9. Systemd Override Files:"
+ls -la /etc/systemd/system/tailscaled.service.d/ 2>/dev/null || echo "No override files"
+if [ -d /etc/systemd/system/tailscaled.service.d/ ]; then
+    for file in /etc/systemd/system/tailscaled.service.d/*.conf; do
+        if [ -f "$file" ]; then
+            echo "=== $file ==="
+            cat "$file"
+            echo ""
+        fi
+    done
+fi
+
+echo "10. WiFi Status:"
+systemctl status cluster-wifi.service --no-pager -l 2>/dev/null || echo "cluster-wifi service not found"
+
+echo "=========================================="
+echo "Debug complete"
+echo ""
+echo "To restart Tailscale:"
+echo "  sudo systemctl restart tailscaled.service"
+echo "  sudo systemctl status tailscaled.service"
+echo ""
+echo "To manually start Tailscale:"
+echo "  sudo tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock"
+echo "=========================================="

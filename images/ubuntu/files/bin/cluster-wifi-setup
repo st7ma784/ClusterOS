@@ -1,0 +1,172 @@
+#!/bin/bash
+# ClusterOS WiFi Setup
+# Detects WiFi interface, writes /etc/netplan/80-cluster-wifi.yaml with the
+# exact interface name (networkd requires exact names, not match: patterns),
+# then applies it and waits for an IP.
+#
+# Runs as cluster-wifi.service (oneshot) so downstream services
+# (tailscaled, node-agent) only start once WiFi is actually connected.
+
+set -o pipefail
+
+WIFI_ENV="/etc/clusteros/wifi.env"
+
+# ── Credentials ───────────────────────────────────────────────────────────────
+# Prefer /etc/clusteros/wifi.env; fall back to compile-time defaults.
+SSID=""
+PSK=""
+if [[ -f "$WIFI_ENV" ]]; then
+    SSID=$(grep -v '^#' "$WIFI_ENV" | grep '^WIFI_SSID=' | cut -d= -f2- | tr -d '"' | xargs || true)
+    PSK=$(grep  -v '^#' "$WIFI_ENV" | grep '^WIFI_KEY='  | cut -d= -f2- | tr -d '"' | xargs || true)
+fi
+SSID="${SSID:-MANDER84}"
+PSK="${PSK:-M4nd3rsM0b}"
+
+log() { echo "[cluster-wifi] $1"; logger -t cluster-wifi "$1" 2>/dev/null || true; }
+
+# ── 1. Load WiFi kernel stack ─────────────────────────────────────────────────
+log "Loading WiFi kernel stack..."
+modprobe cfg80211 2>/dev/null || true
+modprobe mac80211 2>/dev/null || true
+
+udevadm trigger --subsystem-match=pci 2>/dev/null || true
+udevadm trigger --subsystem-match=usb 2>/dev/null || true
+udevadm settle --timeout=10 2>/dev/null || true
+
+for mod in \
+    iwlwifi iwlmvm \
+    rtl8xxxu rtw88_pci rtw89_pci rtw89_8852be rtw89_8852ce r8188eu \
+    ath9k ath10k_pci ath11k_pci \
+    brcmfmac \
+    mt7921e mt7921pci mt76x2e; do
+    modprobe "$mod" 2>/dev/null || true
+done
+
+udevadm trigger --subsystem-match=ieee80211 2>/dev/null || true
+udevadm settle --timeout=10 2>/dev/null || true
+
+# ── 2. Unblock rfkill ─────────────────────────────────────────────────────────
+if command -v rfkill &>/dev/null; then
+    rfkill unblock wifi 2>/dev/null || true
+    rfkill unblock all  2>/dev/null || true
+    log "rfkill: $(rfkill list 2>/dev/null | grep -A1 'Wireless LAN' | tr '\n' ' ')"
+fi
+
+# ── 3. Diagnostics ────────────────────────────────────────────────────────────
+log "PCI network: $(lspci 2>/dev/null | grep -i 'network\|wireless\|wifi\|802.11' | tr '\n' '|')"
+log "Loaded WiFi mods: $(lsmod 2>/dev/null | awk 'NR>1{print $1}' | grep -E 'cfg80211|mac80211|iwl|rtl|rtw|ath|brcm|mt7' | tr '\n' ' ')"
+log "ieee80211 phys: $(ls /sys/class/ieee80211/ 2>/dev/null | tr '\n' ' ' || echo none)"
+log "All interfaces: $(ls /sys/class/net/ 2>/dev/null | tr '\n' ' ')"
+
+# ── 4. Check for WiFi hardware ────────────────────────────────────────────────
+has_wifi_hw() {
+    [ -d /sys/class/ieee80211 ] && [ -n "$(ls -A /sys/class/ieee80211 2>/dev/null)" ] && return 0
+    lspci 2>/dev/null | grep -qi "wireless\|wifi\|802.11\|intel.*wi\|realtek.*rtl\|atheros\|broadcom.*bcm43\|mediatek" && return 0
+    lsusb 2>/dev/null | grep -qi "wireless\|wifi\|wlan\|802.11" && return 0
+    return 1
+}
+
+if ! has_wifi_hw; then
+    log "No WiFi hardware detected — skipping"
+    exit 0
+fi
+
+# ── 5. Find WiFi interface ────────────────────────────────────────────────────
+find_wifi_interface() {
+    for path in /sys/class/net/wl* /sys/class/net/wlan*; do
+        [ -d "$path" ] && basename "$path" && return 0
+    done
+    if command -v iw &>/dev/null; then
+        local i; i=$(iw dev 2>/dev/null | awk '/Interface/{print $2}' | head -1)
+        [ -n "$i" ] && echo "$i" && return 0
+    fi
+    for path in /sys/class/net/*; do
+        if [ -d "$path/wireless" ] || [ -L "$path/phy80211" ] || [ -d "$path/phy80211" ]; then
+            basename "$path" && return 0
+        fi
+    done
+    if [ -d /sys/class/ieee80211 ]; then
+        for phy in /sys/class/ieee80211/*/; do
+            local pr dd
+            pr=$(readlink -f "${phy%/}" 2>/dev/null) || continue
+            dd=$(dirname "$(dirname "$pr")")
+            [ -d "$dd/net" ] || continue
+            for nd in "$dd/net/"/*/; do
+                local i; i=$(basename "$nd")
+                [ -n "$i" ] && [ "$i" != "*" ] && [ -d "/sys/class/net/$i" ] \
+                    && echo "$i" && return 0
+            done
+        done
+    fi
+    if command -v iwconfig &>/dev/null; then
+        local i; i=$(iwconfig 2>/dev/null | awk '/IEEE 802\.11|ESSID/{print $1}' | head -1)
+        [ -n "$i" ] && echo "$i" && return 0
+    fi
+    return 1
+}
+
+WIFI_IFACE=$(find_wifi_interface)
+if [ -z "$WIFI_IFACE" ]; then
+    log "ERROR: WiFi hardware present but no netdev interface created."
+    log "  Likely cause: missing firmware. Check: dmesg | grep -i 'firmware.*failed'"
+    exit 1
+fi
+
+log "WiFi interface: $WIFI_IFACE"
+
+# Bring the interface up before applying netplan config.
+ip link set "$WIFI_IFACE" up 2>/dev/null || true
+sleep 1
+
+# ── 6. Write netplan WiFi config with exact interface name ────────────────────
+# networkd renderer requires exact interface names (not match: patterns) for WiFi.
+# Writing this file makes WiFi persistent across reboots — the service only needs
+# to run once to discover the interface name; subsequent boots use the netplan file.
+NETPLAN_WIFI="/etc/netplan/80-cluster-wifi.yaml"
+mkdir -p /etc/netplan
+
+cat > "$NETPLAN_WIFI" <<EOF
+network:
+  version: 2
+  renderer: networkd
+  wifis:
+    ${WIFI_IFACE}:
+      dhcp4: true
+      dhcp4-overrides:
+        route-metric: 200
+      optional: true
+      access-points:
+        "${SSID}":
+          password: "${PSK}"
+EOF
+chmod 600 "$NETPLAN_WIFI"
+log "Wrote $NETPLAN_WIFI (interface: $WIFI_IFACE, SSID: $SSID)"
+
+# Apply the netplan config — netplan generates a wpa_supplicant config and a
+# systemd-networkd .network file for this interface automatically.
+netplan apply 2>/dev/null && log "netplan apply OK" || {
+    log "WARNING: netplan apply returned non-zero — trying networkd reload"
+    networkctl reload 2>/dev/null || true
+}
+
+# ── 7. Wait for association and DHCP (up to 90s) ──────────────────────────────
+log "Waiting for WiFi IP on $WIFI_IFACE (SSID: $SSID)..."
+for i in $(seq 1 45); do
+    IP=$(ip addr show "$WIFI_IFACE" 2>/dev/null | awk '/inet /{print $2}' | head -1)
+    if [ -n "$IP" ]; then
+        log "SUCCESS: $WIFI_IFACE → $IP"
+        exit 0
+    fi
+    if [ $(( i % 10 )) -eq 0 ]; then
+        WPA_STATE=$(wpa_cli -i "$WIFI_IFACE" status 2>/dev/null | grep '^wpa_state=' | cut -d= -f2 || echo unknown)
+        log "  ${i}×2s — wpa_state=${WPA_STATE}, no IP yet"
+    fi
+    sleep 2
+done
+
+log "WARNING: No IP after 90s"
+log "  Interface state: $(ip link show "$WIFI_IFACE" 2>/dev/null | head -1)"
+log "  wpa status: $(wpa_cli -i "$WIFI_IFACE" status 2>/dev/null | tr '\n' ' ')"
+log "  Visible SSIDs: $(iw dev "$WIFI_IFACE" scan 2>/dev/null | grep 'SSID:' | tr '\n' '|')"
+# Non-fatal — tailscale-auth has its own network wait
+exit 0

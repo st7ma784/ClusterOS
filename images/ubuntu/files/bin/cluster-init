@@ -1,0 +1,63 @@
+#!/bin/bash
+# ClusterOS - Initialize a new cluster
+# Usage: cluster-init
+
+set -e
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+echo -e "${CYAN}=== Initializing ClusterOS Cluster ===${NC}"
+echo ""
+
+# Get local IP
+LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+echo "This node: $(hostname) ($LOCAL_IP)"
+echo ""
+
+# Check if already in a cluster
+STATUS_FILE="/run/clusteros/status.json"
+if [ -f "$STATUS_FILE" ] && command -v jq &>/dev/null; then
+    MEMBERS=$(jq -r '.member_count' "$STATUS_FILE" 2>/dev/null)
+    if [ "$MEMBERS" -gt 1 ] 2>/dev/null; then
+        echo -e "${YELLOW}Warning: Already part of a cluster with $MEMBERS members${NC}"
+        read -p "Continue anyway? (y/N): " confirm
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+            echo "Aborted"
+            exit 0
+        fi
+    fi
+fi
+
+# Ensure config has no bootstrap nodes (this will be the bootstrap)
+CONFIG_FILE="/etc/clusteros/node.yaml"
+if [ -f "$CONFIG_FILE" ]; then
+    echo -e "${YELLOW}Clearing bootstrap nodes (this node will be the bootstrap)...${NC}"
+    sudo sed -i 's|bootstrap_nodes:.*|bootstrap_nodes: []|' "$CONFIG_FILE"
+fi
+
+# Enable and start node-agent
+echo -e "${YELLOW}Starting node-agent...${NC}"
+sudo systemctl enable node-agent
+sudo systemctl restart node-agent
+
+# Wait for startup
+echo -e "${YELLOW}Waiting for services to start...${NC}"
+sleep 5
+
+# Check status
+if systemctl is-active --quiet node-agent; then
+    echo -e "${GREEN}✓${NC} Cluster initialized successfully!"
+    echo ""
+    echo -e "${CYAN}Other nodes can join with:${NC}"
+    echo "  cluster-join $LOCAL_IP"
+    echo ""
+    echo "Run 'cluster-status' to see cluster state"
+else
+    echo -e "${RED}✗${NC} Failed to start node-agent"
+    echo "Check logs with: journalctl -u node-agent -f"
+    exit 1
+fi

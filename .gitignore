@@ -1,5 +1,6 @@
 # Binaries
 bin/
+!images/ubuntu/files/bin/
 *.exe
 *.exe~
 *.dll

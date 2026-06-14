@@ -1,0 +1,5 @@
+#!/bin/bash
+# ClusterOS - Show node-agent version info
+# Usage: cluster-info
+
+exec node-agent info "$@"

@@ -1,0 +1,66 @@
+#!/bin/bash
+# ClusterOS - Join an existing cluster
+# Usage: cluster-join <bootstrap-node-ip>
+
+set -e
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+if [ -z "$1" ]; then
+    echo -e "${CYAN}ClusterOS - Join Cluster${NC}"
+    echo ""
+    echo "Usage: cluster-join <bootstrap-node-ip>"
+    echo ""
+    echo "Example:"
+    echo "  cluster-join 192.168.1.100"
+    echo ""
+    echo "The bootstrap node must already be running."
+    exit 1
+fi
+
+BOOTSTRAP_IP="$1"
+
+echo -e "${CYAN}=== Joining ClusterOS Cluster ===${NC}"
+echo ""
+echo "Bootstrap node: $BOOTSTRAP_IP"
+echo ""
+
+# Check if node-agent config exists
+CONFIG_FILE="/etc/clusteros/node.yaml"
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo -e "${RED}Error: Config file not found: $CONFIG_FILE${NC}"
+    exit 1
+fi
+
+# Update config with bootstrap node
+echo -e "${YELLOW}Updating configuration...${NC}"
+if grep -q "bootstrap_nodes:" "$CONFIG_FILE"; then
+    sudo sed -i "s|bootstrap_nodes:.*|bootstrap_nodes: [\"$BOOTSTRAP_IP:7946\"]|" "$CONFIG_FILE"
+else
+    echo "  bootstrap_nodes: [\"$BOOTSTRAP_IP:7946\"]" | sudo tee -a "$CONFIG_FILE" > /dev/null
+fi
+
+echo -e "${GREEN}✓${NC} Configuration updated"
+
+# Restart node-agent
+echo -e "${YELLOW}Restarting node-agent...${NC}"
+sudo systemctl restart node-agent
+
+# Wait for join
+echo -e "${YELLOW}Waiting for cluster join...${NC}"
+sleep 5
+
+# Check status
+if systemctl is-active --quiet node-agent; then
+    echo -e "${GREEN}✓${NC} Node agent is running"
+    echo ""
+    echo "Run 'cluster-status' to see cluster membership"
+else
+    echo -e "${RED}✗${NC} Node agent failed to start"
+    echo "Check logs with: journalctl -u node-agent -f"
+    exit 1
+fi

@@ -1,0 +1,181 @@
+#!/bin/bash
+# ClusterOS - Deploy cluster services to an existing K3s cluster
+#
+# Installs: Longhorn (storage), cert-manager, Rancher (management UI)
+# Also verifies slurmdbd is running in K3s for SLURM HA
+#
+# Run this on any K3s SERVER node:
+#   sudo bash cluster-setup-services
+#
+# These services will auto-deploy on new clusters.
+# This script is for clusters already running without them.
+
+set -uo pipefail
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+header() { echo -e "\n${CYAN}=== $1 ===${NC}"; }
+ok()     { echo -e "  ${GREEN}✓${NC} $1"; }
+warn()   { echo -e "  ${YELLOW}!${NC} $1"; }
+fail()   { echo -e "  ${RED}✗${NC} $1"; }
+
+echo -e "${CYAN}╔═════════════════════════════════════════╗${NC}"
+echo -e "${CYAN}║  ClusterOS Service Deployment           ║${NC}"
+echo -e "${CYAN}╚═════════════════════════════════════════╝${NC}"
+
+# Must be root
+if [ "$(id -u)" -ne 0 ]; then
+    fail "Must run as root (sudo)"
+    exit 1
+fi
+
+# Check K3s is running
+if ! k3s kubectl cluster-info &>/dev/null 2>&1; then
+    fail "K3s API not reachable — is this a K3s server node?"
+    echo "  Run on a node where 'sudo k3s kubectl get nodes' works."
+    exit 1
+fi
+
+NODE_COUNT=$(k3s kubectl get nodes --no-headers 2>/dev/null | grep -c " Ready")
+ok "K3s cluster: $NODE_COUNT ready node(s)"
+
+TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "")
+if [ -n "$TAILSCALE_IP" ]; then
+    ok "Tailscale IP: $TAILSCALE_IP"
+else
+    warn "Tailscale IP not detected"
+    TAILSCALE_IP="127.0.0.1"
+fi
+
+# ─────────────────────────────────────────────────────────────
+# 1. Longhorn (distributed storage)
+# ─────────────────────────────────────────────────────────────
+header "1/4 Longhorn (distributed storage)"
+
+if k3s kubectl -n longhorn-system get deployment longhorn-driver-deployer &>/dev/null 2>&1; then
+    ok "Longhorn already installed"
+else
+    echo "  Installing Longhorn v1.7.2..."
+    if k3s kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/v1.7.2/deploy/longhorn.yaml 2>&1 | tail -3; then
+        ok "Longhorn manifests applied"
+        echo "  Waiting for driver deployer (up to 3 min)..."
+        if k3s kubectl -n longhorn-system rollout status deployment/longhorn-driver-deployer --timeout=180s 2>&1 | tail -1; then
+            ok "Longhorn is ready"
+            # Set as default StorageClass
+            k3s kubectl patch storageclass longhorn \
+                -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}' 2>/dev/null
+            ok "Longhorn set as default StorageClass"
+        else
+            warn "Longhorn still starting (check: kubectl -n longhorn-system get pods)"
+        fi
+    else
+        fail "Failed to apply Longhorn"
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────
+# 2. slurmdbd (SLURM accounting database in K3s)
+# ─────────────────────────────────────────────────────────────
+header "2/4 slurmdbd (SLURM accounting database)"
+
+if k3s kubectl -n slurm get deployment slurmdbd &>/dev/null 2>&1; then
+    ok "slurmdbd already deployed in K3s"
+    SLURMDBD_READY=$(k3s kubectl -n slurm get deployment slurmdbd -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+    if [ "${SLURMDBD_READY:-0}" -gt 0 ]; then
+        ok "slurmdbd is running ($SLURMDBD_READY replica(s))"
+    else
+        warn "slurmdbd deployed but not yet ready"
+    fi
+else
+    warn "slurmdbd not deployed — node-agent should deploy it automatically on leadership"
+    echo "  The slurmdbd manifest is embedded in node-agent and deploys when K3s leader starts."
+    echo "  If it hasn't appeared, restart node-agent: systemctl restart node-agent"
+fi
+
+# ─────────────────────────────────────────────────────────────
+# 3. cert-manager (required for Rancher TLS)
+# ─────────────────────────────────────────────────────────────
+header "3/4 cert-manager"
+
+if k3s kubectl -n cert-manager get deployment cert-manager &>/dev/null 2>&1; then
+    ok "cert-manager already installed"
+else
+    echo "  Installing cert-manager v1.16.3..."
+    if k3s kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.3/cert-manager.yaml 2>&1 | tail -3; then
+        ok "cert-manager manifests applied"
+        echo "  Waiting for webhook (up to 3 min)..."
+        if k3s kubectl -n cert-manager rollout status deployment/cert-manager-webhook --timeout=180s 2>&1 | tail -1; then
+            ok "cert-manager is ready"
+        else
+            warn "cert-manager still starting"
+        fi
+    else
+        fail "Failed to apply cert-manager"
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────
+# 4. Rancher (management UI)
+# ─────────────────────────────────────────────────────────────
+header "4/4 Rancher (management UI)"
+
+if k3s kubectl -n cattle-system get deployment rancher &>/dev/null 2>&1; then
+    ok "Rancher already installed"
+else
+    # Need Helm for Rancher
+    if ! command -v helm &>/dev/null; then
+        echo "  Installing Helm..."
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash 2>&1 | tail -1
+    fi
+
+    echo "  Adding Rancher Helm repo..."
+    helm repo add rancher-stable https://releases.rancher.com/server-charts/stable 2>/dev/null
+    helm repo update 2>/dev/null
+
+    echo "  Installing Rancher (hostname=$TAILSCALE_IP)..."
+    if KUBECONFIG=/etc/rancher/k3s/k3s.yaml helm install rancher rancher-stable/rancher \
+        --namespace cattle-system --create-namespace \
+        --set hostname="$TAILSCALE_IP" \
+        --set bootstrapPassword=admin \
+        --set ingress.tls.source=rancher \
+        --set replicas=1 \
+        --set global.cattle.psp.enabled=false 2>&1 | tail -3; then
+        ok "Rancher Helm release installed"
+    else
+        fail "Failed to install Rancher"
+    fi
+
+    # Expose via NodePort
+    echo "  Creating NodePort service..."
+    k3s kubectl -n cattle-system expose deployment rancher \
+        --type=NodePort --port=443 --target-port=443 --name=rancher-nodeport \
+        --dry-run=client -o yaml 2>/dev/null | k3s kubectl apply -f - 2>/dev/null
+fi
+
+# ─────────────────────────────────────────────────────────────
+# Summary
+# ─────────────────────────────────────────────────────────────
+header "Summary"
+
+echo ""
+echo -e "${YELLOW}Services deployed:${NC}"
+k3s kubectl get pods -A --no-headers 2>/dev/null | awk '{printf "  %-20s %-40s %s\n", $1, $2, $4}'
+echo ""
+
+# Show Rancher access info
+RANCHER_PORT=$(k3s kubectl -n cattle-system get svc rancher-nodeport \
+    -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo "")
+if [ -n "$RANCHER_PORT" ]; then
+    echo -e "${GREEN}Rancher UI:${NC} https://$TAILSCALE_IP:$RANCHER_PORT"
+    echo "  Login: admin / admin (change on first login)"
+    echo ""
+    echo "  Access from any device on your Tailnet."
+    echo "  To expose publicly: sudo tailscale funnel https / http://localhost:$RANCHER_PORT"
+fi
+
+echo ""
+echo -e "${GREEN}Done!${NC}"

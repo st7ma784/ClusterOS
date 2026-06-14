@@ -1,0 +1,149 @@
+#!/bin/bash
+# ClusterOS Auto-Assembly Script
+# Automatically discovers peers via Tailscale and assembles the cluster
+set -uo pipefail
+
+LOG_PREFIX="[cluster-autostart]"
+CONFIG_FILE="/etc/clusteros/node.yaml"
+
+log() {
+    echo "$LOG_PREFIX $1"
+    logger -t cluster-autostart "$1" 2>/dev/null || true
+}
+
+# Wait for network connectivity
+wait_for_network() {
+    log "Waiting for network connectivity..."
+    for i in $(seq 1 120); do
+        if ping -c1 -W1 8.8.8.8 >/dev/null 2>&1 || ping -c1 -W1 1.1.1.1 >/dev/null 2>&1; then
+            log "Network is up"
+            return 0
+        fi
+        sleep 2
+    done
+    log "Warning: Network not available after 4 minutes"
+    return 1
+}
+
+# Wait for Tailscale to connect
+wait_for_tailscale() {
+    if ! command -v tailscale &>/dev/null; then
+        log "Tailscale not installed"
+        return 1
+    fi
+    
+    log "Waiting for Tailscale to connect..."
+    for i in $(seq 1 90); do
+        if tailscale status 2>/dev/null | grep -q "100\."; then
+            log "Tailscale connected"
+            return 0
+        fi
+        sleep 2
+    done
+    log "Warning: Tailscale not connected after 3 minutes"
+    return 1
+}
+
+# Get our Tailscale IP
+get_my_tailscale_ip() {
+    tailscale ip -4 2>/dev/null || echo ""
+}
+
+# Discover other ClusterOS nodes via Tailscale
+discover_peers() {
+    local my_ip=$(get_my_tailscale_ip)
+    local peers=""
+    
+    # Get all Tailscale peers with their IPs
+    # Look for peers that have ClusterOS ports open (Serf: 7946)
+    while IFS= read -r peer_ip; do
+        # Skip our own IP
+        [ "$peer_ip" = "$my_ip" ] && continue
+        
+        # Check if peer has the Serf port open (quick check)
+        if timeout 2 bash -c "echo >/dev/tcp/$peer_ip/7946" 2>/dev/null; then
+            if [ -n "$peers" ]; then
+                peers="$peers,$peer_ip:7946"
+            else
+                peers="$peer_ip:7946"
+            fi
+            log "Found ClusterOS peer: $peer_ip"
+        fi
+    done < <(tailscale status --json 2>/dev/null | jq -r '.Peer | to_entries[] | .value.TailscaleIPs[0] // empty' 2>/dev/null || true)
+    
+    echo "$peers"
+}
+
+# Update config with discovered peers
+update_config() {
+    local peers="$1"
+    
+    if [ -n "$peers" ]; then
+        # Convert comma-separated to YAML array
+        local yaml_peers=$(echo "$peers" | sed 's/,/", "/g')
+        yaml_peers="[\"$yaml_peers\"]"
+        
+        log "Updating bootstrap_peers to: $yaml_peers"
+        sed -i "s|bootstrap_peers:.*|bootstrap_peers: $yaml_peers|" "$CONFIG_FILE"
+    else
+        log "No peers found - this node will bootstrap a new cluster"
+        sed -i "s|bootstrap_peers:.*|bootstrap_peers: []|" "$CONFIG_FILE"
+    fi
+}
+
+# Main execution
+main() {
+    log "Starting ClusterOS auto-assembly..."
+    
+    # Wait for network first
+    wait_for_network || true
+    
+    # Wait for Tailscale
+    wait_for_tailscale || true
+    
+    # Check if we have Tailscale
+    if command -v tailscale &>/dev/null; then
+        my_ip=$(get_my_tailscale_ip)
+        if [ -n "$my_ip" ]; then
+            log "Our Tailscale IP: $my_ip"
+            
+            # Wait a bit for network to stabilize
+            sleep 5
+            
+            # Discover peers
+            peers=$(discover_peers)
+            
+            # Update config
+            update_config "$peers"
+        else
+            log "No Tailscale IP yet, will use local discovery"
+        fi
+    else
+        log "Tailscale not installed, skipping peer discovery"
+    fi
+    
+    # Ensure node-agent is enabled and running
+    log "Ensuring node-agent service is enabled..."
+    systemctl enable node-agent.service 2>/dev/null || true
+    
+    # Restart node-agent to pick up any config changes
+    log "Starting node-agent..."
+    systemctl restart node-agent.service || {
+        log "Warning: Failed to restart node-agent, trying to start..."
+        systemctl start node-agent.service || log "Failed to start node-agent"
+    }
+    
+    # Wait for node-agent to start
+    sleep 5
+    
+    # Check status
+    if systemctl is-active --quiet node-agent; then
+        log "node-agent is running"
+    else
+        log "Warning: node-agent is not running. Check: journalctl -u node-agent"
+    fi
+    
+    log "ClusterOS auto-assembly complete"
+}
+
+main "$@"

@@ -1,0 +1,70 @@
+#!/bin/bash
+# ClusterOS - Show help for available commands
+# Usage: cluster-help
+
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echo -e "${CYAN}"
+cat << 'EOF'
+   _____ _           _              ___  ____  
+  / ____| |         | |            / _ \/ ___| 
+ | |    | |_   _ ___| |_ ___ _ __ | | | \___ \ 
+ | |    | | | | / __| __/ _ \ '__|| | | |___) |
+ | |____| | |_| \__ \ ||  __/ |   | |_| |____/ 
+  \_____|_|\__,_|___/\__\___|_|    \___/|_____|
+                                                
+EOF
+echo -e "${NC}"
+
+echo -e "${YELLOW}ClusterOS Commands:${NC}"
+echo ""
+echo -e "  ${GREEN}cluster-os-install${NC}    Install ClusterOS from USB to target disk"
+echo -e "  ${GREEN}cluster-os-create-usb${NC} Create a new USB installer from this system"
+echo -e "  ${GREEN}cluster-init${NC}          Initialize this node as a new cluster"
+echo -e "  ${GREEN}cluster-join${NC} <ip>     Join an existing cluster"
+echo -e "  ${GREEN}cluster-status${NC}        Show cluster and service status"
+echo -e "  ${GREEN}cluster-test${NC}          Run deployment tests (slurm, mpi, k3s)"
+echo -e "  ${GREEN}cluster-dashboard${NC}     Live cluster dashboard (real-time)"
+echo -e "  ${GREEN}cluster-info${NC}          Show node-agent version info"
+echo -e "  ${GREEN}cluster-restart${NC}       Restart node-agent (use sudo)"
+echo -e "  ${GREEN}cluster-help${NC}          Show this help message"
+echo ""
+echo -e "${YELLOW}Node Agent (advanced):${NC}"
+echo ""
+echo -e "  ${GREEN}node-agent init${NC}     Initialize node identity"
+echo -e "  ${GREEN}node-agent start${NC}    Start daemon (foreground)"
+echo -e "  ${GREEN}node-agent status${NC}   Detailed node status (JSON)"
+echo -e "  ${GREEN}node-agent join${NC}     Join cluster with bootstrap peers"
+echo ""
+echo -e "${YELLOW}Service Management:${NC}"
+echo ""
+echo -e "  sudo systemctl status node-agent"
+echo -e "  sudo journalctl -u node-agent -f"
+echo ""
+echo -e "${YELLOW}Services (managed by node-agent):${NC}"
+echo ""
+echo -e "  ${GREEN}K3s (Kubernetes):${NC}"
+echo -e "    sudo k3s kubectl get nodes"
+echo -e "    sudo k3s kubectl get pods -A"
+echo ""
+echo -e "  ${GREEN}SLURM (HPC):${NC}"
+echo -e "    sinfo                    # Show node status"
+echo -e "    squeue                   # Show job queue"
+echo -e "    sbatch script.sh         # Submit job"
+echo ""
+echo -e "  ${GREEN}WireGuard (VPN Mesh):${NC}"
+echo -e "    sudo wg show             # Show peer status"
+echo ""
+echo -e "  ${GREEN}Tailscale (VPN):${NC}"
+echo -e "    tailscale status         # Show connection status"
+echo -e "    tailscale ip             # Show Tailscale IP"
+echo -e "    sudo tailscale up        # Connect to Tailscale"
+echo ""
+echo -e "${YELLOW}Configuration:${NC}"
+echo ""
+echo -e "  /etc/clusteros/node.yaml   # Node configuration"
+echo -e "  /var/log/clusteros/        # Log files"
+echo ""
