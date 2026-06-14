@@ -6,10 +6,13 @@ users:
     groups: [sudo, adm, docker]
     shell: /bin/bash
     sudo: ALL=(ALL) NOPASSWD:ALL
-    lock_passwd: true
+    # Password enabled for console/SSH access before apply-patch.sh runs.
+    # apply-patch.sh locks this and switches to key-only auth after first boot.
+    lock_passwd: false
+    passwd: "$6$clusteros$5ETidFMrMBCUBW8Rh.tQ1kBp6YI0TtaS3vXI0Ff6gYZmFKO0j6YIQ0yMZCVfPRbCEbm.TGjhlBTzHlLlRRer/"
 
-# Key-only SSH — apply-patch.sh installs authorized_keys from the patch bundle
-ssh_pwauth: false
+# Password auth enabled until apply-patch.sh hardens SSH to key-only
+ssh_pwauth: true
 
 # Set hostname (overwritten by node-agent setUniqueHostname on first run)
 hostname: cluster-node
@@ -23,8 +26,13 @@ resize_rootfs: true
 
 timezone: UTC
 
+# package_upgrade is intentionally false: a full `apt-get upgrade -y` here runs
+# BEFORE runcmd (and can take many minutes on first boot), extending the window
+# where ssh_pwauth + the default clusteros password are reachable on the LAN.
+# apply-patch.sh (last runcmd step) installs/upgrades only what it needs and
+# locks the default password — keep this window short.
 package_update: true
-package_upgrade: true
+package_upgrade: false
 
 packages:
   - openssh-server
@@ -50,12 +58,16 @@ write_files:
     content: |
       br_netfilter
 
-  # WiFi: connect to the cluster LAN automatically.
-  # This is the primary uplink for nodes without ethernet.
-  # netplan applies this on every boot; the node gets internet access
-  # before cloud-init's runcmd phase so Tailscale can authenticate.
-  # WiFi credentials are injected at image-build time from images/ubuntu/.env
-  # (WIFI_SSID / WIFI_PASSWORD variables) — never hardcoded here.
+  # WiFi: NOT configured via write_files/netplan here. WiFi credentials are
+  # written to /etc/clusteros/wifi.env at image-build time (from
+  # images/ubuntu/.env's WIFI_SSID / WIFI_KEY — never hardcoded here), but
+  # the netplan file itself (80-cluster-wifi.yaml) is written at RUNTIME by
+  # cluster-wifi-setup, run by cluster-wifi.service (After=cloud-init.target —
+  # i.e. after this cloud-config's stages, not before). networkd requires an
+  # exact interface name for `wifis:` entries, which isn't known until
+  # cluster-wifi-setup detects the hardware. See
+  # images/ubuntu/files/bin/cluster-wifi-setup and
+  # images/ubuntu/files/netplan/99-clusteros.yaml.
 
   # Tailscale first-boot auth script.
   # Reads /etc/clusteros/tailscale.env (written by cluster-make-usb or make deploy).
@@ -130,8 +142,19 @@ write_files:
       log "Connected: $(tailscale ip -4 2>/dev/null || echo pending)"
 
 runcmd:
-  # Apply netplan WiFi config immediately (doesn't require reboot)
-  - netplan apply
+  # NOTE: deliberately no `netplan apply` here.
+  #   - Ethernet (images/ubuntu/files/netplan/99-clusteros.yaml) is already
+  #     applied by netplan's early-boot generator, well before cloud-init
+  #     itself starts (cloud-init needs network for package_update).
+  #   - WiFi (80-cluster-wifi.yaml) doesn't exist yet at this point — it's
+  #     written at runtime by cluster-wifi-setup (cluster-wifi.service).
+  #   - cluster-wifi.service has no ordering relative to cloud-final.service
+  #     (both only depend on cloud-init.target — see
+  #     wifi-rfkill-unblock.service's comment), so it can be concurrently
+  #     mid-DHCP-wait for the wifi interface right now. A `netplan apply`
+  #     here would pick up its just-written 80-cluster-wifi.yaml and trigger
+  #     a second networkd reload for that interface, bouncing the link and
+  #     interrupting its DHCP negotiation.
   - sysctl --system
   - systemctl enable ssh
   - systemctl start ssh
@@ -147,9 +170,22 @@ runcmd:
   - /usr/local/bin/clusteros-tailscale-init || true
   # Apply the cluster patch bundle if present (placed there by cluster-make-usb).
   # This installs node-agent, joins the cluster, and sets up all services.
+  #
+  # Guarded by .bootstrapped — same check used by node-agent.service's
+  # ExecStartPre (images/ubuntu/files/systemd/node-agent.service). On first
+  # boot, node-agent.service starts as soon as network-online+tailscaled+
+  # cluster-wifi are up, usually well before cloud-init's runcmd reaches this
+  # step, and its ExecStartPre already runs apply-patch.sh — writing
+  # .bootstrapped partway through (step 9/10) and scheduling a reboot
+  # (step 10/10). Without this guard, runcmd would ALSO run apply-patch.sh,
+  # unconditionally and concurrently: two simultaneous apt-get/dpkg
+  # operations, iptables flushes, and netplan rewrites, with the script's
+  # `set -e` aborting whichever loses the dpkg lock mid-patch — leaving the
+  # node half-patched (node-agent killed, state wiped) with .bootstrapped
+  # never written.
   - |
-    if [ -f /root/patch/apply-patch.sh ]; then
-      bash /root/patch/apply-patch.sh >> /var/log/clusteros-join.log 2>&1
+    if [ -f /root/patch/apply-patch.sh ] && [ ! -f /var/lib/clusteros/.bootstrapped ]; then
+      bash /root/patch/apply-patch.sh >> /var/log/clusteros-join.log 2>&1 && mkdir -p /var/lib/clusteros && touch /var/lib/clusteros/.bootstrapped
     fi
 
 final_message: "ClusterOS cloud-init complete after $UPTIME seconds"

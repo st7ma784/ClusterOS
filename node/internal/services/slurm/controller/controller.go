@@ -65,6 +65,8 @@ func NewSLURMControllerRole(controllerIP string, mungeKey []byte, workers []Work
 func (sc *SLURMController) Start() error {
 	sc.Logger().Info("Starting SLURM controller")
 
+	sc.killExistingSlurmctld()
+
 	if err := sc.createDirectories(); err != nil {
 		return fmt.Errorf("create directories: %w", err)
 	}
@@ -251,6 +253,20 @@ func (sc *SLURMController) stopSlurmctld() error {
 	sc.slurmctldCmd = nil
 	sc.SetRunning(false)
 	return nil
+}
+
+// killExistingSlurmctld kills any stray slurmctld process left behind by a
+// previous run (e.g. an unclean shutdown, or this node stepping down and later
+// being re-elected leader before the old process was reaped) and waits for
+// port 6817 to be released. This mirrors the killExistingK3s idempotency
+// pattern so Start() is always safe to call even if a prior instance is still
+// running.
+func (sc *SLURMController) killExistingSlurmctld() {
+	exec.Command("pkill", "-9", "-f", "slurmctld").Run()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && isTCPReachable("127.0.0.1", 6817) {
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func (sc *SLURMController) generateConfig() error {

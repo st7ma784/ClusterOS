@@ -1,8 +1,8 @@
 [Unit]
 Description=ClusterOS Node Agent
 Documentation=https://github.com/cluster-os
-After=network-online.target tailscaled.service
-Wants=network-online.target
+After=network-online.target tailscaled.service cluster-wifi.service
+Wants=network-online.target cluster-wifi.service
 
 [Service]
 Type=simple
@@ -12,7 +12,7 @@ ExecStartPre=/bin/bash -c 'if [ -f /root/patch/apply-patch.sh ] && [ ! -f /var/l
 ExecStartPre=/bin/sleep 5
 ExecStartPre=-/usr/local/bin/node-agent init --identity-path /var/lib/cluster-os/identity.json
 ExecStart=/usr/local/bin/node-agent --log-level info start --foreground
-Restart=on-failure
+Restart=always
 RestartSec=10
 StartLimitInterval=60s
 StartLimitBurst=3
@@ -32,7 +32,7 @@ LimitNPROC=4096
 # and SLURM/WireGuard need access to /etc as well
 NoNewPrivileges=false
 ProtectSystem=false
-ProtectHome=read-only
+ProtectHome=false
 
 [Install]
 WantedBy=multi-user.target

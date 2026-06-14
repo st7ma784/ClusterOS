@@ -12,17 +12,45 @@ set -o pipefail
 WIFI_ENV="/etc/clusteros/wifi.env"
 
 # ── Credentials ───────────────────────────────────────────────────────────────
-# Prefer /etc/clusteros/wifi.env; fall back to compile-time defaults.
+# Read from /etc/clusteros/wifi.env (written from images/ubuntu/.env at image
+# build time, or by apply-patch.sh on a running node). No hardcoded fallback —
+# nodes without WiFi credentials simply skip WiFi setup (wired/Tailscale-only).
 SSID=""
 PSK=""
 if [[ -f "$WIFI_ENV" ]]; then
     SSID=$(grep -v '^#' "$WIFI_ENV" | grep '^WIFI_SSID=' | cut -d= -f2- | tr -d '"' | xargs || true)
     PSK=$(grep  -v '^#' "$WIFI_ENV" | grep '^WIFI_KEY='  | cut -d= -f2- | tr -d '"' | xargs || true)
 fi
-SSID="${SSID:-MANDER84}"
-PSK="${PSK:-M4nd3rsM0b}"
 
 log() { echo "[cluster-wifi] $1"; logger -t cluster-wifi "$1" 2>/dev/null || true; }
+
+if [[ -z "$SSID" || -z "$PSK" ]]; then
+    log "No WiFi credentials in $WIFI_ENV — skipping WiFi setup (wired/Tailscale-only node)"
+    exit 0
+fi
+
+# ── 0. Self-heal: WiFi driver kernel modules ──────────────────────────────────
+# cluster-wifi.service (Type=oneshot, RemainAfterExit=yes — runs exactly once
+# per boot) is ordered BEFORE node-agent.service, whose ExecStartPre runs
+# apply-patch.sh. On a freshly-imaged node, apply-patch.sh's
+# linux-modules-extra-$(uname -r) self-heal (which provides iwlwifi etc.)
+# hasn't run yet on this — our only attempt this boot. Do the same self-heal
+# here too, so WiFi doesn't depend on that ordering / a second reboot.
+if [ ! -d /sys/class/ieee80211 ] || [ -z "$(ls -A /sys/class/ieee80211 2>/dev/null)" ]; then
+    if lspci 2>/dev/null | grep -qiE "network controller|wireless|wifi|802\.11" \
+        || lsusb 2>/dev/null | grep -qiE "wireless|wifi|wlan|802\.11"; then
+        PKG="linux-modules-extra-$(uname -r)"
+        if ! dpkg -s "$PKG" &>/dev/null 2>&1; then
+            log "$PKG not installed — installing now (self-heal, independent of apply-patch.sh ordering)"
+            apt-get -o Acquire::ForceIPv4=true update -qq 2>/dev/null || true
+            if apt-get -o Acquire::ForceIPv4=true install -y -qq "$PKG" 2>/dev/null; then
+                log "$PKG installed"
+            else
+                log "WARNING: failed to install $PKG (no network yet?) — apply-patch.sh will retry on next boot"
+            fi
+        fi
+    fi
+fi
 
 # ── 1. Load WiFi kernel stack ─────────────────────────────────────────────────
 log "Loading WiFi kernel stack..."
@@ -36,6 +64,7 @@ udevadm settle --timeout=10 2>/dev/null || true
 for mod in \
     iwlwifi iwlmvm \
     rtl8xxxu rtw88_pci rtw89_pci rtw89_8852be rtw89_8852ce r8188eu \
+    8852bu \
     ath9k ath10k_pci ath11k_pci \
     brcmfmac \
     mt7921e mt7921pci mt76x2e; do
@@ -105,10 +134,48 @@ find_wifi_interface() {
     return 1
 }
 
-WIFI_IFACE=$(find_wifi_interface)
+# A registered phy (/sys/class/ieee80211/phyN) doesn't always come with a
+# netdev — some cfg80211 drivers leave default-interface creation to
+# userspace (normally NetworkManager, which a minimal server image doesn't
+# run). Ask cfg80211 directly to create one for any phy that has none.
+create_wifi_interface() {
+    command -v iw &>/dev/null || return 1
+    [ -d /sys/class/ieee80211 ] || return 1
+    local phy phyname pr dd created=1
+    for phy in /sys/class/ieee80211/*/; do
+        phyname=$(basename "${phy%/}")
+        pr=$(readlink -f "${phy%/}" 2>/dev/null) || continue
+        dd=$(dirname "$(dirname "$pr")")
+        if [ -d "$dd/net" ] && [ -n "$(ls -A "$dd/net" 2>/dev/null)" ]; then
+            continue
+        fi
+        log "phy $phyname has no netdev — running: iw phy $phyname interface add wlan0 type managed"
+        iw phy "$phyname" interface add wlan0 type managed 2>/dev/null && created=0
+    done
+    return $created
+}
+
+WIFI_IFACE=""
+for attempt in $(seq 1 10); do
+    WIFI_IFACE=$(find_wifi_interface)
+    [ -n "$WIFI_IFACE" ] && break
+    if [ "$attempt" -eq 5 ]; then
+        # Halfway through: rfkill may have re-blocked since our initial
+        # unblock, and a bare phy may need a netdev created by hand.
+        rfkill unblock wifi 2>/dev/null || true
+        rfkill unblock all  2>/dev/null || true
+        create_wifi_interface
+    fi
+    udevadm trigger --subsystem-match=ieee80211 --subsystem-match=net 2>/dev/null || true
+    udevadm settle --timeout=5 2>/dev/null || true
+    sleep 2
+done
+
 if [ -z "$WIFI_IFACE" ]; then
     log "ERROR: WiFi hardware present but no netdev interface created."
-    log "  Likely cause: missing firmware. Check: dmesg | grep -i 'firmware.*failed'"
+    log "  rfkill: $(rfkill list 2>/dev/null | tr '\n' ' ')"
+    log "  ieee80211 phys: $(ls /sys/class/ieee80211/ 2>/dev/null | tr '\n' ' ')"
+    log "  recent dmesg (firmware/80211/rfkill): $(dmesg 2>/dev/null | grep -iE 'firmware|80211|rfkill' | tail -8 | tr '\n' '|')"
     exit 1
 fi
 

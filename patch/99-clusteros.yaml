@@ -1,5 +1,6 @@
 network:
   version: 2
+  renderer: networkd
   ethernets:
     all-en:
       match:
@@ -15,13 +16,6 @@ network:
       dhcp-identifier: mac
       optional: true
       link-local: [ipv4, ipv6]   # 169.254.x.x + fe80:: when no DHCP — enables p2p Ethernet patches
-  wifis:
-    all-wl:
-      match:
-        name: "wl*"
-      dhcp4: true
-      optional: true
-      link-local: [ipv4, ipv6]
-      access-points:
-        "MANDER84":
-          password: "M4nd3rsM0b"
+  # WiFi is NOT configured here: networkd renderer requires exact interface names,
+  # not match: patterns. cluster-wifi.service writes /etc/netplan/80-cluster-wifi.yaml
+  # with the real interface name at boot time.

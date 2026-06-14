@@ -39,10 +39,15 @@ else
     echo "  Run 'make cluster-key' before building the image."
 fi
 
-# Copy and enable systemd service
+# Copy and enable systemd services
 sudo cp /tmp/clusteros-files/systemd/node-agent.service /etc/systemd/system/
+
 sudo systemctl daemon-reload
 sudo systemctl enable node-agent.service
+
+# OpenMPI: bind MPI traffic to Tailscale interface with a fixed port range
+sudo mkdir -p /etc/openmpi
+sudo cp /tmp/clusteros-files/config/openmpi-mca-params.conf /etc/openmpi/
 
 # ------------------------------------------------------------------------------
 # Install k3s (disabled by default)
@@ -100,9 +105,11 @@ sudo apt-get install -y linux-firmware || true
 # CRITICAL: Cloud images use minimal kernels without WiFi drivers
 # We need to install linux-modules-extra for the INSTALLED kernel, not the running one
 # The running kernel during Packer build is the VM's kernel, not the target
-INSTALLED_KERNEL=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|/boot/vmlinuz-||' | sort -V | tail -1)
-echo "  Installed kernel: $INSTALLED_KERNEL"
+INSTALLED_KERNEL=$(find /boot -maxdepth 1 -name 'vmlinuz-*' 2>/dev/null \
+    | sed 's|/boot/vmlinuz-||' | sort -V | tail -1 || true)
+echo "  Installed kernel: ${INSTALLED_KERNEL:-none}"
 
+sudo apt-get update || true
 if [ -n "$INSTALLED_KERNEL" ]; then
     echo "  Installing extra kernel modules for WiFi support..."
     sudo apt-get install -y "linux-modules-extra-${INSTALLED_KERNEL}" || {
@@ -114,26 +121,85 @@ fi
 # Also install the generic kernel modules package as fallback
 sudo apt-get install -y linux-modules-extra-generic 2>/dev/null || true
 
-# Broadcom WiFi - proprietary driver for some chipsets
-sudo apt-get install -y broadcom-sta-dkms 2>/dev/null || true
-# Broadcom open-source driver (brcmfmac/brcmsmac)
-sudo apt-get install -y bcmwl-kernel-source 2>/dev/null || true
+# DO NOT install DKMS packages (broadcom-sta-dkms, bcmwl-kernel-source,
+# realtek-rtl88xxau-dkms): even when the DKMS build fails in chroot (no
+# running kernel), these packages still install /etc/modprobe.d/ blacklist
+# files that prevent the standard open-source drivers (brcmfmac, iwlwifi,
+# rtw88, etc.) from loading — the same drivers the Ubuntu installer uses.
+# The linux-firmware package already contains all required firmware blobs.
 
-# Realtek USB WiFi adapters (rtl8xxxu, rtl88xxau)
-sudo apt-get install -y realtek-rtl88xxau-dkms 2>/dev/null || true
+# Remove any stale modprobe blacklists that might have come from cloud-image
+# defaults. We want the standard open-source WiFi drivers to load freely.
+for f in /etc/modprobe.d/broadcom-sta*.conf \
+          /etc/modprobe.d/bcmwl*.conf \
+          /etc/modprobe.d/blacklist-ath_pci.conf; do
+    [ -f "$f" ] && { sudo rm -f "$f"; echo "  Removed blacklist: $f"; }
+done
 
-# NetworkManager as backup for complex WiFi scenarios  
-sudo apt-get install -y network-manager 2>/dev/null || true
-
-# Verify WiFi modules are available
-echo "  Verifying WiFi modules..."
+# Verify WiFi modules are available for the TARGET kernel — not the Packer
+# build host's. `modinfo` with no -k checks $(uname -r), which inside the
+# chroot is the BUILD HOST's kernel, so it can report "available" even when
+# linux-modules-extra-${INSTALLED_KERNEL} failed to install into this image.
+echo "  Verifying WiFi modules (target kernel: ${INSTALLED_KERNEL:-unknown})..."
+MISSING_MODS=""
 for mod in iwlwifi ath9k ath10k_pci brcmfmac rtw88_pci mt7921e cfg80211 mac80211; do
-    if modinfo "$mod" &>/dev/null; then
+    if [ -n "$INSTALLED_KERNEL" ] \
+        && find "/lib/modules/${INSTALLED_KERNEL}" -name "${mod}.ko*" 2>/dev/null | grep -q .; then
         echo "    ✓ $mod available"
     else
         echo "    ✗ $mod NOT found"
+        MISSING_MODS="$MISSING_MODS $mod"
     fi
 done
+if [ -n "$MISSING_MODS" ]; then
+    echo "  WARNING: missing for kernel ${INSTALLED_KERNEL:-unknown}:$MISSING_MODS"
+    echo "  WiFi may not work until apply-patch.sh installs linux-modules-extra-\$(uname -r) on first boot."
+fi
+
+# Install out-of-tree RTL8852BU driver for UGREEN AX900 CM762 USB WiFi adapter.
+# This chipset is NOT in the mainline kernel; DKMS registers the source so it
+# auto-builds on first real boot even if the chroot build fails (no /proc/version).
+echo "  Installing RTL8852BU driver (UGREEN AX900 CM762)..."
+sudo apt-get install -y dkms build-essential git 2>/dev/null || true
+if [ -n "$INSTALLED_KERNEL" ]; then
+    sudo apt-get install -y "linux-headers-${INSTALLED_KERNEL}" 2>/dev/null || \
+        sudo apt-get install -y linux-headers-generic 2>/dev/null || true
+fi
+
+# morrownr/8852bu-20240418 was renamed/replaced by morrownr/rtl8852bu-20250826
+# (PACKAGE_NAME also changed from "8852bu" to "rtl8852bu" — the old URL 404s,
+# so this driver previously never installed on any node).
+RTL_CLONE="/tmp/rtl8852bu-src"
+RTL_DKMS_SRC=""
+if git clone --depth=1 https://github.com/morrownr/rtl8852bu-20250826.git "$RTL_CLONE" 2>/dev/null; then
+    RTL_DKMS_SRC="$RTL_CLONE"
+elif curl -sL https://github.com/morrownr/rtl8852bu-20250826/archive/refs/heads/main.tar.gz \
+        | sudo tar -xz -C /tmp/ 2>/dev/null; then
+    RTL_DKMS_SRC="/tmp/rtl8852bu-20250826-main"
+fi
+
+if [ -n "$RTL_DKMS_SRC" ] && [ -f "$RTL_DKMS_SRC/dkms.conf" ]; then
+    RTL_VER=$(grep -m1 'PACKAGE_VERSION' "$RTL_DKMS_SRC/dkms.conf" | cut -d'"' -f2 || echo "1.19.21-86")
+    RTL_NAME=$(grep -m1 'PACKAGE_NAME' "$RTL_DKMS_SRC/dkms.conf" | cut -d'"' -f2 || echo "rtl8852bu")
+    # The DKMS package name (rtl8852bu) differs from the kernel module it
+    # builds (8852bu, per BUILT_MODULE_NAME in dkms.conf).
+    RTL_MODULE=$(grep -m1 'BUILT_MODULE_NAME' "$RTL_DKMS_SRC/dkms.conf" | grep -oP '"\K[^"]+' || echo "8852bu")
+    DKMS_DIR="/usr/src/${RTL_NAME}-${RTL_VER}"
+    sudo cp -r "$RTL_DKMS_SRC" "$DKMS_DIR" 2>/dev/null || true
+    sudo dkms add "${RTL_NAME}/${RTL_VER}" 2>/dev/null || true
+    if [ -n "$INSTALLED_KERNEL" ] && [ -d "/usr/src/linux-headers-${INSTALLED_KERNEL}" ]; then
+        sudo dkms build "${RTL_NAME}/${RTL_VER}" -k "${INSTALLED_KERNEL}" 2>/dev/null && \
+        sudo dkms install "${RTL_NAME}/${RTL_VER}" -k "${INSTALLED_KERNEL}" --force 2>/dev/null && \
+        echo "    ✓ RTL8852BU driver built for kernel ${INSTALLED_KERNEL}" || \
+        echo "    ! RTL8852BU chroot build failed — DKMS will auto-build on first real boot"
+    else
+        echo "    ! No kernel headers in chroot — DKMS will auto-build on first real boot"
+    fi
+    echo "${RTL_MODULE}" | sudo tee /etc/modules-load.d/clusteros-rtl8852bu.conf > /dev/null
+    echo "    ✓ RTL8852BU registered with DKMS (source: $DKMS_DIR)"
+else
+    echo "    ! RTL8852BU source download failed — will install on first boot via apply-patch.sh"
+fi
 
 # Rebuild initramfs to include firmware and modules
 echo "  Rebuilding initramfs..."
@@ -163,8 +229,14 @@ sudo systemctl mask slurmd.service 2>/dev/null || true
 # ------------------------------------------------------------------------------
 echo "[4/6] Installing Tailscale..."
 
-# Install Tailscale
-curl -fsSL https://tailscale.com/install.sh | sh
+# Recover from any half-configured packages left by DKMS builds above.
+# DKMS postinst scripts fail in chroot (no running kernel to build against),
+# leaving dpkg in a broken state that blocks subsequent apt calls.
+dpkg --configure -a 2>/dev/null || true
+
+# Install Tailscale — || true so a network hiccup or chroot apt issue does not
+# abort the whole image build; apply-patch.sh installs it on first real boot.
+curl -fsSL https://tailscale.com/install.sh | sh || true
 
 # Ensure Tailscale directories exist with correct permissions
 sudo mkdir -p /var/lib/tailscale /var/run/tailscale
@@ -214,6 +286,21 @@ TSENV
     echo "  Tailscale configuration created at: /etc/clusteros/tailscale.env"
     echo "  Final file content:"
     sudo cat /etc/clusteros/tailscale.env | head -10
+
+    # Write WiFi credentials for cluster-wifi-setup to read at runtime.
+    # cluster-wifi-setup reads WIFI_SSID / WIFI_KEY from this file — no hardcoded
+    # fallback. Credentials only need updating in images/ubuntu/.env.
+    if [ -n "${WIFI_SSID:-}" ] && [ -n "${WIFI_KEY:-}" ]; then
+        sudo tee /etc/clusteros/wifi.env > /dev/null <<WIFIENV
+# ClusterOS WiFi credentials — read by /usr/local/bin/cluster-wifi-setup
+WIFI_SSID=${WIFI_SSID}
+WIFI_KEY=${WIFI_KEY}
+WIFIENV
+        sudo chmod 600 /etc/clusteros/wifi.env
+        echo "  WiFi credentials written → /etc/clusteros/wifi.env (SSID: ${WIFI_SSID})"
+    else
+        echo "  WIFI_SSID/WIFI_KEY not set in images/ubuntu/.env — skipping wifi.env (wired/Tailscale-only)"
+    fi
 
 elif [ -f /tmp/clusteros-files/tailscale/tailscale.env ]; then
     echo "  Installing Tailscale template configuration..."
@@ -277,7 +364,10 @@ fi
 # ------------------------------------------------------------------------------
 echo "[5/6] Configuring network..."
 
-# Copy netplan config (includes WiFi configuration)
+# Copy netplan config (ethernet only — WiFi is NOT configured here. The WiFi
+# netplan file, 80-cluster-wifi.yaml, is written at runtime by
+# cluster-wifi-setup once it has detected the exact wireless interface name,
+# which networkd's wifis: stanza requires.)
 sudo cp /tmp/clusteros-files/netplan/99-clusteros.yaml /etc/netplan/
 sudo chmod 600 /etc/netplan/99-clusteros.yaml
 
@@ -303,12 +393,15 @@ if [ -d /tmp/clusteros-files/systemd/tailscaled.service.d ]; then
     echo "  tailscaled configured to wait for WiFi"
 fi
 
-# DISABLE the main wpa_supplicant.service (D-Bus service for NetworkManager)
-# Netplan manages its own wpa_supplicant processes for WiFi
-sudo systemctl unmask wpa_supplicant.service 2>/dev/null || true
+# wpa_supplicant.service is D-Bus-activated: systemd-networkd starts it
+# on-demand via fi.w1.wpa_supplicant1 for any wifis: entry in netplan
+# (80-cluster-wifi.yaml, written at runtime by cluster-wifi-setup). Unmask so
+# that D-Bus activation works; disable so it doesn't ALSO auto-start as a
+# standalone unit at boot before networkd asks for it.
+sudo systemctl unmask  wpa_supplicant.service 2>/dev/null || true
 sudo systemctl disable wpa_supplicant.service 2>/dev/null || true
 
-# Disable NetworkManager - we use systemd-networkd + netplan + cluster-wifi
+# NetworkManager is not installed; this is a no-op but kept for safety.
 sudo systemctl disable NetworkManager.service 2>/dev/null || true
 
 # Disable systemd-rfkill - it can restore a "blocked" state from previous boot
@@ -321,6 +414,22 @@ sudo systemctl mask systemd-rfkill.socket 2>/dev/null || true
 sudo mkdir -p /var/lib/systemd/rfkill
 echo "0" | sudo tee /var/lib/systemd/rfkill/platform-*:wlan 2>/dev/null || true
 echo "  Disabled systemd-rfkill (prevents restoring blocked state)"
+
+# Lab mode: disable AppArmor entirely (private, ringfenced cluster — no
+# untrusted tenants). AppArmor profile denials are a recurring source of
+# debugging noise for netlink/device operations during WiFi interface setup.
+# Only the filesystem-scoped half of the rollback belongs here — unloading
+# already-loaded profiles and resetting iptables policies operates on the
+# BUILD HOST's live kernel from inside this chroot, so that part lives in
+# apply-patch.sh (runs against the booted image's own kernel on first boot).
+sudo systemctl disable apparmor.service 2>/dev/null || true
+sudo systemctl mask    apparmor.service 2>/dev/null || true
+if [ -f /etc/default/grub ] && ! grep -q 'apparmor=0' /etc/default/grub; then
+    sudo sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 apparmor=0"/' /etc/default/grub
+    sudo update-grub 2>/dev/null || true
+    echo "  apparmor=0 added to kernel cmdline"
+fi
+echo "  AppArmor disabled (lab mode)"
 
 # Install and enable WiFi setup service
 if [ -f /tmp/clusteros-files/systemd/cluster-wifi.service ]; then
@@ -425,7 +534,7 @@ echo ""
 echo "Enabled services:"
 systemctl list-unit-files | grep -E "node-agent|k3s|slurm|munge|tailscale|cluster-autostart|cluster-wifi" | head -20
 echo ""
-echo "WiFi configured: TALKTALK665317 (see images/ubuntu/files/netplan/99-clusteros.yaml)"
+echo "WiFi: configured via /etc/clusteros/wifi.env (see images/ubuntu/.env)"
 echo ""
 echo "============================================"
 echo "Provisioning Complete"

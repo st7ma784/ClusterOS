@@ -36,6 +36,87 @@ warn() { echo -e "  ${YELLOW}!${NC} $*"; }
 err()  { echo -e "  ${RED}✗${NC} $*"; }
 step() { echo -e "\n${CYAN}${BOLD}[$1]${NC} $2"; }
 
+# write_cluster_wifi_service_fallback <target-path>
+# Writes the cluster-wifi.service unit (mirrors
+# images/ubuntu/files/systemd/cluster-wifi.service). Used as a fallback when
+# $BUNDLE_DIR/cluster-wifi.service isn't available, so both the fresh-image
+# and disk-install code paths below stay in sync from one definition.
+write_cluster_wifi_service_fallback() {
+    cat > "$1" <<'WIFISVCEOF'
+[Unit]
+Description=ClusterOS WiFi Setup
+# Run AFTER cloud-init completes - cloud-init may block rfkill
+After=systemd-modules-load.service systemd-udevd.service systemd-networkd.service cloud-init.target
+Wants=systemd-networkd.service
+Requires=systemd-modules-load.service
+Before=tailscaled.service tailscale-auth.service cluster-autostart.service network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Give cloud-init and udev time to settle
+ExecStartPre=/bin/sleep 3
+# Unblock WiFi BEFORE running setup (in case something blocked it)
+ExecStartPre=/usr/sbin/rfkill unblock wifi
+ExecStart=/usr/local/bin/cluster-wifi-setup
+TimeoutStartSec=300
+StandardOutput=journal
+StandardError=journal
+# Don't fail boot if WiFi fails
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target
+WIFISVCEOF
+}
+
+# Fix UEFI boot on a freshly-written device.
+# Ubuntu cloud images use systemd-boot which requires XBOOTLDR partition
+# discovery — this fails on many real machines when booting from USB.
+# Replace BOOTX64.EFI with shim (Secure Boot) or GRUB, and write a
+# fallback grub.cfg that finds the root partition by label.
+_fix_uefi_boot_dev() {
+    local dev="$1"
+    local efi_part=""
+    for candidate in "${dev}p15" "${dev}15" "${dev}p2" "${dev}2" "${dev}p1" "${dev}1"; do
+        [[ -b "$candidate" ]] || continue
+        blkid "$candidate" 2>/dev/null | grep -qi "vfat\|fat32" && { efi_part="$candidate"; break; }
+    done
+    if [[ -z "$efi_part" ]]; then
+        warn "No EFI partition found on $dev — BIOS/legacy boot only"
+        return
+    fi
+    local efi_mnt; efi_mnt="$(mktemp -d /tmp/clusteros-efi-XXXXXX)"
+    mount "$efi_part" "$efi_mnt" 2>/dev/null \
+        || { warn "Could not mount EFI partition $efi_part"; rmdir "$efi_mnt"; return; }
+    mkdir -p "$efi_mnt/EFI/BOOT"
+    if [[ -f "$efi_mnt/EFI/ubuntu/shimx64.efi" ]]; then
+        cp "$efi_mnt/EFI/ubuntu/shimx64.efi" "$efi_mnt/EFI/BOOT/BOOTX64.EFI"
+        ok "Secure Boot shim → EFI/BOOT/BOOTX64.EFI"
+    elif [[ -f "$efi_mnt/EFI/ubuntu/grubx64.efi" ]]; then
+        cp "$efi_mnt/EFI/ubuntu/grubx64.efi" "$efi_mnt/EFI/BOOT/BOOTX64.EFI"
+        ok "GRUB → EFI/BOOT/BOOTX64.EFI"
+    else
+        warn "No shim or grub in EFI partition — firmware must find boot entry itself"
+    fi
+    # Fallback grub.cfg: searches by label so partition UUIDs don't matter
+    cat > "$efi_mnt/EFI/BOOT/grub.cfg" << 'GCFG'
+set timeout=5
+set default=0
+search --no-floppy --label --set=root cloudimg-rootfs
+if [ -z "${root}" ]; then search --no-floppy --label --set=root BOOT; fi
+set prefix=(${root})/boot/grub
+configfile ${prefix}/grub.cfg
+menuentry "ClusterOS" {
+    search --no-floppy --label --set=root cloudimg-rootfs
+    linux /boot/vmlinuz root=LABEL=cloudimg-rootfs ro quiet
+    initrd /boot/initrd.img
+}
+GCFG
+    ok "Fallback grub.cfg written"
+    umount "$efi_mnt"; rmdir "$efi_mnt"
+}
+
 # ── Arg parse ─────────────────────────────────────────────────────────────────
 DEVICE=""
 OUTPUT=""
@@ -185,17 +266,39 @@ cp "$0" "$BUNDLE_DIR/cluster-make-usb.sh"
 chmod +x "$BUNDLE_DIR/cluster-make-usb.sh"
 ok "cluster-make-usb bundled (nodes can create further USB installers)"
 
-# Netplan — WiFi + wired DHCP config for physical hardware
+# Netplan — wired DHCP config for physical hardware
 if [[ -f /etc/netplan/99-clusteros.yaml ]]; then
     cp /etc/netplan/99-clusteros.yaml "$BUNDLE_DIR/99-clusteros.yaml"
     chmod 600 "$BUNDLE_DIR/99-clusteros.yaml"
-    ok "Netplan bundled (WiFi + wired DHCP)"
+    ok "Netplan bundled (wired DHCP)"
 elif [[ -f /usr/local/lib/clusteros/99-clusteros.yaml ]]; then
     cp /usr/local/lib/clusteros/99-clusteros.yaml "$BUNDLE_DIR/99-clusteros.yaml"
     chmod 600 "$BUNDLE_DIR/99-clusteros.yaml"
     ok "Netplan bundled (from lib)"
 else
-    warn "No 99-clusteros.yaml found — new nodes may not get WiFi automatically"
+    warn "No 99-clusteros.yaml found — new nodes may not get wired DHCP automatically"
+fi
+
+# WiFi credentials — cluster-wifi-setup reads these at runtime
+if [[ -f /etc/clusteros/wifi.env ]]; then
+    cp /etc/clusteros/wifi.env "$BUNDLE_DIR/wifi.env"
+    chmod 600 "$BUNDLE_DIR/wifi.env"
+    ok "WiFi credentials bundled (/etc/clusteros/wifi.env)"
+else
+    warn "No /etc/clusteros/wifi.env on this node — bundle will omit WiFi credentials (wired/Tailscale-only)"
+fi
+
+# cluster-wifi-setup binary — needed for USB nodes that weren't built via Packer
+if [[ -f /usr/local/bin/cluster-wifi-setup ]]; then
+    cp /usr/local/bin/cluster-wifi-setup "$BUNDLE_DIR/cluster-wifi-setup"
+    chmod 755 "$BUNDLE_DIR/cluster-wifi-setup"
+    ok "cluster-wifi-setup bundled"
+fi
+
+# cluster-wifi.service — needed for USB nodes
+if [[ -f /etc/systemd/system/cluster-wifi.service ]]; then
+    cp /etc/systemd/system/cluster-wifi.service "$BUNDLE_DIR/cluster-wifi.service"
+    ok "cluster-wifi.service bundled"
 fi
 
 # Tailscale credentials — new nodes need these to auto-join the overlay network.
@@ -469,38 +572,80 @@ if [[ -n "$DEVICE" ]]; then
         ok "Chroot DNS set to 8.8.8.8 (symlink replaced with real file)"
 
         # ── apt-get update with retry ─────────────────────────────────────────
-        # Run update separately so a transient DNS failure doesn't leave us
-        # trying to install from a broken/empty package index.
         _APT_UPDATED=false
         for _attempt in 1 2 3; do
             if chroot "$_MNT" apt-get -o Acquire::ForceIPv4=true update -qq 2>&1; then
-                _APT_UPDATED=true
-                break
+                _APT_UPDATED=true; break
             fi
             warn "apt-get update attempt $_attempt/3 failed — retrying in 5s..."
             sleep 5
         done
         if [[ "$_APT_UPDATED" != "true" ]]; then
-            # Restore host DNS if we changed it, then bail
-            if [[ "$_HOST_DNS_FIXED" == "true" ]]; then
-                echo "$_orig_resolv" > /etc/resolv.conf 2>/dev/null || true
-            fi
+            [[ "$_HOST_DNS_FIXED" == "true" ]] \
+                && echo "$_orig_resolv" > /etc/resolv.conf 2>/dev/null || true
             err "apt-get update failed after 3 attempts — cannot install packages"
-            err "The USB image will be incomplete. Fix internet access on this node and retry."
             exit 1
         fi
         ok "apt-get update succeeded"
+
+        # Protect invoke-rc.d so postinst scripts (munge, slurm) don't fail when
+        # they try to start services in the chroot. dpkg-divert prevents sysvinit-utils
+        # upgrades from restoring the real binary during the apt run.
+        chroot "$_MNT" dpkg-divert --local --rename \
+            --divert /usr/sbin/invoke-rc.d.real /usr/sbin/invoke-rc.d 2>/dev/null || true
+        printf '#!/bin/sh\nexit 0\n' > "$_MNT/usr/sbin/invoke-rc.d"
+        chmod +x "$_MNT/usr/sbin/invoke-rc.d"
+        # needrestart scans /proc (host processes via bind mount) and calls invoke-rc.d
+        chroot "$_MNT" apt-get -o Acquire::ForceIPv4=true -qq purge -y needrestart \
+            2>/dev/null || true
 
         # Install all dependencies via chroot apt
         chroot "$_MNT" /bin/bash -c "
             export DEBIAN_FRONTEND=noninteractive
             apt-get -o Acquire::ForceIPv4=true install -y -qq \
-                openssh-server jq curl wget munge slurm-wlm slurm-client \
+                openssh-server jq curl wget git munge slurm-wlm slurm-client \
                 libpmix-dev openmpi-bin libopenmpi-dev python3-mpi4py \
-                build-essential open-iscsi nfs-common multipath-tools \
+                build-essential dkms linux-headers-generic \
+                open-iscsi nfs-common multipath-tools \
                 gdisk parted dosfstools pv wpasupplicant
             systemctl enable ssh
         " && ok "Packages installed" || warn "Some packages failed — node will retry on first boot"
+
+        # Install RTL8852BU driver for UGREEN AX900 CM762 USB WiFi adapter.
+        # morrownr/8852bu-20240418 was renamed/replaced by
+        # morrownr/rtl8852bu-20250826 (PACKAGE_NAME also changed from "8852bu"
+        # to "rtl8852bu" — the old URL 404s, so this driver previously never
+        # installed on any node).
+        chroot "$_MNT" /bin/bash -c "
+            RTL_SRC='/usr/src/rtl8852bu-20250826'
+            git clone --depth=1 https://github.com/morrownr/rtl8852bu-20250826.git \"\$RTL_SRC\" 2>/dev/null || \
+                { curl -sL https://github.com/morrownr/rtl8852bu-20250826/archive/refs/heads/main.tar.gz \
+                    | tar -xz -C /tmp/ 2>/dev/null && \
+                  mv /tmp/rtl8852bu-20250826-main \"\$RTL_SRC\" 2>/dev/null; } || true
+            if [ -f \"\$RTL_SRC/dkms.conf\" ]; then
+                RTL_VER=\$(grep -m1 'PACKAGE_VERSION' \"\$RTL_SRC/dkms.conf\" | cut -d'\"' -f2 || echo '1.19.21-86')
+                RTL_NAME=\$(grep -m1 'PACKAGE_NAME' \"\$RTL_SRC/dkms.conf\" | cut -d'\"' -f2 || echo 'rtl8852bu')
+                RTL_MODULE=\$(grep -m1 'BUILT_MODULE_NAME' \"\$RTL_SRC/dkms.conf\" | grep -oP '\"\K[^\"]+' || echo '8852bu')
+                DKMS_DIR=\"/usr/src/\${RTL_NAME}-\${RTL_VER}\"
+                [ -d \"\$DKMS_DIR\" ] || cp -r \"\$RTL_SRC\" \"\$DKMS_DIR\"
+                dkms add \"\${RTL_NAME}/\${RTL_VER}\" 2>/dev/null || true
+                KVER=\$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|/boot/vmlinuz-||' | sort -V | tail -1)
+                if [ -n \"\$KVER\" ] && [ -d \"/usr/src/linux-headers-\${KVER}\" ]; then
+                    dkms build \"\${RTL_NAME}/\${RTL_VER}\" -k \"\$KVER\" 2>/dev/null && \
+                    dkms install \"\${RTL_NAME}/\${RTL_VER}\" -k \"\$KVER\" --force 2>/dev/null && \
+                    echo 'RTL8852BU driver built for' \"\$KVER\" || \
+                    echo 'RTL8852BU chroot build failed — DKMS will auto-build on first real boot'
+                fi
+                echo \"\$RTL_MODULE\" > /etc/modules-load.d/clusteros-rtl8852bu.conf
+            fi
+        " && ok "RTL8852BU driver (UGREEN AX900 CM762) registered" || \
+            warn "RTL8852BU driver install failed — apply-patch.sh will retry on first boot"
+
+        # Restore real invoke-rc.d before the image ships
+        rm -f "$_MNT/usr/sbin/invoke-rc.d"
+        chroot "$_MNT" dpkg-divert --local --rename \
+            --divert /usr/sbin/invoke-rc.d.real \
+            --remove /usr/sbin/invoke-rc.d 2>/dev/null || true
 
         # ── Create clusteros user ─────────────────────────────────────────────
         # cloud-init would normally do this (see images/ubuntu/cloud-init/user-data).
@@ -787,17 +932,43 @@ INSTALL_SCRIPT
         chmod 755 "$_MNT/usr/local/bin/cluster-os-install"
         ok "cluster-os-install written"
 
+        # Write WiFi credentials into the image
+        mkdir -p "$_MNT/etc/clusteros"
+        if [[ -f "$BUNDLE_DIR/wifi.env" ]]; then
+            install -m 600 "$BUNDLE_DIR/wifi.env" "$_MNT/etc/clusteros/wifi.env"
+            ok "WiFi credentials written to image (/etc/clusteros/wifi.env)"
+        else
+            warn "No wifi.env in bundle — node will be wired/Tailscale-only until /etc/clusteros/wifi.env is configured"
+        fi
+
+        # Install cluster-wifi-setup binary
+        if [[ -f "$BUNDLE_DIR/cluster-wifi-setup" ]]; then
+            install -m 755 "$BUNDLE_DIR/cluster-wifi-setup" "$_MNT/usr/local/bin/cluster-wifi-setup"
+            ok "cluster-wifi-setup installed in image"
+        fi
+
         # Write node-agent systemd service — runs on every boot
         # NOTE: no --no-reboot flag here; apply-patch.sh auto-detects USB vs disk via
         # lsblk TRAN and sets NO_REBOOT accordingly:
         #   USB boot  → _ROOT_TRAN=usb  → NO_REBOOT=1 (don't reboot, stay live)
         #   Disk boot → _ROOT_TRAN=sata/nvme → NO_REBOOT=0 (reboot to pick up config)
         mkdir -p "$_MNT/etc/systemd/system"
+
+        # Write cluster-wifi.service — detects WiFi interface, writes netplan file,
+        # waits for IP. Must run before node-agent so Tailscale auth has network.
+        if [[ -f "$BUNDLE_DIR/cluster-wifi.service" ]]; then
+            install -m 644 "$BUNDLE_DIR/cluster-wifi.service" "$_MNT/etc/systemd/system/cluster-wifi.service"
+            ok "cluster-wifi.service installed from bundle"
+        else
+            write_cluster_wifi_service_fallback "$_MNT/etc/systemd/system/cluster-wifi.service"
+            ok "cluster-wifi.service written inline"
+        fi
+
         cat > "$_MNT/etc/systemd/system/node-agent.service" <<'SVCEOF'
 [Unit]
 Description=ClusterOS node-agent
-After=network-online.target tailscaled.service
-Wants=network-online.target
+After=network-online.target tailscaled.service cluster-wifi.service
+Wants=network-online.target cluster-wifi.service
 
 [Service]
 Type=simple
@@ -815,11 +986,13 @@ SVCEOF
         for _svc in munge slurmd slurmctld k3s k3s-agent; do
             ln -sf /dev/null "$_MNT/etc/systemd/system/${_svc}.service" 2>/dev/null || true
         done
-        # Enable node-agent
+        # Enable node-agent and cluster-wifi
         mkdir -p "$_MNT/etc/systemd/system/multi-user.target.wants"
         ln -sf /etc/systemd/system/node-agent.service \
             "$_MNT/etc/systemd/system/multi-user.target.wants/node-agent.service"
-        ok "node-agent.service enabled"
+        ln -sf /etc/systemd/system/cluster-wifi.service \
+            "$_MNT/etc/systemd/system/multi-user.target.wants/cluster-wifi.service"
+        ok "node-agent.service + cluster-wifi.service enabled"
 
         # Install tailscale.env if present in bundle
         if [[ -f "$BUNDLE_DIR/tailscale.env" ]]; then
@@ -852,6 +1025,8 @@ SVCEOF
         sgdisk -e "$DEVICE" 2>/dev/null || true
         partprobe "$DEVICE" 2>/dev/null || true
         sleep 2
+        step "3b/4" "Fixing UEFI boot (BOOTX64.EFI + fallback grub.cfg)"
+        _fix_uefi_boot_dev "$DEVICE"
         rm -f "$_IMG_WORK"
 
         echo ""
@@ -876,10 +1051,11 @@ SVCEOF
         command -v pv &>/dev/null && WRITER="pv"
         gzip -dc "$BASE_IMAGE" | $WRITER | dd of="$DEVICE" bs=4M conv=fsync status=progress 2>&1 || true
         sync
-        # Fix GPT backup header (required after writing to a different-sized device)
         sgdisk -e "$DEVICE" 2>/dev/null || true
         partprobe "$DEVICE" 2>/dev/null || true
         sleep 2
+        step "3a-efi/4" "Fixing UEFI boot (BOOTX64.EFI + fallback grub.cfg)"
+        _fix_uefi_boot_dev "$DEVICE"
 
         step "3b/4" "Injecting cluster bundle into image"
         # Find root partition (Ubuntu cloud images: p2 or p1 with ext4)
@@ -927,10 +1103,45 @@ SVCEOF
             mkdir -p "$MOUNT_DIR/etc/netplan"
             if [[ -f "$BUNDLE_DIR/99-clusteros.yaml" ]]; then
                 install -m 600 "$BUNDLE_DIR/99-clusteros.yaml" "$MOUNT_DIR/etc/netplan/99-clusteros.yaml"
-                ok "Netplan installed from bundle (wired DHCP + WiFi)"
+                ok "Netplan installed from bundle (wired DHCP)"
             else
-                warn "99-clusteros.yaml not in bundle — WiFi may not work on new nodes"
+                warn "99-clusteros.yaml not in bundle — wired DHCP may not work on new nodes"
             fi
+
+            # WiFi credentials
+            mkdir -p "$MOUNT_DIR/etc/clusteros"
+            if [[ -f "$BUNDLE_DIR/wifi.env" ]]; then
+                install -m 600 "$BUNDLE_DIR/wifi.env" "$MOUNT_DIR/etc/clusteros/wifi.env"
+                ok "wifi.env installed to /etc/clusteros/"
+            else
+                warn "No wifi.env in bundle — node will be wired/Tailscale-only until /etc/clusteros/wifi.env is configured"
+            fi
+
+            # cluster-wifi-setup binary
+            mkdir -p "$MOUNT_DIR/usr/local/bin"
+            if [[ -f "$BUNDLE_DIR/cluster-wifi-setup" ]]; then
+                install -m 755 "$BUNDLE_DIR/cluster-wifi-setup" \
+                    "$MOUNT_DIR/usr/local/bin/cluster-wifi-setup"
+                ok "cluster-wifi-setup installed from bundle"
+            fi
+
+            # cluster-wifi.service
+            mkdir -p "$MOUNT_DIR/etc/systemd/system"
+            if [[ -f "$BUNDLE_DIR/cluster-wifi.service" ]]; then
+                install -m 644 "$BUNDLE_DIR/cluster-wifi.service" \
+                    "$MOUNT_DIR/etc/systemd/system/cluster-wifi.service"
+                ok "cluster-wifi.service installed from bundle"
+            else
+                write_cluster_wifi_service_fallback "$MOUNT_DIR/etc/systemd/system/cluster-wifi.service"
+                ok "cluster-wifi.service written inline"
+            fi
+
+            # Enable cluster-wifi.service
+            mkdir -p "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants"
+            ln -sf /etc/systemd/system/cluster-wifi.service \
+                "$MOUNT_DIR/etc/systemd/system/multi-user.target.wants/cluster-wifi.service" \
+                2>/dev/null || true
+            ok "cluster-wifi.service enabled"
 
             # CRITICAL: Overwrite node-agent.service with the version that calls
             # apply-patch.sh in ExecStartPre.  The pre-built Packer image has an
@@ -940,8 +1151,8 @@ SVCEOF
             cat > "$MOUNT_DIR/etc/systemd/system/node-agent.service" <<'SVCEOF'
 [Unit]
 Description=ClusterOS node-agent
-After=network-online.target tailscaled.service
-Wants=network-online.target
+After=network-online.target tailscaled.service cluster-wifi.service
+Wants=network-online.target cluster-wifi.service
 
 [Service]
 Type=simple

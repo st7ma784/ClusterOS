@@ -59,6 +59,8 @@ func NewSLURMWorkerRoleNoConfig(controllerIP string, mungeKey []byte, nodeIP str
 func (sw *SLURMWorker) Start() error {
 	sw.Logger().Infof("Starting SLURM worker (controller=%s)", sw.controllerIP)
 
+	sw.killExistingSlurmd()
+
 	for _, dir := range []string{
 		"/etc/slurm",
 		"/var/lib/slurm/slurmd",
@@ -132,6 +134,24 @@ func (sw *SLURMWorker) HealthCheck() error {
 		return sw.startSlurmd()
 	}
 	return nil
+}
+
+// killExistingSlurmd kills any stray slurmd process left behind by a previous
+// run (e.g. this node previously pointed at a different controller after a
+// leadership change, or an unclean shutdown) and waits for port 6818 to be
+// released. This mirrors the killExistingK3s idempotency pattern so Start()
+// is always safe to call even if a prior instance is still running.
+func (sw *SLURMWorker) killExistingSlurmd() {
+	exec.Command("pkill", "-9", "-f", "slurmd").Run()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:6818", 200*time.Millisecond)
+		if err != nil {
+			return
+		}
+		conn.Close()
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 // writeClientConfig writes a minimal /etc/slurm/slurm.conf sufficient for SLURM client

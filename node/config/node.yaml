@@ -20,16 +20,9 @@ discovery:
   encrypt_key: ""
 
 # Networking settings
-# NOTE: WireGuard (interface/listen_port) is replaced by Tailscale for overlay networking.
-# These fields are parsed by config.go but the WireGuardManager is never instantiated
-# by the current node-agent. They are kept to avoid config parse errors.
+# NOTE: Overlay networking is provided by Tailscale, not a self-managed
+# WireGuard mesh — see node/internal/networking/tailscale.go.
 networking:
-  # Legacy: WireGuard interface name (not used — Tailscale replaced WireGuard)
-  interface: ""
-
-  # Legacy: WireGuard listen port (not used — Tailscale replaced WireGuard)
-  listen_port: 0
-
   # Subnet used for internal addressing reference
   subnet: "10.42.0.0/16"
 

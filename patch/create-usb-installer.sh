@@ -75,30 +75,41 @@ create_usb_image() {
 
     mkdir -p "$OUTPUT_DIR"
 
-    # Copy the raw image as-is (it's already bootable from Packer)
     log_info "Copying raw image..."
     cp "$RAW_IMAGE" "$IMG_OUTPUT"
 
-    local img_size=$(du -h "$IMG_OUTPUT" | cut -f1)
-    log_info "USB image created: $IMG_OUTPUT ($img_size)"
+    # Fix the GPT backup header in the file itself.
+    # The raw image's backup header points to the last LBA of the virtual disk;
+    # after copying to a different-sized file (or USB drive) the header is at the
+    # wrong location. Etcher and some firmware reject images with a misplaced GPT.
+    if command -v sgdisk &>/dev/null; then
+        log_info "Fixing GPT backup header..."
+        sgdisk -e "$IMG_OUTPUT" 2>/dev/null || true
+    fi
 
-    # Fix UEFI boot (replace systemd-boot with GRUB for better compatibility)
     log_info "Fixing UEFI boot configuration..."
     fix_uefi_boot
 
-    # Embed the installer image into the image itself (self-replicating)
-    log_info "Embedding installer image for self-replication..."
-    embed_installer_image
+    # Produce a compressed copy for Etcher on Windows.
+    # Etcher streams .img.gz rather than loading the full 8 GB into RAM,
+    # which prevents the crash seen with the raw .img file.
+    log_info "Compressing image for Etcher (.img.gz)..."
+    gzip -kf "$IMG_OUTPUT"
+    log_info "Compressed: ${IMG_OUTPUT}.gz ($(du -sh "${IMG_OUTPUT}.gz" | cut -f1))"
 
-    # Final size after embedding
-    local final_size=$(du -h "$IMG_OUTPUT" | cut -f1)
-    log_info "Final USB image: $IMG_OUTPUT ($final_size)"
+    local img_size=$(du -h "$IMG_OUTPUT" | cut -f1)
+    log_info "Raw image:  $IMG_OUTPUT ($img_size)"
 
     echo ""
-    echo "To write to USB drive:"
-    echo "  sudo dd if=$IMG_OUTPUT of=/dev/sdX bs=4M status=progress oflag=sync"
-    echo "  sudo sgdisk -e /dev/sdX   # IMPORTANT: Fix GPT backup header location"
-    echo "  sync"
+    echo "Write to USB — choose one method:"
+    echo ""
+    echo "  Balena Etcher (Windows/Mac/Linux):"
+    echo "    Flash: ${IMG_OUTPUT}.gz"
+    echo ""
+    echo "  dd (Linux):"
+    echo "    sudo dd if=$IMG_OUTPUT of=/dev/sdX bs=4M status=progress oflag=sync"
+    echo "    sudo sgdisk -e /dev/sdX   # fix GPT backup header on actual drive"
+    echo "    sync"
     echo ""
     echo "Replace /dev/sdX with your USB device (use lsblk to find it)"
     echo "WARNING: This will erase all data on the USB drive!"

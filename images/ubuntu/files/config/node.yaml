@@ -9,10 +9,6 @@ discovery:
   bind_port: 7946
   bootstrap_peers: []
 
-wireguard:
-  listen_port: 51820
-  mtu: 1420
-
 # Roles to enable on this node
 # The node-agent will manage these services based on cluster state and leader election
 roles:

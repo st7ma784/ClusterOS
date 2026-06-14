@@ -794,6 +794,29 @@ func (d *Daemon) runProvisioning() error {
 	return nil
 }
 
+// stopSlurmController gracefully stops slurmctld and clears local controller
+// state. Called whenever this node steps down from the SLURM-controller role
+// (split-brain yield, or transitioning to a worker/CP role) so a stale
+// slurmctld with an outdated worker list never lingers and port 6817 is freed
+// for whichever node becomes the new controller.
+func (d *Daemon) stopSlurmController() {
+	d.mu.Lock()
+	ctrl := d.slurmCtrl
+	d.slurmCtrl = nil
+	d.mu.Unlock()
+	if ctrl == nil {
+		return
+	}
+	d.logger.Info("Stepping down as SLURM controller — stopping slurmctld")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := ctrl.Stop(ctx); err != nil {
+		d.logger.Warnf("stop slurmctld: %v", err)
+	}
+	d.roleManager.UnregisterRole("slurm-controller")
+	d.clusterState.RemoveLeader("slurm-controller")
+}
+
 // runJoining is called on non-leader nodes.
 // It waits for the leader to be ready, then reads tags and starts services.
 func (d *Daemon) runJoining() error {
@@ -801,7 +824,7 @@ func (d *Daemon) runJoining() error {
 
 	// Clear any stale leader roles from a previous term.
 	d.roleManager.UnregisterRole("k3s-server")
-	d.roleManager.UnregisterRole("slurm-controller")
+	d.stopSlurmController()
 
 	// If leaderName was cleared (e.g. after ghost-leader detection), re-discover
 	// a reachable leader before waiting for tags.  Without this, waitForLeaderTag
@@ -926,7 +949,7 @@ func (d *Daemon) runJoiningCP() error {
 
 	// Clear any stale pure-worker roles from a previous term.
 	d.roleManager.UnregisterRole("k3s-agent")
-	d.roleManager.UnregisterRole("slurm-controller")
+	d.stopSlurmController()
 
 	// Wait for leader to reach ready phase and sync all tags via TCP push-pull.
 	d.logger.Info("Waiting for leader to reach ready phase...")
@@ -1040,6 +1063,10 @@ func (d *Daemon) runReady() {
 					d.mu.Unlock()
 					// Remove our k3s-nodes leadership tag before stepping down.
 					d.discovery.DeleteTags([]string{"k3s-nodes"})
+					// Stop our slurmctld so it doesn't keep running with a stale
+					// worker list — runJoining will point this node's slurmd at
+					// the new controller via killExistingSlurmd().
+					d.stopSlurmController()
 					d.setPhase(PhaseJoining)
 					return
 				}
@@ -2594,79 +2621,134 @@ func (d *Daemon) writeStatusFile() {
 
 func (d *Daemon) setupFirewallRules() error {
 	d.logger.Info("Setting up firewall rules")
-	rules := []struct{ port, proto, comment string }{
-		{"22", "tcp", "SSH"},
-		{"80", "tcp", "HTTP (nginx-ingress hostNetwork)"},
-		{"443", "tcp", "HTTPS (nginx-ingress hostNetwork)"},
-		{"7946", "tcp", "Serf TCP"},
-		{"7946", "udp", "Serf UDP"},
-		{"6443", "tcp", "K3s API"},
-		{"6817", "tcp", "SLURM slurmctld"},
-		{"6818", "tcp", "SLURM slurmd"},
-		{"6819", "tcp", "SLURM slurmdbd"},
-		{"10250", "tcp", "Kubelet API"},
-		{"2379:2380", "tcp", "etcd"},
-		{"8090", "tcp", "slurmweb (hostNetwork, readiness probe)"},
-		{"30000:32767", "tcp", "K8s NodePort"},
-		{"30000:32767", "udp", "K8s NodePort"},
+
+	// run executes an iptables command, logging errors but never failing.
+	run := func(args ...string) {
+		if out, err := exec.Command("iptables", args...).CombinedOutput(); err != nil {
+			d.logger.Debugf("iptables %v: %v (%s)", args, err, strings.TrimSpace(string(out)))
+		}
 	}
-	for _, rule := range rules {
-		cmd := exec.Command("ufw", "allow", fmt.Sprintf("%s/%s", rule.port, rule.proto))
-		if _, err := cmd.CombinedOutput(); err != nil {
-			ipt := exec.Command("iptables", "-A", "INPUT", "-p", rule.proto,
-				"--dport", rule.port, "-j", "ACCEPT")
-			ipt.CombinedOutput()
+	// once adds a rule only when it is not already present (idempotent across restarts).
+	once := func(chain string, args ...string) {
+		check := append([]string{"-C", chain}, args...)
+		if exec.Command("iptables", check...).Run() != nil {
+			add := append([]string{"-A", chain}, args...)
+			run(add...)
 		}
 	}
 
-	// Trust the Tailscale interface — traffic arriving on tailscale0/ts0 has already
-	// been authenticated by Tailscale, so we don't need per-port rules for overlay traffic.
+	// ---- Clean slate --------------------------------------------------------
+	// We own INPUT and OUTPUT entirely; flush before rebuilding so stale rules
+	// from previous daemon versions never accumulate.
+	// FORWARD is left alone — kube-proxy appends its own rules after k3s starts,
+	// and we manage pod-CIDR rules below via once() to avoid duplicates.
+	run("-F", "INPUT")
+	run("-F", "OUTPUT")
+
+	// ---- INPUT chain --------------------------------------------------------
+	// Rules are evaluated top-down; order matters.
+
+	// Loopback — unconditionally trusted.
+	run("-A", "INPUT", "-i", "lo", "-j", "ACCEPT")
+	// Established / related — keep existing sessions alive across rule reloads.
+	run("-A", "INPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
+	// ICMP — required for Tailscale path probing, SLURM health checks, and ping.
+	run("-A", "INPUT", "-p", "icmp", "-j", "ACCEPT")
+
+	// Tailscale interfaces — fully trusted (WireGuard-encrypted, device-authenticated).
+	// All cluster-internal traffic (k3s, etcd, SLURM, MPI) arrives on these interfaces.
+	// These ACCEPT rules must come before the anti-spoofing DROP below — iptables
+	// evaluates top-down and stops at the first matching rule.
 	for _, iface := range []string{"tailscale0", "ts0"} {
+		run("-A", "INPUT", "-i", iface, "-j", "ACCEPT")
 		exec.Command("ufw", "allow", "in", "on", iface).CombinedOutput()
 	}
-	// iptables CGNAT range fallback for kernels where interface-based rules don't apply.
-	cmd := exec.Command("iptables", "-C", "INPUT", "-s", "100.64.0.0/10", "-j", "ACCEPT")
-	if cmd.Run() != nil {
-		exec.Command("iptables", "-I", "INPUT", "-s", "100.64.0.0/10", "-j", "ACCEPT").Run()
+	// CGNAT source fallback for non-standard Tailscale interface names.
+	once("INPUT", "-s", "100.64.0.0/10", "-j", "ACCEPT")
+
+	// Anti-spoofing: any remaining packet claiming a Tailscale CGNAT source
+	// was not accepted above, so it arrived on a non-Tailscale interface — drop it.
+	// Single rule placed after the ACCEPTs. The previous two-rule loop was buggy:
+	// a packet legitimately on tailscale0 passed "! -i tailscale0" but was then
+	// dropped by "! -i ts0" because tailscale0 ≠ ts0.
+	run("-A", "INPUT", "-s", "100.64.0.0/10", "-j", "DROP")
+
+	// Tailscale direct-path WireGuard (UDP 41641) — open on the physical interface
+	// so Tailscale can establish direct peer connections without a DERP relay.
+	run("-A", "INPUT", "-p", "udp", "--dport", "41641", "-j", "ACCEPT")
+	// STUN (UDP 3478) — Tailscale NAT traversal helper.
+	run("-A", "INPUT", "-p", "udp", "--dport", "3478", "-j", "ACCEPT")
+	// DHCP client (UDP 68) — server replies arrive here. Without this, a node
+	// keeps its current lease but silently fails to renew once this firewall
+	// is in place, eventually losing its LAN/WiFi IP.
+	run("-A", "INPUT", "-p", "udp", "--dport", "68", "-j", "ACCEPT")
+
+	// SSH — the perimeter firewall restricts this to the management station;
+	// we open it on the node so deploy/SCP works from the cluster LAN.
+	run("-A", "INPUT", "-p", "tcp", "--dport", "22", "-j", "ACCEPT")
+	// Serf gossip — accepted from LAN peers (bootstrap phase before Tailscale is up).
+	run("-A", "INPUT", "-p", "tcp", "--dport", "7946", "-j", "ACCEPT")
+	run("-A", "INPUT", "-p", "udp", "--dport", "7946", "-j", "ACCEPT")
+	// ingress-nginx hostNetwork: HTTP and HTTPS served directly on the host.
+	run("-A", "INPUT", "-p", "tcp", "--dport", "80", "-j", "ACCEPT")
+	run("-A", "INPUT", "-p", "tcp", "--dport", "443", "-j", "ACCEPT")
+	// k3s NodePort range — cluster services exposed to management clients.
+	run("-A", "INPUT", "-p", "tcp", "--dport", "30000:32767", "-j", "ACCEPT")
+	run("-A", "INPUT", "-p", "udp", "--dport", "30000:32767", "-j", "ACCEPT")
+	// node-agent peer-update HTTP server.
+	run("-A", "INPUT", "-p", "tcp", "--dport", "8090", "-j", "ACCEPT")
+
+	// NOTE: k3s API (6443), etcd (2379-2380), Kubelet (10250), SLURM daemons
+	// (6817-6819), and MPI all arrive exclusively via tailscale0/ts0 and are
+	// accepted by the Tailscale interface rule above.  They are intentionally
+	// absent from LAN-facing INPUT rules to keep them off the LAN attack surface.
+
+	// ---- OUTPUT chain (egress filtering) ------------------------------------
+	// Limit what a compromised root process can initiate.  Even with full root
+	// access, the node cannot reach arbitrary internet hosts or the home LAN.
+
+	run("-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT")
+	run("-A", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
+	run("-A", "OUTPUT", "-p", "icmp", "-j", "ACCEPT")
+	// Tailscale overlay — k3s, SLURM, and MPI all egress through here.
+	for _, iface := range []string{"tailscale0", "ts0"} {
+		run("-A", "OUTPUT", "-o", iface, "-j", "ACCEPT")
+	}
+	// Tailscale WireGuard direct path and STUN.
+	run("-A", "OUTPUT", "-p", "udp", "--dport", "41641", "-j", "ACCEPT")
+	run("-A", "OUTPUT", "-p", "udp", "--dport", "3478", "-j", "ACCEPT")
+	// DHCP client (UDP 67) — lease renewal requests go to the server on this port.
+	run("-A", "OUTPUT", "-p", "udp", "--dport", "67", "-j", "ACCEPT")
+	// HTTPS: Tailscale DERP relay, package repos, container registries.
+	run("-A", "OUTPUT", "-p", "tcp", "--dport", "443", "-j", "ACCEPT")
+	// HTTP: apt and plain package mirrors.
+	run("-A", "OUTPUT", "-p", "tcp", "--dport", "80", "-j", "ACCEPT")
+	// DNS (UDP + TCP for large/DNSSEC responses).
+	run("-A", "OUTPUT", "-p", "udp", "--dport", "53", "-j", "ACCEPT")
+	run("-A", "OUTPUT", "-p", "tcp", "--dport", "53", "-j", "ACCEPT")
+	// NTP clock sync.
+	run("-A", "OUTPUT", "-p", "udp", "--dport", "123", "-j", "ACCEPT")
+	// SSH outbound — needed for node-agent SCP peer-update mechanism.
+	run("-A", "OUTPUT", "-p", "tcp", "--dport", "22", "-j", "ACCEPT")
+	// Serf outbound — LAN bootstrap before Tailscale overlay is established.
+	run("-A", "OUTPUT", "-p", "tcp", "--dport", "7946", "-j", "ACCEPT")
+	run("-A", "OUTPUT", "-p", "udp", "--dport", "7946", "-j", "ACCEPT")
+
+	// ---- FORWARD chain ------------------------------------------------------
+	// Pod CIDR forwarding — allow Flannel-routed packets through FORWARD.
+	// Uses once() so re-runs don't accumulate duplicate rules.
+	for _, cidr := range []string{"10.42.0.0/16", "10.43.0.0/16"} {
+		once("FORWARD", "-d", cidr, "-j", "ACCEPT")
+		once("FORWARD", "-s", cidr, "-j", "ACCEPT")
+	}
+	// Virtual interfaces created by k3s (flannel bridge, VXLAN, veth pairs).
+	for _, iface := range []string{"cni0", "flannel.1", "flannel-wg"} {
+		once("FORWARD", "-i", iface, "-j", "ACCEPT")
+		once("FORWARD", "-o", iface, "-j", "ACCEPT")
 	}
 
-	// Remove stale REDIRECT rules for ports 80/443 from both the OUTPUT and
-	// PREROUTING nat chains.  Old daemon versions added these rules to redirect
-	// HTTP/HTTPS traffic to ingress-nginx NodePorts (30080/30443), but they break
-	// outbound connections (apt, containerd, curl) with ECONNREFUSED.
-	//
-	// We flush the entire OUTPUT chain (no kube-proxy rules live there) but use
-	// targeted deletion for PREROUTING to avoid disturbing kube-proxy's
-	// KUBE-SERVICES jump rule which also lives in PREROUTING.
-	d.logger.Info("Flushing nat OUTPUT chain and removing stale PREROUTING REDIRECTs")
-	exec.Command("iptables", "-t", "nat", "-F", "OUTPUT").Run() //nolint:errcheck
-	for _, pair := range [][2]string{{"80", "30080"}, {"443", "30443"}} {
-		from, to := pair[0], pair[1]
-		for {
-			if exec.Command("iptables", "-t", "nat", "-C", "PREROUTING",
-				"-p", "tcp", "--dport", from, "-j", "REDIRECT", "--to-ports", to).Run() != nil {
-				break
-			}
-			exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", //nolint:errcheck
-				"-p", "tcp", "--dport", from, "-j", "REDIRECT", "--to-ports", to).Run()
-		}
-	}
-
-	// Persist the now-clean iptables state so iptables-persistent/netfilter-persistent
-	// cannot restore stale rules from /etc/iptables/rules.v4 on the next reboot.
-	os.MkdirAll("/etc/iptables", 0755)
-	if f, err := os.Create("/etc/iptables/rules.v4"); err == nil {
-		saveCmd := exec.Command("iptables-save")
-		saveCmd.Stdout = f
-		saveCmd.Run()
-		f.Close()
-		d.logger.Info("Saved iptables state to /etc/iptables/rules.v4")
-	} else {
-		d.logger.Warnf("Could not write /etc/iptables/rules.v4: %v", err)
-	}
-
-	// UFW FORWARD policy — must be ACCEPT for pod NodePort traffic to route correctly.
-	// kube-proxy DNAT's NodePort traffic to pod IPs; UFW's default DROP blocks this.
+	// UFW FORWARD policy — must be ACCEPT for pod NodePort traffic to route.
+	// kube-proxy DNAT's NodePort traffic to pod IPs; UFW's DROP blocks that.
 	if data, err := os.ReadFile("/etc/default/ufw"); err == nil {
 		if strings.Contains(string(data), `DEFAULT_FORWARD_POLICY="DROP"`) {
 			newData := strings.ReplaceAll(string(data),
@@ -2682,20 +2764,24 @@ func (d *Daemon) setupFirewallRules() error {
 	// IP forwarding — required for routing between LAN, Tailscale, and pod network.
 	exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
 
-	// Pod CIDR FORWARD rules — allow Flannel-routed packets through the FORWARD chain.
-	for _, cidr := range []string{"10.42.0.0/16", "10.43.0.0/16"} {
-		if exec.Command("iptables", "-C", "FORWARD", "-d", cidr, "-j", "ACCEPT").Run() != nil {
-			exec.Command("iptables", "-I", "FORWARD", "1", "-d", cidr, "-j", "ACCEPT").Run()
-		}
-		if exec.Command("iptables", "-C", "FORWARD", "-s", cidr, "-j", "ACCEPT").Run() != nil {
-			exec.Command("iptables", "-I", "FORWARD", "1", "-s", cidr, "-j", "ACCEPT").Run()
+	// ---- nat chain cleanup --------------------------------------------------
+	// Remove stale REDIRECT rules from previous daemon versions.
+	d.logger.Info("Flushing nat OUTPUT chain and removing stale PREROUTING REDIRECTs")
+	exec.Command("iptables", "-t", "nat", "-F", "OUTPUT").Run() //nolint:errcheck
+	for _, pair := range [][2]string{{"80", "30080"}, {"443", "30443"}} {
+		from, to := pair[0], pair[1]
+		for {
+			if exec.Command("iptables", "-t", "nat", "-C", "PREROUTING",
+				"-p", "tcp", "--dport", from, "-j", "REDIRECT", "--to-ports", to).Run() != nil {
+				break
+			}
+			exec.Command("iptables", "-t", "nat", "-D", "PREROUTING", //nolint:errcheck
+				"-p", "tcp", "--dport", from, "-j", "REDIRECT", "--to-ports", to).Run()
 		}
 	}
 
 	// Ingress NodePort aliases: redirect incoming :30080 → :80 and :30443 → :443.
 	// ingress-nginx runs with hostNetwork=true and binds directly to ports 80/443.
-	// kube-proxy's NodePort DNAT doesn't apply to hostNetwork pods, so we add
-	// explicit PREROUTING REDIRECT rules so external traffic on 30080/30443 reaches nginx.
 	for _, pair := range [][2]string{{"30080", "80"}, {"30443", "443"}} {
 		from, to := pair[0], pair[1]
 		if exec.Command("iptables", "-t", "nat", "-C", "PREROUTING",
@@ -2704,7 +2790,7 @@ func (d *Daemon) setupFirewallRules() error {
 				"-p", "tcp", "--dport", from, "-j", "REDIRECT", "--to-ports", to).Run()
 			d.logger.Infof("Added PREROUTING REDIRECT :%s → :%s (ingress NodePort alias)", from, to)
 		}
-		// Also handle loopback (OUTPUT chain) so curl http://localhost:30080 works.
+		// OUTPUT chain handles localhost:30080 so curl on the node itself works.
 		if exec.Command("iptables", "-t", "nat", "-C", "OUTPUT",
 			"-p", "tcp", "--dport", from, "-j", "REDIRECT", "--to-ports", to).Run() != nil {
 			exec.Command("iptables", "-t", "nat", "-A", "OUTPUT", //nolint:errcheck
@@ -2712,7 +2798,30 @@ func (d *Daemon) setupFirewallRules() error {
 		}
 	}
 
-	d.logger.Info("Firewall rules set (including Tailscale interface trust and pod CIDR forwarding)")
+	// ---- Default policies ----------------------------------------------------
+	// Explicitly (re)set to ACCEPT. This is a ringfenced lab cluster — the
+	// node-level default-deny lockdown previously set here (-P ... DROP) caused
+	// nodes to lose connectivity (Serf/mDNS/peer-update traffic not covered by
+	// the allowlist above), breaking cluster formation and WiFi-only nodes after
+	// every deploy. Set explicitly (not just left alone) so nodes that already
+	// picked up the DROP policy get it reverted on the next daemon restart.
+	run("-P", "INPUT", "ACCEPT")
+	run("-P", "OUTPUT", "ACCEPT")
+	run("-P", "FORWARD", "ACCEPT")
+
+	// ---- Persist rules ------------------------------------------------------
+	os.MkdirAll("/etc/iptables", 0755)
+	if f, err := os.Create("/etc/iptables/rules.v4"); err == nil {
+		saveCmd := exec.Command("iptables-save")
+		saveCmd.Stdout = f
+		saveCmd.Run()
+		f.Close()
+		d.logger.Info("Saved iptables state to /etc/iptables/rules.v4")
+	} else {
+		d.logger.Warnf("Could not write /etc/iptables/rules.v4: %v", err)
+	}
+
+	d.logger.Info("Firewall rules set (default ACCEPT, Tailscale trust, ingress NodePort aliases)")
 	return nil
 }
 

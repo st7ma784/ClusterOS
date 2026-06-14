@@ -290,11 +290,12 @@ main() {
             
             if [ -n "$AUTH_KEY" ]; then
                 log "Auth key generated (expires in 5 minutes)"
-                
+
                 # Step 3: Authenticate with the generated key
                 log "Authenticating Tailscale..."
+                modprobe tun 2>/dev/null || true
                 if tailscale up --authkey="$AUTH_KEY" --hostname="$TS_HOSTNAME" \
-                    --accept-routes --accept-dns=false --reset 2>&1; then
+                    --accept-routes --accept-dns=false 2>&1; then
                     log "Successfully authenticated via OAuth"
                     sleep 2
                     TS_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
@@ -313,8 +314,9 @@ main() {
     # Method 2: Use pre-configured auth key (fallback)
     if [ -n "$TAILSCALE_AUTHKEY" ]; then
         log "Trying pre-configured auth key..."
+        modprobe tun 2>/dev/null || true
         if tailscale up --authkey="$TAILSCALE_AUTHKEY" --hostname="$TS_HOSTNAME" \
-            --accept-routes --accept-dns=false --reset 2>&1; then
+            --accept-routes --accept-dns=false 2>&1; then
             log "Successfully authenticated with pre-configured auth key"
             sleep 2
             tailscale ip -4 2>/dev/null && log "Connected!"

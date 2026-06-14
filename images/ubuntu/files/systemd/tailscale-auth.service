@@ -15,9 +15,11 @@ RemainAfterExit=yes
 ExecStartPre=/bin/sleep 15
 # Much longer timeout since tailscaled can take time to initialize
 TimeoutStartSec=300
-# Don't restart on failure to avoid auth loops
-# Restart=on-failure
-# RestartSec=30
+# Retry on failure — the first attempt often fires before iptables are clean
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Install]
 WantedBy=multi-user.target

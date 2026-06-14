@@ -1,4 +1,4 @@
-.PHONY: all node test test-cluster image release clean fmt lint deps help
+.PHONY: all node test test-cluster image image-chroot usb usb-chroot release clean fmt lint deps help patch cluster-key
 
 # Version info (from git tags or default)
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -41,8 +41,10 @@ help:
 	@echo ""
 	@echo "Build Targets:"
 	@echo "  make node         - Build node-agent binary (local arch)"
-	@echo "  make image        - Build OS image with Packer (requires Packer & QEMU)"
+	@echo "  make image        - Build OS image with Packer (requires Packer & KVM)"
+	@echo "  make image-chroot - Build OS image without KVM (use when /dev/kvm unavailable)"
 	@echo "  make usb          - Create USB installer image (requires Packer build)"
+	@echo "  make usb-chroot   - Create USB installer image (uses image-chroot build)"
 	@echo "  make usb-local    - Create USB installer image on the local machine"
 	@echo "  make release      - Create release artifacts (amd64 + arm64)"
 	@echo ""
@@ -222,17 +224,59 @@ image: node patch cluster-key
 	@echo "========================================="
 	@ls -lh /data/packer-output/cluster-os-node/
 
-usb: image
+image-chroot: node patch cluster-key
+	@echo "Staging current node-agent binary..."
+	@cp $(BUILD_DIR)/$(BINARY_NAME) images/ubuntu/node-agent
+	@echo "========================================="
+	@echo "Building OS image (no-KVM / chroot path)"
+	@echo "========================================="
+	@if [ ! -f images/ubuntu/.env ]; then \
+		echo "Error: images/ubuntu/.env missing — copy images/ubuntu/.env.example and add Tailscale credentials"; \
+		exit 1; \
+	fi
+	@mkdir -p /data/packer-cache /data/packer-output/cluster-os-node
+	@sudo bash scripts/build-image-chroot.sh
+	@echo ""
+	@echo "========================================="
+	@echo "OS image built successfully!"
+	@echo "========================================="
+	@ls -lh /data/packer-output/cluster-os-node/
+
+RAW_IMAGE := /data/packer-output/cluster-os-node/cluster-os-node.raw
+
+# usb — always rebuilds so changes to build scripts, patch bundle, and service
+# files are always reflected. Use usb-cached to reuse a previous raw image.
+usb:
+	@if [ -e /dev/kvm ]; then \
+		$(MAKE) image; \
+	else \
+		$(MAKE) image-chroot; \
+	fi
 	@echo "Creating USB installer..."
-	@./scripts/create-usb-installer.sh --usb
+	@sudo ./scripts/create-usb-installer.sh --usb
 	@echo ""
 	@echo "========================================="
 	@echo "USB installer created!"
 	@echo "========================================="
-	@ls -lh dist/cluster-os-usb.img
+	@ls -lh dist/cluster-os-usb.img dist/cluster-os-usb.img.gz 2>/dev/null || true
 	@echo ""
-	@echo "Write to USB with:"
-	@echo "  sudo dd if=dist/cluster-os-usb.img of=/dev/sdX bs=4M status=progress"
+	@echo "Flash to USB with Balena Etcher: dist/cluster-os-usb.img.gz"
+	@echo "Or with dd:"
+	@echo "  sudo dd if=dist/cluster-os-usb.img of=/dev/sdX bs=4M status=progress oflag=sync"
+	@echo ""
+
+usb-chroot: image-chroot
+	@echo "Creating USB installer from chroot-built image..."
+	@sudo ./scripts/create-usb-installer.sh --usb
+	@echo ""
+	@echo "========================================="
+	@echo "USB installer created!"
+	@echo "========================================="
+	@ls -lh dist/cluster-os-usb.img dist/cluster-os-usb.img.gz 2>/dev/null || true
+	@echo ""
+	@echo "Flash to USB with Balena Etcher: dist/cluster-os-usb.img.gz"
+	@echo "Or with dd:"
+	@echo "  sudo dd if=dist/cluster-os-usb.img of=/dev/sdX bs=4M status=progress oflag=sync"
 	@echo ""
 
 # patch — build binary for the local arch and stage the complete patch folder.
@@ -284,6 +328,50 @@ patch: node
 		echo "Pause image already bundled (patch/pause-3.6.tar) — reusing"; \
 	fi
 	@test -f patch/cloudflare.env || cp patch/cloudflare.env.example patch/cloudflare.env
+	@# Tailscale credentials — generate patch/tailscale.env from images/ubuntu/.env so
+	@# apply-patch.sh can call clusteros-tailscale-init on first boot.  This runs AFTER
+	@# iptables cleanup and DNS rescue, making it far more reliable than the standalone
+	@# tailscale-auth.service which fires at 15s (before the network is clean).
+	@if [ -f images/ubuntu/.env ]; then \
+		_TS_ID=$$(grep -v '^#' images/ubuntu/.env | grep '^TAILSCALE_OAUTH_CLIENT_ID=' | head -1 | cut -d= -f2-); \
+		_TS_SEC=$$(grep -v '^#' images/ubuntu/.env | grep '^TAILSCALE_OAUTH_CLIENT_SECRET=' | head -1 | cut -d= -f2-); \
+		_TS_KEY=$$(grep -v '^#' images/ubuntu/.env | grep '^TAILSCALE_AUTHKEY=' | head -1 | cut -d= -f2-); \
+		printf '# Tailscale credentials — generated from images/ubuntu/.env by make patch\n' > patch/tailscale.env; \
+		printf '# DO NOT COMMIT — this file is in .gitignore\n' >> patch/tailscale.env; \
+		printf 'TAILSCALE_OAUTH_CLIENT_ID=%s\n' "$$_TS_ID" >> patch/tailscale.env; \
+		printf 'TAILSCALE_OAUTH_CLIENT_SECRET=%s\n' "$$_TS_SEC" >> patch/tailscale.env; \
+		printf 'TAILSCALE_TAGS=clusteros\n' >> patch/tailscale.env; \
+		if [ -n "$$_TS_KEY" ]; then printf 'TAILSCALE_AUTHKEY=%s\n' "$$_TS_KEY" >> patch/tailscale.env; fi; \
+		chmod 600 patch/tailscale.env; \
+		echo "  Tailscale credentials staged -> patch/tailscale.env"; \
+	else \
+		echo "  WARNING: images/ubuntu/.env not found -- Tailscale auto-join will not be configured"; \
+		echo "           Copy images/ubuntu/.env.example to images/ubuntu/.env and fill in credentials."; \
+	fi
+	@# WiFi credentials — generate patch/wifi.env from images/ubuntu/.env so
+	@# apply-patch.sh can install /etc/clusteros/wifi.env on deployed nodes and
+	@# cluster-make-usb can bundle it into fresh USB images. No hardcoded fallback —
+	@# nodes without these credentials are wired/Tailscale-only.
+	@if [ -f images/ubuntu/.env ]; then \
+		_WIFI_SSID=$$(grep -v '^#' images/ubuntu/.env | grep '^WIFI_SSID=' | head -1 | cut -d= -f2-); \
+		_WIFI_KEY=$$(grep -v '^#' images/ubuntu/.env | grep '^WIFI_KEY=' | head -1 | cut -d= -f2-); \
+		if [ -n "$$_WIFI_SSID" ] && [ -n "$$_WIFI_KEY" ]; then \
+			printf '# WiFi credentials — generated from images/ubuntu/.env by make patch\n' > patch/wifi.env; \
+			printf '# DO NOT COMMIT — this file is in .gitignore\n' >> patch/wifi.env; \
+			printf 'WIFI_SSID=%s\n' "$$_WIFI_SSID" >> patch/wifi.env; \
+			printf 'WIFI_KEY=%s\n' "$$_WIFI_KEY" >> patch/wifi.env; \
+			chmod 600 patch/wifi.env; \
+			echo "  WiFi credentials staged -> patch/wifi.env"; \
+		else \
+			echo "  WIFI_SSID/WIFI_KEY not set in images/ubuntu/.env -- patch/wifi.env not generated (wired/Tailscale-only)"; \
+		fi; \
+	fi
+	@# Netplan wired-DHCP config — sync from images/ubuntu/files/netplan. This file
+	@# contains no credentials (WiFi is handled separately via wifi.env); always
+	@# overwrite so patch/99-clusteros.yaml never drifts from the tracked source.
+	@cp -f images/ubuntu/files/netplan/99-clusteros.yaml patch/99-clusteros.yaml
+	@chmod 600 patch/99-clusteros.yaml
+	@echo "  Netplan config synced -> patch/99-clusteros.yaml"
 	@echo "Bundling cluster SSH public key..."
 	@if [ ! -f "$(HOME)/.ssh/cluster_key" ]; then \
 		echo "  Generating new cluster SSH keypair (~/.ssh/cluster_key)..."; \
@@ -384,6 +472,21 @@ deploy: patch
 			   echo "      WARNING: ~/patch/cluster-make-usb.sh missing on node — SCP may have failed"; \
 			 fi' \
 			|| echo "WARNING: cluster-make-usb install step failed on $$node"; \
+		echo "    [5/5] Ensuring node-agent is running (recovers if apply-patch.sh aborted before restart/reboot)"; \
+		$(_SSH_AUTH) $(SSH_USER)@$$node \
+			'sudo systemctl enable node-agent 2>/dev/null; \
+			 if ! systemctl is-active --quiet node-agent; then \
+			   echo "      node-agent not active — starting"; \
+			   sudo systemctl start node-agent; \
+			 fi; \
+			 sleep 3; \
+			 if systemctl is-active --quiet node-agent; then \
+			   echo "      node-agent active"; \
+			 else \
+			   echo "      ERROR: node-agent still not active after start attempt"; \
+			   sudo journalctl -u node-agent -n 15 --no-pager; \
+			 fi' \
+			|| echo "WARNING: node-agent ensure-running step failed on $$node"; \
 	done
 	@echo ""
 	@echo "Deploy complete. Check: make deploy-status"

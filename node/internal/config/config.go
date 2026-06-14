@@ -40,11 +40,9 @@ type DiscoveryConfig struct {
 
 // NetworkingConfig contains networking-related settings
 type NetworkingConfig struct {
-	Interface  string     `mapstructure:"interface"`
-	ListenPort int        `mapstructure:"listen_port"`
-	Subnet     string     `mapstructure:"subnet"`
-	IPv6       bool       `mapstructure:"ipv6"`
-	WiFi       WiFiConfig `mapstructure:"wifi"`
+	Subnet string     `mapstructure:"subnet"`
+	IPv6   bool       `mapstructure:"ipv6"`
+	WiFi   WiFiConfig `mapstructure:"wifi"`
 }
 
 // WiFiConfig contains WiFi settings
@@ -177,8 +175,6 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("discovery.bootstrap_peers", []string{})
 
 	// Networking defaults
-	v.SetDefault("networking.interface", "wg0")
-	v.SetDefault("networking.listen_port", 51820)
 	v.SetDefault("networking.subnet", "10.42.0.0/16")
 	v.SetDefault("networking.ipv6", false)
 	v.SetDefault("networking.wifi.enabled", false)
@@ -281,11 +277,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid discovery bind port: %d", c.Discovery.BindPort)
 	}
 
-	// Validate networking settings
-	if c.Networking.ListenPort < 1 || c.Networking.ListenPort > 65535 {
-		return fmt.Errorf("invalid networking listen port: %d", c.Networking.ListenPort)
-	}
-
 	// Validate logging level
 	validLogLevels := map[string]bool{
 		"debug": true,
@@ -336,10 +327,8 @@ func Save(config *Config, configPath string) error {
 			"encrypt_key":     config.Discovery.EncryptKey,
 		},
 		"networking": map[string]interface{}{
-			"interface":  config.Networking.Interface,
-			"listen_port": config.Networking.ListenPort,
-			"subnet":     config.Networking.Subnet,
-			"ipv6":       config.Networking.IPv6,
+			"subnet": config.Networking.Subnet,
+			"ipv6":   config.Networking.IPv6,
 			"wifi": map[string]interface{}{
 				"enabled": config.Networking.WiFi.Enabled,
 				"ssid":    config.Networking.WiFi.SSID,
