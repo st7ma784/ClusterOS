@@ -2503,10 +2503,6 @@ INGRESS_LABELS = {
     "/jupyter":   ("JupyterHub",           "Notebook UI"),
 }
 
-# Subdomains that correspond to known built-in services — skip when auto-discovering
-# subdomains to avoid duplicating entries already shown via INGRESS_LABELS.
-_KNOWN_SUBDOMAINS = {p.strip("/").split("/")[0] for p in INGRESS_LABELS}
-
 # NodePort to probe (TCP connect) for known services — shows live up/down status.
 PROBE_PORT = {
     "/rancher":   30444,
@@ -2553,7 +2549,22 @@ def collect_ingresses():
     except Exception:
         return []
 
-    seen, rows = set(), []
+    # nginx rewrite ingresses use regex paths like "/longhorn(/|$)(.*)".  Strip
+    # everything from the first regex metacharacter to recover the clean prefix
+    # ("/longhorn") so built-in services exposed only via a rewrite ingress still
+    # match INGRESS_LABELS and get listed.
+    def _clean_path(raw):
+        cut = len(raw)
+        for c in "($){}*?+[]":
+            i = raw.find(c)
+            if i != -1:
+                cut = min(cut, i)
+        return raw[:cut].rstrip("/") or "/"
+
+    # key -> (href, display, label, desc, is_path).  We dedupe by service key and
+    # prefer a path-based href (works on whatever host the user is already on) over
+    # a subdomain href (needs that subdomain's DNS to resolve).
+    by_key = {}
     for ing in items:
         ns   = ing.get("metadata", {}).get("namespace", "")
         anns = ing.get("metadata", {}).get("annotations", {})
@@ -2571,40 +2582,42 @@ def collect_ingresses():
             )
 
             for po in rule.get("http", {}).get("paths", []):
-                raw = po.get("path", "/")
-                # Skip regex/routing paths.
-                if any(c in raw for c in ("(", "$", "?", "*")):
-                    continue
-
-                clean = raw.rstrip("/") or "/"
+                clean = _clean_path(po.get("path", "/"))
 
                 if is_subdomain:
-                    href    = f"https://{host}/"
-                    display = host
-                    sub     = host[:-(len(CLUSTER_DOMAIN) + 1)]
-                    # Skip subdomains already covered by a path in INGRESS_LABELS
-                    # (longhorn, rancher, slurm, jupyter) — would be duplicate rows.
-                    if sub in _KNOWN_SUBDOMAINS:
-                        continue
-                    label = sub.replace("-", " ").title()
-                    desc  = ns
+                    sub      = host[:-(len(CLUSTER_DOMAIN) + 1)]
+                    builtin  = INGRESS_LABELS.get("/" + sub)
+                    href     = f"https://{host}/"
+                    display  = host
+                    if builtin:
+                        # Known built-in (e.g. Rancher) exposed only via subdomain —
+                        # keep its friendly name instead of silently dropping it.
+                        key          = "/" + sub
+                        label, desc  = builtin
+                    else:
+                        key          = host
+                        label        = sub.replace("-", " ").title()
+                        desc         = ns
                 else:
+                    if clean == "/":
+                        continue  # root path = the landing page itself
                     href    = clean
                     display = clean
+                    key     = clean
                     entry   = INGRESS_LABELS.get(clean)
                     if entry:
                         label, desc = entry
-                    elif clean == "/":
-                        continue  # root path = the landing page itself
                     else:
                         # Path-based user service not in built-in list — show it.
                         label = clean.strip("/").replace("-", " ").replace("/", " / ").title()
                         desc  = ns
 
-                if href in seen:
-                    continue
-                seen.add(href)
-                rows.append((href, display, label, desc))
+                is_path = href.startswith("/")
+                prev    = by_key.get(key)
+                if prev is None or (is_path and not prev[4]):
+                    by_key[key] = (href, display, label, desc, is_path)
+
+    rows = [v[:4] for v in by_key.values()]
 
     # Built-in services first (INGRESS_LABELS paths), then new services alphabetically.
     def _key(r):
@@ -3993,17 +4006,40 @@ func (ks *K3sServer) deployRancher() error {
 	// that leaves the setting pointing at the old (nip.io) URL → "Unknown schema" error.
 	go ks.patchRancherServerURLSetting(effectiveURL, rolloutTriggered)
 
-	// Remove the helm-created "rancher" ingress — its hostname is baked in at install
-	// time and may be a nip.io address. The "rancher-domain" ingress in deployDomainIngresses
-	// owns the rancher.<domain> route with correct session affinity. Keeping both causes
-	// nginx to non-deterministically pick one, which breaks sticky sessions.
-	// In nip.io mode (no custom domain) the helm ingress is the only route, so only
-	// delete it when a custom domain is configured.
+	// Reconcile the helm-created "rancher" ingress instead of deleting it.
+	//
+	// The helm chart templates a "rancher" ingress that points at the rancher Service
+	// port 80 while carrying backend-protocol=HTTPS — so nginx attempts a TLS handshake
+	// against the pod's plaintext :80 and every request 502s. It also force-redirects
+	// HTTP→HTTPS (ssl-redirect defaults to true), which loops forever behind cloudflared
+	// (cloudflared only forwards plain HTTP to localhost:80).
+	//
+	// The "rancher-domain" ingress in deployDomainIngresses already owns the correct
+	// route (port 443, HTTPS, ssl-redirect=false), but it shares the rancher.<domain>
+	// host/path with the helm ingress. nginx merges duplicate host/path entries and
+	// picks one non-deterministically — when the broken helm ingress wins, Rancher is
+	// unreachable. Deleting the helm ingress doesn't stick: helm/Rancher recreates it.
+	//
+	// So we converge the helm ingress to a working config (port 443 + ssl-redirect=false)
+	// rather than fighting a recreation race. Once both ingresses behave identically the
+	// merge outcome no longer matters. Only do this when a custom domain is configured;
+	// in nip.io mode the helm ingress is the only route and its default config is used.
 	if domain := readCloudflareDomain(); domain != "" {
-		exec.Command("k3s", "kubectl", "-n", "cattle-system", "delete", "ingress",
-			"rancher", "--ignore-not-found=true",
-			"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
-		).Run()
+		if exec.Command("k3s", "kubectl", "-n", "cattle-system", "get", "ingress", "rancher",
+			"--kubeconfig", "/etc/rancher/k3s/k3s.yaml").Run() == nil {
+			// Point the backend at port 443 so it matches backend-protocol=HTTPS.
+			exec.Command("k3s", "kubectl", "-n", "cattle-system", "patch", "ingress", "rancher",
+				"--type=json",
+				"-p=[{\"op\":\"replace\",\"path\":\"/spec/rules/0/http/paths/0/backend/service/port/number\",\"value\":443}]",
+				"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
+			).Run()
+			// Disable ssl-redirect so cloudflared's plain-HTTP request is served directly
+			// instead of looping on a 308 redirect to HTTPS.
+			exec.Command("k3s", "kubectl", "-n", "cattle-system", "annotate", "ingress", "rancher",
+				"nginx.ingress.kubernetes.io/ssl-redirect=false", "--overwrite",
+				"--kubeconfig", "/etc/rancher/k3s/k3s.yaml",
+			).Run()
+		}
 	}
 
 	// Always (re-)apply the NodePort service and redirect ingress so they survive

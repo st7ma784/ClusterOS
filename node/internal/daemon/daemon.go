@@ -363,14 +363,30 @@ func (d *Daemon) runPhaseMachine() {
 
 func (d *Daemon) runDiscovering() {
 	d.logger.Info("Discovering cluster members...")
+	// Serf's member list always includes the local node as StatusAlive, so a
+	// ">= 1" gate passes instantly — before any *peer* has been discovered. On a
+	// simultaneous cold boot that lets a node fall through to election seeing only
+	// itself, self-elect, and provision a competing single-node cluster.
+	//
+	// So we wait for at least one PEER (>= 2 total members) before electing, but
+	// bound the wait with a deadline: a genuinely solo node (first node up, or a
+	// truly standalone deployment) must still proceed and bootstrap the cluster.
+	const peerWaitDeadline = 90 * time.Second
+	start := time.Now()
 	for {
 		select {
 		case <-d.ctx.Done():
 			return
 		default:
 		}
-		if len(d.discovery.GetAliveMembers()) >= 1 {
-			d.logger.Infof("Discovered %d alive member(s)", len(d.discovery.GetAliveMembers()))
+		n := len(d.discovery.GetAliveMembers())
+		if n >= 2 {
+			d.logger.Infof("Discovered %d alive member(s) (peer found) — proceeding to election", n)
+			d.setPhase(PhaseElecting)
+			return
+		}
+		if time.Since(start) >= peerWaitDeadline {
+			d.logger.Infof("No peers discovered after %s — proceeding to election as a solo node (will bootstrap cluster)", peerWaitDeadline)
 			d.setPhase(PhaseElecting)
 			return
 		}

@@ -10,6 +10,11 @@ import (
 
 const (
 	tailscaleScanInterval = 30 * time.Second
+	// Bootstrap burst — aggressive probing right after node-agent starts so a
+	// cold-boot cluster meshes before the election window closes. See
+	// StartTailscalePeerDiscovery.
+	bootstrapProbeWindow   = 60 * time.Second
+	bootstrapProbeInterval = 5 * time.Second
 )
 
 // StartTailscalePeerDiscovery probes all online Tailscale peers for Serf
@@ -23,6 +28,27 @@ func (sd *SerfDiscovery) StartTailscalePeerDiscovery(ctx context.Context) {
 		sd.logger.Info("[ts] Tailscale peer discovery enabled — will probe online peers for Serf")
 		// Run immediately so fresh-boot join is fast.
 		sd.probeAndJoinTailscalePeers()
+
+		// Bootstrap burst: on a simultaneous cold boot, peers' tailscaled often
+		// isn't "Online" yet when the first probe runs, so it finds nothing. The
+		// election window can close (15–30s) before the next steady-state probe
+		// (every 30s) ever runs. Probe aggressively for the first ~60s so a peer
+		// that finishes booting a few seconds later is discovered well within the
+		// election window.
+		bootstrapDeadline := time.Now().Add(bootstrapProbeWindow)
+		fast := time.NewTicker(bootstrapProbeInterval)
+		for time.Now().Before(bootstrapDeadline) {
+			select {
+			case <-fast.C:
+				sd.probeAndJoinTailscalePeers()
+			case <-ctx.Done():
+				fast.Stop()
+				sd.logger.Info("[ts] Tailscale peer discovery stopped")
+				return
+			}
+		}
+		fast.Stop()
+
 		ticker := time.NewTicker(tailscaleScanInterval)
 		defer ticker.Stop()
 		for {

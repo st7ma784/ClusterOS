@@ -18,7 +18,11 @@ CACHED_IMG="$CACHE_DIR/ubuntu-24.04-cloudimg.img"
 WORK_RAW="$CACHE_DIR/clusteros-work.raw"
 OUTPUT_QCOW2="$OUTPUT_DIR/$VM_NAME.qcow2"
 OUTPUT_RAW="$OUTPUT_DIR/$VM_NAME.raw"
-IMAGE_SIZE="8G"
+# Nominal "8GB" USB sticks hold only ~7.45 GiB (8,000,000,000 bytes). A full 8 GiB
+# image overflows them and Balena/Rufus reject it with "not enough space". The
+# rootfs uses well under 4 GiB, so 7000 MiB (~7.34 GB) leaves ample headroom while
+# still fitting any nominal 8 GB device with margin to spare.
+IMAGE_SIZE="7000M"
 
 # Mutable — set during prepare_image / mount_image
 LOOP_DEV=""
